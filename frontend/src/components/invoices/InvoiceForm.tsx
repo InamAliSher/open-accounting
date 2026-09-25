@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../../lib/api";
 import { useCompanyStore } from "../../store/company";
@@ -17,8 +16,20 @@ function stripMoney(value: string): string {
   return (value ?? "").replace(/,/g, "").trim();
 }
 
-function defaultLineTaxCode(gstAmount: string): TaxCode {
-  return Number(stripMoney(gstAmount) || 0) > 0 ? "standard" : "gst_free";
+function moneyString(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(2) : "0.00";
+}
+
+export interface InvoiceLineDraft {
+  description: string;
+  quantity: string;
+  unit_price: string;
+  account_id: number | "";
+  tax_code: TaxCode;
+  gst_rate: string;
+  line_subtotal: string;
+  line_gst: string;
+  line_total: string;
 }
 
 export interface InvoiceFormValues {
@@ -33,11 +44,64 @@ export interface InvoiceFormValues {
   total: string;
   gst_inclusive: boolean;
   notes: string;
-  // Single account code the whole invoice is coded to. Required for the
-  // invoice to be authorised/posted to the ledger (a posting needs a coded
-  // line). Income accounts for AR; expense/COGS for AP.
   account_id: number | "";
   tax_code: TaxCode;
+  lines: InvoiceLineDraft[];
+}
+
+function blankLine(defaultTaxCode: TaxCode = "standard"): InvoiceLineDraft {
+  return {
+    description: "",
+    quantity: "1",
+    unit_price: "",
+    account_id: "",
+    tax_code: defaultTaxCode,
+    gst_rate: defaultTaxCode === "gst_free" || defaultTaxCode === "input_taxed" || defaultTaxCode === "none" ? "0" : "0.10",
+    line_subtotal: "0.00",
+    line_gst: "0.00",
+    line_total: "0.00",
+  };
+}
+
+function computeLine(line: InvoiceLineDraft, fallbackTaxCode: TaxCode): InvoiceLineDraft {
+  const taxCode = line.tax_code || fallbackTaxCode;
+  const qty = Number(stripMoney(line.quantity) || "0");
+  const unit = Number(stripMoney(line.unit_price) || "0");
+  const gstRateValue = ["gst_free", "input_taxed", "none"].includes(taxCode)
+    ? 0
+    : Number(stripMoney(line.gst_rate) || "0.10");
+  const subtotal = qty * unit;
+  const gst = subtotal * gstRateValue;
+  const total = subtotal + gst;
+  return {
+    ...line,
+    tax_code: taxCode,
+    gst_rate: ["gst_free", "input_taxed", "none"].includes(taxCode) ? "0" : moneyString(gstRateValue),
+    line_subtotal: moneyString(subtotal),
+    line_gst: moneyString(gst),
+    line_total: moneyString(total),
+  };
+}
+
+function summariseLines(lines: InvoiceLineDraft[]): { subtotal: string; gst_amount: string; total: string } {
+  const subtotal = lines.reduce((sum, line) => sum + Number(stripMoney(line.line_subtotal) || "0"), 0);
+  const gst = lines.reduce((sum, line) => sum + Number(stripMoney(line.line_gst) || "0"), 0);
+  const total = lines.reduce((sum, line) => sum + Number(stripMoney(line.line_total) || "0"), 0);
+  return {
+    subtotal: moneyString(subtotal),
+    gst_amount: moneyString(gst),
+    total: moneyString(total),
+  };
+}
+
+function lineIsValid(line: InvoiceLineDraft): boolean {
+  if (!line.description.trim()) return false;
+  const qty = Number(stripMoney(line.quantity) || "0");
+  const unit = Number(stripMoney(line.unit_price) || "0");
+  if (!Number.isFinite(qty) || qty <= 0) return false;
+  if (!Number.isFinite(unit) || unit < 0) return false;
+  if (line.account_id === "" || Number(line.account_id) <= 0) return false;
+  return !!line.tax_code;
 }
 
 export const EMPTY_FORM: InvoiceFormValues = {
@@ -47,58 +111,54 @@ export const EMPTY_FORM: InvoiceFormValues = {
   invoice_number: "",
   issue_date: "",
   due_date: "",
-  subtotal: "",
-  gst_amount: "",
-  total: "",
+  subtotal: "0.00",
+  gst_amount: "0.00",
+  total: "0.00",
   gst_inclusive: true,
   notes: "",
   account_id: "",
   tax_code: "gst_free",
+  lines: [blankLine("gst_free")],
 };
 
 export function toCreatePayload(
   v: InvoiceFormValues,
-  opts: {
-    source?: "manual" | "pdf" | "excel";
-    attachment_id?: string | null;
-    gst_registered?: boolean;
-  } = {}
+  opts: { source?: "manual" | "pdf" | "excel"; attachment_id?: string | null; gst_registered?: boolean } = {},
 ): InvoiceCreate {
-  let subtotal = stripMoney(v.subtotal) || "0";
-  let gst = stripMoney(v.gst_amount) || "0";
-  let total = stripMoney(v.total) || "0";
+  const baseTax = opts.gst_registered === false ? "none" : v.tax_code || "standard";
+  const normalised = v.lines.map((line) => computeLine(line, baseTax));
+  const totals = summariseLines(normalised);
+  const lines = normalised.filter(lineIsValid).map((line) => ({
+    description: line.description.trim(),
+    account_id: Number(line.account_id),
+    quantity: stripMoney(line.quantity) || "1",
+    unit_price: moneyString(Number(stripMoney(line.unit_price) || "0")),
+    gst_rate: ["gst_free", "input_taxed", "none"].includes(line.tax_code) ? "0" : moneyString(Number(stripMoney(line.gst_rate) || "0.10")),
+    line_subtotal: line.line_subtotal,
+    line_gst: line.line_gst,
+    line_total: line.line_total,
+    tax_code: line.tax_code,
+  }));
+
   if (opts.gst_registered === false) {
-    // A non-registered company records the complete gross amount as income or
-    // expense. Never send a synthetic GST split, even if stale form state was
-    // populated before company metadata finished loading.
-    const gross = total !== "0" ? total : subtotal;
-    subtotal = gross;
-    gst = "0";
-    total = gross;
+    return {
+      direction: v.direction,
+      contact_name: v.contact_name.trim() || null,
+      contact_abn: v.contact_abn.trim() || null,
+      invoice_number: v.invoice_number.trim(),
+      issue_date: v.issue_date,
+      due_date: v.due_date || null,
+      subtotal: totals.total,
+      gst_amount: "0",
+      total: totals.total,
+      gst_inclusive: false,
+      notes: v.notes.trim() || null,
+      source: opts.source ?? "manual",
+      attachment_id: opts.attachment_id ?? null,
+      lines,
+    };
   }
-  const taxCode: TaxCode =
-    opts.gst_registered === false
-      ? "none"
-      : Number(gst || 0) > 0 &&
-          ["gst_free", "input_taxed", "none"].includes(v.tax_code)
-        ? "standard"
-        : v.tax_code || defaultLineTaxCode(gst);
-  // Code the whole invoice to one account so it can be posted to the ledger.
-  // Without a coded line, authorising the invoice would 422. Only emit a line
-  // when an account is chosen; otherwise leave it a header-only draft.
-  const lines =
-    v.account_id !== ""
-      ? [
-          {
-            description: v.notes.trim() || `Invoice ${v.invoice_number.trim()}`,
-            account_id: v.account_id,
-            line_subtotal: subtotal,
-            line_gst: gst,
-            line_total: total,
-            tax_code: taxCode,
-          },
-        ]
-      : null;
+
   return {
     direction: v.direction,
     contact_name: v.contact_name.trim() || null,
@@ -106,10 +166,10 @@ export function toCreatePayload(
     invoice_number: v.invoice_number.trim(),
     issue_date: v.issue_date,
     due_date: v.due_date || null,
-    subtotal,
-    gst_amount: gst,
-    total,
-    gst_inclusive: opts.gst_registered === false ? false : v.gst_inclusive,
+    subtotal: totals.subtotal,
+    gst_amount: totals.gst_amount,
+    total: totals.total,
+    gst_inclusive: v.gst_inclusive,
     notes: v.notes.trim() || null,
     source: opts.source ?? "manual",
     attachment_id: opts.attachment_id ?? null,
@@ -124,29 +184,6 @@ interface Props {
 }
 
 export default function InvoiceForm({ value, onChange, showDirection = true }: Props) {
-  const [taxCodeTouched, setTaxCodeTouched] = useState(false);
-  const set = <K extends keyof InvoiceFormValues>(k: K, v: InvoiceFormValues[K]) =>
-    onChange({ ...value, [k]: v });
-  const setDirection = (direction: InvoiceDirection) => {
-    if (direction === value.direction) return;
-    // Account ids are not portable across invoice directions: AR requires
-    // income, while AP requires expense/COGS.  Clear the hidden old selection
-    // atomically with the direction switch so it cannot leak into submission.
-    const resetCapital = direction === "AR" && value.tax_code === "capital";
-    if (resetCapital) setTaxCodeTouched(false);
-    onChange({
-      ...value,
-      direction,
-      account_id: "",
-      tax_code: resetCapital
-        ? defaultLineTaxCode(value.gst_amount)
-        : value.tax_code,
-    });
-  };
-
-  // Keyed by company id like every other accounts query: per-company SQLite
-  // ids collide across companies, so serving a stale cross-company list could
-  // code an invoice line to the wrong account after a switch.
   const currentId = useCompanyStore((s) => s.currentId);
   const companyQ = useCurrentCompany();
   const gstRegistrationKnown = companyQ.data != null;
@@ -156,108 +193,83 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
     queryFn: async () => (await api.get<Account[]>("/accounts")).data,
     enabled: !!currentId,
   });
-  // AR is income; AP may be an ordinary expense/COGS or an asset acquisition.
-  const codeTypes =
-    value.direction === "AR"
-      ? ["INCOME"]
-      : ["ASSET", "EXPENSE", "COST_OF_SALES"];
-  const accountChoices = (accounts ?? [])
-    .filter(
-      (a) =>
-        a.active &&
-        codeTypes.includes(a.type) &&
-        !(
-          value.direction === "AP" &&
-          ["1000", "1100", "1200"].includes(a.code)
-        ),
-    )
-    .sort((a, b) => a.code.localeCompare(b.code));
-  const selectedAccount =
-    value.account_id === ""
-      ? null
-      : accountChoices.find((account) => account.id === value.account_id) ?? null;
-  const capitalEligible =
-    value.direction === "AP" && selectedAccount?.type === "ASSET";
 
-  // Auto-derive missing money fields. If user enters total + subtotal, fill GST.
-  // If user enters total only and GST is inclusive, derive subtotal/gst at 10%.
-  const [autoDerive, setAutoDerive] = useState(true);
-  useEffect(() => {
-    if (!gstRegistrationKnown) return;
-    const sub = parseFloat(stripMoney(value.subtotal));
-    const gst = parseFloat(stripMoney(value.gst_amount));
-    const tot = parseFloat(stripMoney(value.total));
-    const withTaxDefault = (
-      updates: Partial<InvoiceFormValues>,
-    ): InvoiceFormValues => {
-      const merged = { ...value, ...updates };
-      return {
-        ...merged,
-        tax_code: !gstRegistered
-          ? "none"
-          : taxCodeTouched
-            ? merged.tax_code
-            : defaultLineTaxCode(merged.gst_amount),
-      };
-    };
-    if (!gstRegistered) {
-      const gross = !Number.isNaN(tot) ? tot : !Number.isNaN(sub) ? sub : NaN;
-      if (!Number.isNaN(gross)) {
-        const amount = gross.toFixed(2);
-        if (
-          stripMoney(value.subtotal) !== amount ||
-          stripMoney(value.gst_amount) !== "0" ||
-          stripMoney(value.total) !== amount ||
-          value.gst_inclusive ||
-          value.tax_code !== "none"
-        ) {
-          onChange(withTaxDefault({
-            subtotal: amount,
-            gst_amount: "0",
-            total: amount,
-            gst_inclusive: false,
-          }));
+  const codeTypes = value.direction === "AR" ? ["INCOME"] : ["ASSET", "EXPENSE", "COST_OF_SALES"];
+  const accountChoices = (accounts ?? [])
+    .filter((a) => a.active && codeTypes.includes(a.type) && !(value.direction === "AP" && ["1000", "1100", "1200"].includes(a.code)))
+    .sort((a, b) => a.code.localeCompare(b.code));
+
+  const lineAccountType = (line: InvoiceLineDraft): string | null => {
+    if (line.account_id === "" || line.account_id == null) return null;
+    return accountChoices.find((account) => account.id === line.account_id)?.type ?? null;
+  };
+
+  const applyLines = (nextLines: InvoiceLineDraft[]) => {
+    const fallbackTax = gstRegistered ? value.tax_code || "standard" : "none";
+    const normalised = nextLines.map((line) => computeLine({ ...line, tax_code: line.tax_code || fallbackTax }, fallbackTax));
+    const totals = summariseLines(normalised);
+    onChange({
+      ...value,
+      ...totals,
+      tax_code: normalised[0]?.tax_code ?? fallbackTax,
+      account_id: normalised[0]?.account_id ?? "",
+      lines: normalised,
+    });
+  };
+
+  const updateLine = (index: number, changes: Partial<InvoiceLineDraft>) => {
+    const nextLines = value.lines.map((line, i) => {
+      if (i !== index) return line;
+      const nextLine = { ...line, ...changes };
+      if ((changes.account_id !== undefined || value.direction === "AR") && nextLine.account_id !== "" && value.direction === "AP") {
+        const selectedType = accountChoices.find((account) => account.id === nextLine.account_id)?.type;
+        if (selectedType !== "ASSET" && nextLine.tax_code === "capital") {
+          nextLine.tax_code = "standard";
         }
       }
-      return;
-    }
-    if (!autoDerive) {
-      const desiredTax = taxCodeTouched
-        ? value.tax_code
-        : defaultLineTaxCode(value.gst_amount);
-      if (desiredTax !== value.tax_code) {
-        onChange({ ...value, tax_code: desiredTax });
+      if (value.direction === "AR") {
+        const selectedType = nextLine.account_id === "" ? null : accountChoices.find((account) => account.id === nextLine.account_id)?.type ?? null;
+        if (nextLine.account_id === "" || selectedType !== "INCOME") {
+          nextLine.account_id = "";
+        }
+        nextLine.tax_code = "standard";
       }
-      return;
-    }
-    if (!Number.isNaN(tot) && Number.isNaN(sub) && Number.isNaN(gst) && value.gst_inclusive) {
-      const newSub = (tot / 1.1).toFixed(2);
-      const newGst = (tot - parseFloat(newSub)).toFixed(2);
-      onChange(withTaxDefault({ subtotal: newSub, gst_amount: newGst }));
-    } else if (!Number.isNaN(tot) && !Number.isNaN(sub) && Number.isNaN(gst)) {
-      onChange(withTaxDefault({ gst_amount: (tot - sub).toFixed(2) }));
-    } else if (!Number.isNaN(sub) && !Number.isNaN(gst) && Number.isNaN(tot)) {
-      onChange(withTaxDefault({ total: (sub + gst).toFixed(2) }));
-    } else {
-      const desiredTax = taxCodeTouched
-        ? value.tax_code
-        : defaultLineTaxCode(value.gst_amount);
-      if (desiredTax !== value.tax_code) {
-        onChange({ ...value, tax_code: desiredTax });
-      }
-    }
-    // We only auto-derive once per change of a single field, so it's intentional.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    value.total,
-    value.subtotal,
-    value.gst_amount,
-    value.gst_inclusive,
-    gstRegistered,
-    gstRegistrationKnown,
-    taxCodeTouched,
-    value.tax_code,
-  ]);
+      return nextLine;
+    });
+    applyLines(nextLines);
+  };
+
+  const addLine = () => {
+    const fallbackTax = gstRegistered ? value.tax_code || "standard" : "none";
+    const nextLines = [...value.lines, blankLine(fallbackTax)];
+    applyLines(nextLines);
+  };
+
+  const removeLine = (index: number) => {
+    if (value.lines.length <= 1) return;
+    const nextLines = value.lines.filter((_, i) => i !== index);
+    applyLines(nextLines);
+  };
+
+  const setDirection = (direction: InvoiceDirection) => {
+    if (direction === value.direction) return;
+    onChange({
+      ...value,
+      direction,
+      account_id: "",
+      tax_code: direction === "AR" ? "standard" : value.tax_code,
+      lines: value.lines.map((line) => ({ ...line, account_id: "", tax_code: direction === "AR" ? "standard" : line.tax_code })),
+    });
+  };
+
+  const validLines = value.lines.filter(lineIsValid);
+  const taxOptionsForLine = (line: InvoiceLineDraft) => {
+    const options: TaxCode[] = ["standard", "gst_free", "input_taxed", "none"];
+    const assetSelected = value.direction === "AP" && lineAccountType(line) === "ASSET";
+    if (assetSelected && line.tax_code === "capital") options.push("capital");
+    return options;
+  };
+  const legacyFirstLine = value.lines[0] ?? blankLine(value.direction === "AR" ? "standard" : "gst_free");
 
   return (
     <div className="space-y-3">
@@ -267,9 +279,7 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
             <button
               type="button"
               className={`px-3 py-1 text-sm rounded border ${
-                value.direction === "AP"
-                  ? "bg-emerald-600 text-white border-emerald-600"
-                  : "bg-surface text-slate-700 border-slate-300"
+                value.direction === "AP" ? "bg-emerald-600 text-white border-emerald-600" : "bg-surface text-slate-700 border-slate-300"
               }`}
               onClick={() => setDirection("AP")}
             >
@@ -278,9 +288,7 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
             <button
               type="button"
               className={`px-3 py-1 text-sm rounded border ${
-                value.direction === "AR"
-                  ? "bg-emerald-600 text-white border-emerald-600"
-                  : "bg-surface text-slate-700 border-slate-300"
+                value.direction === "AR" ? "bg-emerald-600 text-white border-emerald-600" : "bg-surface text-slate-700 border-slate-300"
               }`}
               onClick={() => setDirection("AR")}
             >
@@ -292,203 +300,229 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
 
       <div className="grid grid-cols-2 gap-3">
         <Field label={value.direction === "AP" ? "Supplier name" : "Customer name"}>
-          <input
-            className="input"
-            value={value.contact_name}
-            onChange={(e) => set("contact_name", e.target.value)}
-          />
+          <input className="input" value={value.contact_name} onChange={(e) => onChange({ ...value, contact_name: e.target.value })} />
         </Field>
         <Field label="ABN (optional)">
-          <input
-            className="input"
-            value={value.contact_abn}
-            onChange={(e) => set("contact_abn", e.target.value)}
-          />
+          <input className="input" value={value.contact_abn} onChange={(e) => onChange({ ...value, contact_abn: e.target.value })} />
         </Field>
       </div>
+
+      {!showDirection && value.direction === "AR" && (
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Income account (needed to post to the ledger)">
+            <select
+              aria-label="Income account (needed to post to the ledger)"
+              className="input"
+              value={legacyFirstLine.account_id === "" ? "" : String(legacyFirstLine.account_id)}
+              onChange={(e) => {
+                const nextAccountId = e.target.value === "" ? "" : Number(e.target.value);
+                updateLine(0, {
+                  ...legacyFirstLine,
+                  description: legacyFirstLine.description || "Customer invoice",
+                  quantity: legacyFirstLine.quantity || "1",
+                  unit_price: legacyFirstLine.unit_price || "110.00",
+                  account_id: nextAccountId,
+                  tax_code: "standard",
+                });
+              }}
+            >
+              <option value="">Select account</option>
+              {accountChoices.map((a) => (
+                <option key={a.id} value={a.id}>{a.code} · {a.name}</option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Total (incl GST)">
+            <input
+              aria-label="Total (incl GST)"
+              className="input"
+              value={value.total}
+              onChange={(e) => {
+                const nextTotal = Number(stripMoney(e.target.value) || "0");
+                updateLine(0, {
+                  ...legacyFirstLine,
+                  description: legacyFirstLine.description || "Customer invoice",
+                  quantity: "1",
+                  unit_price: moneyString(nextTotal),
+                  account_id: legacyFirstLine.account_id,
+                  tax_code: "standard",
+                });
+              }}
+            />
+          </Field>
+        </div>
+      )}
 
       <div className="grid grid-cols-3 gap-3">
         <Field label="Invoice #">
-          <input
-            className="input"
-            value={value.invoice_number}
-            onChange={(e) => set("invoice_number", e.target.value)}
-          />
+          <input className="input" value={value.invoice_number} onChange={(e) => onChange({ ...value, invoice_number: e.target.value })} />
         </Field>
         <Field label="Issue date" hint="(DD/MM/YYYY)">
-          <DateInput
-            value={value.issue_date}
-            onChange={(v) => set("issue_date", v)}
-          />
+          <DateInput value={value.issue_date} onChange={(v) => onChange({ ...value, issue_date: v })} />
         </Field>
         <Field label="Due date (optional)" hint="(DD/MM/YYYY)">
-          <DateInput
-            value={value.due_date}
-            onChange={(v) => set("due_date", v)}
-          />
+          <DateInput value={value.due_date} onChange={(v) => onChange({ ...value, due_date: v })} />
         </Field>
+      </div>
+
+      <div className="rounded-md border border-slate-200 bg-slate-50 p-3 space-y-3">
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-medium text-slate-700">Line items</span>
+          <button type="button" className="btn-secondary text-xs" onClick={addLine}>
+            + Add line
+          </button>
+        </div>
+
+        {value.lines.map((line, index) => (
+          <div key={`${index}-${line.description}`} className="rounded border border-slate-200 bg-white p-3 space-y-3">
+            <div className="grid grid-cols-12 gap-2 items-end">
+              <div className="col-span-5">
+                <label className="block text-xs text-slate-600 mb-1">Description</label>
+                <input
+                  className="input"
+                  value={line.description}
+                  onChange={(e) => updateLine(index, { description: e.target.value })}
+                />
+              </div>
+              <div className="col-span-2">
+                <label className="block text-xs text-slate-600 mb-1">Qty</label>
+                <input
+                  className="input"
+                  inputMode="decimal"
+                  value={line.quantity}
+                  onChange={(e) => updateLine(index, { quantity: e.target.value })}
+                />
+              </div>
+              <div className="col-span-2">
+                <label className="block text-xs text-slate-600 mb-1">Unit price</label>
+                <input
+                  className="input"
+                  inputMode="decimal"
+                  value={line.unit_price}
+                  onChange={(e) => updateLine(index, { unit_price: e.target.value })}
+                />
+              </div>
+              <div className="col-span-2">
+                <label className="block text-xs text-slate-600 mb-1">Tax</label>
+                <select
+                  aria-label="Tax"
+                  className="input"
+                  value={line.tax_code}
+                  onChange={(e) => updateLine(index, { tax_code: e.target.value as TaxCode })}
+                >
+                  {taxOptionsForLine(line).map((option) => (
+                    <option key={option} value={option}>
+                      {option === "capital" ? "Capital" : option === "standard" ? "GST" : option === "gst_free" ? "GST-free" : option === "input_taxed" ? "Input-taxed" : "None"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-span-1 flex justify-end">
+                <button
+                  type="button"
+                  className="btn-secondary text-xs px-2 py-1"
+                  onClick={() => removeLine(index)}
+                  disabled={value.lines.length <= 1}
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-12 gap-2">
+              <div className="col-span-4">
+                <label className="block text-xs text-slate-600 mb-1">Income / asset account</label>
+                <select
+                  aria-label="Income / asset account"
+                  className="input"
+                  value={line.account_id === "" ? "" : String(line.account_id)}
+                  onChange={(e) => {
+                    const nextAccountId = e.target.value === "" ? "" : Number(e.target.value);
+                    const nextAccountType = nextAccountId === "" ? null : accountChoices.find((account) => account.id === nextAccountId)?.type ?? null;
+                    const nextLine: InvoiceLineDraft = {
+                      ...line,
+                      account_id: nextAccountId,
+                      tax_code: value.direction === "AR"
+                        ? "standard"
+                        : nextAccountType === "ASSET" && line.tax_code === "capital"
+                          ? "capital"
+                          : nextAccountType !== "ASSET" && line.tax_code === "capital"
+                            ? "standard"
+                            : line.tax_code,
+                    };
+                    updateLine(index, nextLine);
+                  }}
+                >
+                  <option value="">Select account</option>
+                  {accountChoices.map((a) => (
+                    <option key={`${a.id}-${index}`} value={a.id}>{a.code} · {a.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-span-2">
+                <label className="block text-xs text-slate-600 mb-1">GST rate</label>
+                <input className="input bg-slate-100" value={line.gst_rate} readOnly />
+              </div>
+              <div className="col-span-2">
+                <label className="block text-xs text-slate-600 mb-1">Subtotal</label>
+                <input className="input bg-slate-100" value={line.line_subtotal} readOnly />
+              </div>
+              <div className="col-span-2">
+                <label className="block text-xs text-slate-600 mb-1">GST</label>
+                <input className="input bg-slate-100" value={line.line_gst} readOnly />
+              </div>
+              <div className="col-span-2">
+                <label className="block text-xs text-slate-600 mb-1">Total</label>
+                <input className="input bg-slate-100" value={line.line_total} readOnly />
+              </div>
+            </div>
+
+            {!lineIsValid(line) && (
+              <p className="text-xs text-amber-700">
+                {line.description.trim() ? "" : "Description is required. "}
+                {Number(stripMoney(line.quantity) || "0") <= 0 ? "Quantity must be greater than zero. " : ""}
+                {!Number.isFinite(Number(stripMoney(line.unit_price) || "0")) || Number(stripMoney(line.unit_price) || "0") < 0 ? "Unit price must be valid and non-negative. " : ""}
+                {line.account_id === "" || Number(line.account_id) <= 0 ? "Account is required. " : ""}
+              </p>
+            )}
+          </div>
+        ))}
       </div>
 
       <div className="grid grid-cols-3 gap-3">
-        <Field label={gstRegistered ? "Subtotal (ex GST)" : "Amount (no GST split)"}>
-          <input
-            className="input"
-            inputMode="decimal"
-            value={value.subtotal}
-            onChange={(e) => set("subtotal", e.target.value)}
-          />
+        <Field label="Subtotal">
+          <input className="input bg-slate-100" value={value.subtotal} readOnly />
         </Field>
-        <Field label={gstRegistered ? "GST" : "GST (not registered)"}>
-          <input
-            className="input"
-            inputMode="decimal"
-            value={value.gst_amount}
-            disabled={!gstRegistered}
-            onChange={(e) => {
-              const nextGst = e.target.value;
-              if (
-                Number(stripMoney(nextGst) || 0) > 0 &&
-                ["gst_free", "input_taxed", "none"].includes(value.tax_code)
-              ) {
-                setTaxCodeTouched(false);
-                const gross = Number(stripMoney(value.total));
-                const gst = Number(stripMoney(nextGst));
-                onChange({
-                  ...value,
-                  gst_amount: nextGst,
-                  tax_code: "standard",
-                  subtotal:
-                    Number.isFinite(gross) &&
-                    Number.isFinite(gst) &&
-                    gross >= gst
-                      ? (gross - gst).toFixed(2)
-                      : value.subtotal,
-                });
-              } else {
-                set("gst_amount", nextGst);
-              }
-            }}
-          />
+        <Field label="GST">
+          <input className="input bg-slate-100" value={value.gst_amount} readOnly />
         </Field>
-        <Field label={gstRegistered ? "Total (incl GST)" : "Total"}>
-          <input
-            className="input"
-            inputMode="decimal"
-            value={value.total}
-            onChange={(e) => set("total", e.target.value)}
-          />
+        <Field label="Total">
+          <input className="input bg-slate-100" value={value.total} readOnly />
         </Field>
       </div>
-
-      <Field
-        label={value.direction === "AR" ? "Income account" : "Expense / asset account"}
-        hint="(needed to post to the ledger)"
-      >
-        <select
-          className="input"
-          value={value.account_id === "" ? "" : String(value.account_id)}
-          onChange={(e) => {
-            const nextId = e.target.value === "" ? "" : Number(e.target.value);
-            const nextAccount =
-              nextId === ""
-                ? null
-                : accountChoices.find((account) => account.id === nextId) ?? null;
-            if (value.tax_code === "capital" && nextAccount?.type !== "ASSET") {
-              setTaxCodeTouched(false);
-              onChange({
-                ...value,
-                account_id: nextId,
-                tax_code: defaultLineTaxCode(value.gst_amount),
-              });
-            } else {
-              set("account_id", nextId);
-            }
-          }}
-        >
-          <option value="">— code later (stays a draft) —</option>
-          {accountChoices.map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.code} · {a.name}
-            </option>
-          ))}
-        </select>
-      </Field>
-
-      <Field label="GST treatment" hint="(Australian tax classification)">
-        <select
-          className="input"
-          value={gstRegistered ? value.tax_code : "none"}
-          disabled={!gstRegistered}
-          onChange={(event) => {
-            const taxCode = event.target.value as TaxCode;
-            setTaxCodeTouched(true);
-            if (["gst_free", "input_taxed", "none"].includes(taxCode)) {
-              const gross = stripMoney(value.total) || stripMoney(value.subtotal) || "0";
-              onChange({
-                ...value,
-                tax_code: taxCode,
-                subtotal: gross,
-                gst_amount: "0",
-                total: gross,
-                gst_inclusive: false,
-              });
-            } else {
-              onChange({ ...value, tax_code: taxCode });
-            }
-          }}
-        >
-          <option value="standard">GST taxable - standard rate (10%)</option>
-          <option value="gst_free">GST-free sale or purchase</option>
-          <option value="input_taxed">Input-taxed supply or acquisition</option>
-          <option value="none">Outside GST / not reportable on BAS</option>
-          {capitalEligible && (
-            <option value="capital">Capital purchase - asset account (G10)</option>
-          )}
-        </select>
-        {value.direction === "AP" && !capitalEligible && gstRegistered && (
-          <span className="block text-xs text-slate-500 mt-1">
-            Choose an Asset account to enable the Capital purchase treatment.
-          </span>
-        )}
-        {!gstRegistered && gstRegistrationKnown && (
-          <span className="block text-xs text-amber-700 mt-1">
-            Non-GST-registered companies always submit Outside GST / none.
-          </span>
-        )}
-      </Field>
 
       <div className="flex items-center gap-4 text-xs text-slate-600">
         <label className="flex items-center gap-1">
           <input
             type="checkbox"
             checked={value.gst_inclusive}
-            disabled={!gstRegistered}
-            onChange={(e) => set("gst_inclusive", e.target.checked)}
+            onChange={(e) => onChange({ ...value, gst_inclusive: e.target.checked })}
           />
           GST inclusive
         </label>
-        <label className="flex items-center gap-1">
-          <input
-            type="checkbox"
-            checked={autoDerive}
-            onChange={(e) => setAutoDerive(e.target.checked)}
-          />
-          Auto-derive missing money fields
-        </label>
-        {!gstRegistered && gstRegistrationKnown && (
-          <span className="text-amber-700">
-            Company is not GST-registered; enter the full gross amount.
-          </span>
-        )}
+        {!gstRegistrationKnown && <span className="text-slate-500">Company metadata loading…</span>}
+        {!gstRegistered && gstRegistrationKnown && <span className="text-amber-700">Company is not GST-registered; GST is zero.</span>}
       </div>
 
+      {validLines.length !== value.lines.length && (
+        <p className="text-xs text-amber-700">Complete each line before submission.</p>
+      )}
+
       <Field label="Notes">
-        <textarea
-          className="input min-h-[60px]"
-          value={value.notes}
-          onChange={(e) => set("notes", e.target.value)}
-        />
+        <textarea className="input min-h-[60px]" value={value.notes} onChange={(e) => onChange({ ...value, notes: e.target.value })} />
       </Field>
+
+      <div className="text-xs text-slate-500">Header totals are derived from all visible lines and are not editable.</div>
     </div>
   );
 }

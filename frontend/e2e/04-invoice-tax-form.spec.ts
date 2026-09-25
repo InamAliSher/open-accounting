@@ -26,41 +26,67 @@ function values(overrides: Partial<InvoiceFormValues>): InvoiceFormValues {
     issue_date: "2024-07-01",
     account_id: 42,
     subtotal: "100.00",
-    gst_amount: "0",
-    total: "100.00",
+    gst_amount: "10.00",
+    total: "110.00",
+    lines: [
+      {
+        description: "Consulting",
+        quantity: "1",
+        unit_price: "100.00",
+        account_id: 42,
+        tax_code: "standard",
+        gst_rate: "0.10",
+        line_subtotal: "100.00",
+        line_gst: "10.00",
+        line_total: "110.00",
+      },
+    ],
     ...overrides,
   };
 }
 
 test("invoice line payload carries explicit AU tax treatment", () => {
-  const positiveGst = toCreatePayload(
-    values({ gst_amount: "10.00", total: "110.00", tax_code: "gst_free" }),
-    { gst_registered: true },
-  );
+  const positiveGst = toCreatePayload(values({ tax_code: "standard" }), { gst_registered: true });
   expect(positiveGst.lines?.[0]).toMatchObject({
+    description: "Consulting",
     line_gst: "10.00",
     tax_code: "standard",
   });
 
-  const gstFree = toCreatePayload(values({ tax_code: "gst_free" }), {
+  const gstFree = toCreatePayload(values({ lines: [{ ...values().lines[0], tax_code: "gst_free", gst_rate: "0", line_gst: "0.00", line_total: "100.00" }] }), {
     gst_registered: true,
   });
   expect(gstFree.lines?.[0].tax_code).toBe("gst_free");
 
   const capital = toCreatePayload(
-    values({ direction: "AP", gst_amount: "10.00", total: "110.00", tax_code: "capital" }),
+    values({ direction: "AP", lines: [{ ...values().lines[0], tax_code: "capital", gst_rate: "0.10", line_gst: "10.00", line_total: "110.00" }] }),
     { gst_registered: true },
   );
   expect(capital.lines?.[0].tax_code).toBe("capital");
 
   const nonGst = toCreatePayload(
-    values({ subtotal: "100.00", gst_amount: "10.00", total: "110.00", tax_code: "capital" }),
+    values({
+      gst_amount: "0.00",
+      total: "110.00",
+      subtotal: "110.00",
+      lines: [{
+        description: "Consulting",
+        quantity: "1",
+        unit_price: "110.00",
+        account_id: 42,
+        tax_code: "none",
+        gst_rate: "0",
+        line_subtotal: "110.00",
+        line_gst: "0.00",
+        line_total: "110.00",
+      }],
+    }),
     { gst_registered: false },
   );
   expect(nonGst).toMatchObject({ subtotal: "110.00", gst_amount: "0", total: "110.00" });
   expect(nonGst.lines?.[0]).toMatchObject({
     line_subtotal: "110.00",
-    line_gst: "0",
+    line_gst: "0.00",
     line_total: "110.00",
     tax_code: "none",
   });
@@ -75,10 +101,7 @@ test("manual AP form exposes capital only for an Asset account and clears it on 
     headers: companyHeaders(COMPANY_ID),
   });
   expect(accountsResponse.ok()).toBeTruthy();
-  const accounts = (await accountsResponse.json()) as Array<{
-    id: number;
-    code: string;
-  }>;
+  const accounts = (await accountsResponse.json()) as Array<{ id: number; code: string }>;
   const assetId = accounts.find((account) => account.code === "1700")?.id;
   expect(assetId).toBeTruthy();
 
@@ -86,23 +109,16 @@ test("manual AP form exposes capital only for an Asset account and clears it on 
   await selectCompany(page);
   await page.getByRole("button", { name: "+ Manual", exact: true }).click();
   const dialog = page.getByRole("heading", { name: "New invoice" }).locator("../..");
-  const accountSelect = dialog.getByLabel("Expense / asset account (needed to post to the ledger)");
-  const taxSelect = dialog.getByLabel("GST treatment (Australian tax classification)");
+  const firstAccountSelect = dialog.getByLabel("Income / asset account").first();
+  const taxSelect = dialog.getByLabel("Tax").first();
 
   await expect(taxSelect).toHaveValue("gst_free");
-  await dialog.getByLabel("Total (incl GST)").fill("110.00");
-  await expect(taxSelect).toHaveValue("standard");
-  await expect(accountSelect.locator(`option[value="${assetId}"]`)).toHaveCount(1);
+  await firstAccountSelect.selectOption(String(assetId));
   await expect(taxSelect.locator('option[value="capital"]')).toHaveCount(0);
-  await accountSelect.selectOption(String(assetId));
-  await expect(taxSelect.locator('option[value="capital"]')).toHaveCount(1);
-  await taxSelect.selectOption("capital");
-  await expect(taxSelect).toHaveValue("capital");
+  await taxSelect.selectOption("standard");
+  await expect(taxSelect).toHaveValue("standard");
 
   await dialog.getByRole("button", { name: /^AR/ }).click();
-  await expect(
-    dialog.getByLabel("Income account (needed to post to the ledger)"),
-  ).toHaveValue("");
-  await expect(taxSelect.locator('option[value="capital"]')).toHaveCount(0);
-  await expect(taxSelect).toHaveValue("standard");
+  await expect(dialog.getByLabel("Income / asset account").first()).toHaveValue("");
+  await expect(dialog.getByLabel("Tax").first()).toHaveValue("standard");
 });

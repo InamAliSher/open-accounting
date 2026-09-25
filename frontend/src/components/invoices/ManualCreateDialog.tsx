@@ -45,7 +45,16 @@ export default function ManualCreateDialog({
     !!form.contact_name &&
     !!form.invoice_number &&
     !!form.issue_date &&
-    !!form.total;
+    form.lines.length > 0 &&
+    form.lines.every((line) => {
+      if (!line.description.trim()) return false;
+      const qty = Number((line.quantity ?? "0").replace(/,/g, ""));
+      const unit = Number((line.unit_price ?? "0").replace(/,/g, ""));
+      if (!Number.isFinite(qty) || qty <= 0) return false;
+      if (!Number.isFinite(unit) || unit < 0) return false;
+      if (line.account_id === "" || Number(line.account_id) <= 0) return false;
+      return !!line.tax_code;
+    });
   const submit = () => {
     if (canCreate) {
       mut.mutate(toCreatePayload(form, {
