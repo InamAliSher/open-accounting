@@ -29,23 +29,29 @@ export default function InvoicesContent({
   onImportExcel,
   showCreateActions = true,
   title = "Invoices",
+  fixedDirection,
+  showDirectionFilter = true,
 }: {
   onSelectInvoice: (invoice: Invoice) => void;
   onCreateManual: () => void;
   onImportExcel: () => void;
   showCreateActions?: boolean;
   title?: string;
+  fixedDirection?: InvoiceDirection | "ALL";
+  showDirectionFilter?: boolean;
 }) {
   const currentId = useCompanyStore((s) => s.currentId);
-  const [direction, setDirection] = useState<DirectionFilter>("ALL");
+  const [direction, setDirection] = useState<DirectionFilter>(fixedDirection ?? "ALL");
   const [status, setStatus] = useState<StatusFilter>("ALL");
   const [q, setQ] = useState("");
 
+  const effectiveDirection = fixedDirection ?? direction;
+
   const { data, isLoading, error } = useQuery({
-    queryKey: ["invoices", currentId, direction, status, q],
+    queryKey: ["invoices", currentId, effectiveDirection, status, q],
     queryFn: () =>
       fetchInvoices({
-        direction: direction === "ALL" ? undefined : direction,
+        direction: effectiveDirection === "ALL" ? undefined : effectiveDirection,
         status: status === "ALL" ? undefined : status,
         q: q.trim() || undefined,
       }),
@@ -91,20 +97,24 @@ export default function InvoicesContent({
 
       <div className="bg-surface rounded-lg border border-slate-200 p-4">
         <div className="flex flex-wrap gap-3 mb-3">
-          <Pills
-            value={direction}
-            onChange={(v) => setDirection(v as DirectionFilter)}
-            options={[
-              { v: "ALL", label: "All" },
-              { v: "AP", label: "AP (bills)" },
-              { v: "AR", label: "AR (sales)" },
-            ]}
-          />
+          {showDirectionFilter && (
+            <Pills
+              value={direction}
+              onChange={(v) => setDirection(v as DirectionFilter)}
+              options={[
+                { v: "ALL", label: "All" },
+                { v: "AP", label: "AP (bills)" },
+                { v: "AR", label: "AR (sales)" },
+              ]}
+            />
+          )}
           <Pills
             value={status}
             onChange={(v) => setStatus(v as StatusFilter)}
             options={[
               { v: "ALL", label: "Any status" },
+              { v: "draft", label: "Draft" },
+              { v: "authorised", label: "Authorised" },
               { v: "unpaid", label: "Unpaid" },
               { v: "partial", label: "Partial" },
               { v: "paid", label: "Paid" },
@@ -171,7 +181,7 @@ export default function InvoicesContent({
                         </span>
                       </Td>
                       <Td className="font-mono">{displayDocNumber(inv.invoice_number)}</Td>
-                      <Td>{displayName(inv.contact_name, "provider")}</Td>
+                      <Td>{displayName(inv.contact_name, inv.direction === "AR" ? "client" : "provider")}</Td>
                       <Td className="text-right">
                         {formatMoney(inv.subtotal, inv.currency)}
                       </Td>

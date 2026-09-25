@@ -85,3 +85,74 @@ test("03 — Documents page lists Receipts + can open New Receipt dialog", async
   // dialog-scoped sanity check.
   await expect(page.getByLabel("Issue date")).toBeVisible();
 });
+
+test("04 — Customer Invoices link, route, and AR-only list behavior", async ({
+  page,
+}) => {
+  await ensureCompany(page.context().request);
+
+  await page.goto("/");
+  await expect(
+    page.getByRole("link", { name: "Customer Invoices", exact: true }),
+  ).toBeVisible();
+
+  const arListRequest = page.waitForRequest(
+    (request) =>
+      request.method() === "GET" &&
+      request.url().includes("/api/v1/invoices") &&
+      new URL(request.url()).searchParams.get("direction") === "AR",
+  );
+
+  await page.getByRole("link", { name: "Customer Invoices", exact: true }).click();
+
+  await expect(page.getByRole("heading", { name: "Customer Invoices" })).toBeVisible({
+    timeout: 5000,
+  });
+  await expect(page.getByRole("button", { name: /AP · Bill from supplier/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /AR · Invoice to customer/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Draft" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Authorised" })).toBeVisible();
+
+  const req = await arListRequest;
+  expect(new URL(req.url()).searchParams.get("direction")).toBe("AR");
+});
+
+test("05 — Customer Invoices manual create posts direction=AR", async ({ page }) => {
+  await ensureCompany(page.context().request);
+
+  const createRequest = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" && request.url().includes("/api/v1/invoices"),
+  );
+
+  await page.goto("/customer-invoices");
+  await page.getByRole("button", { name: /\+\s*Manual/i }).click();
+
+  await expect(page.getByRole("heading", { name: "New invoice" })).toBeVisible({
+    timeout: 5000,
+  });
+  await expect(page.getByRole("button", { name: /AP · Bill from supplier/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /AR · Invoice to customer/i })).toHaveCount(0);
+
+  await page.getByLabel("Customer name").fill("Customer UI");
+  await page.getByLabel("Invoice #").fill("AR-UI-001");
+  await page.getByLabel("Issue date").fill("01/09/2026");
+  const accountSelect = page.getByLabel("Income account (needed to post to the ledger)");
+  await accountSelect.selectOption({ index: 1 });
+  await page.getByLabel("Total (incl GST)").fill("110.00");
+  await page.getByRole("button", { name: "Create" }).click();
+
+  const req = await createRequest;
+  const payload = JSON.parse(req.postData() ?? "{}");
+  expect(payload.direction).toBe("AR");
+  await expect(page.getByRole("heading", { name: "Customer Invoices" })).toBeVisible();
+});
+
+test("06 — Receipts route remains available", async ({ page }) => {
+  await ensureCompany(page.context().request);
+
+  await page.goto("/");
+  await expect(page.getByRole("link", { name: "Documents", exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Documents", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Receipts" })).toBeVisible();
+});

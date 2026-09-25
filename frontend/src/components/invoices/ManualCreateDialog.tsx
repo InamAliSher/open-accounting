@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../lib/api";
 import { apiErrorMessage } from "../../lib/errors";
 import { useModalKeys } from "../../lib/useModalKeys";
-import type { Invoice } from "../../types/api";
+import type { Invoice, InvoiceDirection } from "../../types/api";
 import InvoiceForm, {
   EMPTY_FORM,
   toCreatePayload,
@@ -16,10 +16,21 @@ async function createInvoice(payload: ReturnType<typeof toCreatePayload>): Promi
   return data;
 }
 
-export default function ManualCreateDialog({ onClose }: { onClose: () => void }) {
+export default function ManualCreateDialog({
+  onClose,
+  defaultDirection = "AP",
+  showDirection = true,
+}: {
+  onClose: () => void;
+  defaultDirection?: InvoiceDirection;
+  showDirection?: boolean;
+}) {
   const qc = useQueryClient();
   const companyQ = useCurrentCompany();
-  const [form, setForm] = useState<InvoiceFormValues>(EMPTY_FORM);
+  const [form, setForm] = useState<InvoiceFormValues>({
+    ...EMPTY_FORM,
+    direction: defaultDirection,
+  });
   const mut = useMutation({
     mutationFn: createInvoice,
     onSuccess: () => {
@@ -56,7 +67,7 @@ export default function ManualCreateDialog({ onClose }: { onClose: () => void })
           </button>
         </div>
         <div className="px-5 py-4 overflow-auto">
-          <InvoiceForm value={form} onChange={setForm} />
+          <InvoiceForm value={form} onChange={setForm} showDirection={showDirection} />
           {mut.isError && (
             <p className="text-sm text-red-600 mt-3">
               {apiErrorMessage(mut.error)}

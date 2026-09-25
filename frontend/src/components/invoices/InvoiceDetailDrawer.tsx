@@ -77,7 +77,9 @@ export default function InvoiceDetailDrawer({ invoice, onClose }: Props) {
 
         <div className="px-5 py-4 overflow-auto space-y-4 text-sm">
           <DetailGrid>
-            <Row label="Contact">{displayName(invoice.contact_name, "provider")}</Row>
+            <Row label="Contact">
+              {displayName(invoice.contact_name, invoice.direction === "AR" ? "client" : "provider")}
+            </Row>
             <Row label="Issue date">{formatDate(invoice.issue_date)}</Row>
             <Row label="Due date">{formatDate(invoice.due_date)}</Row>
             <Row label="Currency">{invoice.currency}</Row>
