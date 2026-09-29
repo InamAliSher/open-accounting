@@ -664,6 +664,9 @@ export interface JournalEntry {
   entry_date: string;     // YYYY-MM-DD
   memo: string;
   reference: string | null;
+  source_type: string;
+  source_id: number | null;
+  reverses_entry_id: number | null;
   created_at: string;
   updated_at: string;
   lines: JournalLine[];

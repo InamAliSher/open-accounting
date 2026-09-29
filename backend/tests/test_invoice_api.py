@@ -381,6 +381,42 @@ def test_void_endpoint_creates_reversal(client, accounts):
     assert body["journal_entry"]["reverses_entry_id"] is not None
 
 
+def test_invoice_journals_reject_manual_mutations_and_keep_provenance(client, accounts):
+    inv = _create_invoice(client, accounts, number="INV-API-IMMUTABLE")
+    posted = client.post(f"/api/v1/invoices/{inv['id']}/post", headers=HEAD)
+    assert posted.status_code == 200, posted.text
+    original = posted.json()["journal_entry"]
+
+    voided = client.post(f"/api/v1/invoices/{inv['id']}/void", headers=HEAD)
+    assert voided.status_code == 200, voided.text
+    reversal = voided.json()["journal_entry"]
+
+    assert original["source_type"] == "invoice_ar"
+    assert original["source_id"] == inv["id"]
+    assert original["reverses_entry_id"] is None
+    assert reversal["source_type"] == "invoice_reversal"
+    assert reversal["source_id"] == inv["id"]
+    assert reversal["reverses_entry_id"] == original["id"]
+
+    for entry in (original, reversal):
+        patch = client.patch(
+            f"/api/v1/journal/{entry['id']}",
+            headers=HEAD,
+            json={"memo": "Unauthorized fictional journal edit"},
+        )
+        assert patch.status_code == 409, patch.text
+
+        delete = client.delete(f"/api/v1/journal/{entry['id']}", headers=HEAD)
+        assert delete.status_code == 409, delete.text
+
+        retrieved = client.get(f"/api/v1/journal/{entry['id']}", headers=HEAD)
+        assert retrieved.status_code == 200, retrieved.text
+        assert retrieved.json()["memo"] == entry["memo"]
+        assert retrieved.json()["source_type"] == entry["source_type"]
+        assert retrieved.json()["source_id"] == inv["id"]
+        assert retrieved.json()["reverses_entry_id"] == entry["reverses_entry_id"]
+
+
 def test_patch_financial_field_on_authorised_invoice_rejected(client, accounts):
     inv = _create_invoice(client, accounts, number="INV-API-4")
     client.post(f"/api/v1/invoices/{inv['id']}/post", headers=HEAD)
