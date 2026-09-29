@@ -134,17 +134,31 @@ test("05 — Customer Invoices manual create posts direction=AR", async ({ page 
   await expect(page.getByRole("button", { name: /AP · Bill from supplier/i })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /AR · Invoice to customer/i })).toHaveCount(0);
 
-  await page.getByLabel("Customer name").fill("Customer UI");
-  await page.getByLabel("Invoice #").fill("AR-UI-001");
-  await page.getByLabel("Issue date").fill("01/09/2026");
-  const accountSelect = page.getByLabel("Income account (needed to post to the ledger)");
+  const dialog = page.getByRole("heading", { name: "New invoice" }).locator("../..");
+  await dialog.getByLabel("Customer name").fill("Customer UI");
+  await dialog.getByLabel("Invoice #").fill("AR-UI-001");
+  await dialog.getByLabel("Issue date").fill("01/09/2026");
+  await dialog.getByLabel("Description").first().fill("Regression consulting");
+  await dialog.getByLabel("Qty").first().fill("1");
+  await dialog.getByLabel("Unit price").first().fill("100.00");
+  const accountSelect = dialog.getByLabel("Account").first();
   await accountSelect.selectOption({ index: 1 });
-  await page.getByLabel("Total (incl GST)").fill("110.00");
-  await page.getByRole("button", { name: "Create" }).click();
+  await dialog.getByRole("button", { name: "Save Draft" }).click();
 
   const req = await createRequest;
   const payload = JSON.parse(req.postData() ?? "{}");
   expect(payload.direction).toBe("AR");
+  expect(payload.lines).toHaveLength(1);
+  expect(payload.lines[0]).toMatchObject({
+    description: "Regression consulting",
+    quantity: "1",
+    unit_price: "100.00",
+    line_subtotal: "100.00",
+    line_gst: "0.00",
+    line_total: "100.00",
+    tax_code: "gst_free",
+  });
+  expect(payload).not.toHaveProperty("status");
   await expect(page.getByRole("heading", { name: "Customer Invoices" })).toBeVisible();
 });
 

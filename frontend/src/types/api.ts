@@ -187,6 +187,8 @@ export interface InvoiceCreate {
 export interface InvoiceLineIn {
   description: string;
   account_id?: number | null;
+  quantity: string;
+  unit_price: string;
   line_subtotal: string;
   line_gst?: string;
   line_total: string;
