@@ -121,28 +121,82 @@ test("validation rejects every incomplete or inconsistent Phase A draft", () => 
   expect(validateInvoiceForm(values({ total: "101.00" })).join(" ")).toContain("amounts are inconsistent");
 });
 
-test("provisional registered-company tax codes do not change neutral amounts", () => {
+test("explicit exclusive, inclusive, and GST-free examples calculate exact line amounts", () => {
   const standard = { ...values().lines[0], tax_code: "standard" as const };
-  const capital = { ...values().lines[0], tax_code: "capital" as const };
-  const inclusive = toCreatePayload(values({ lines: [standard], gst_inclusive: true }), {
-    gst_registered: true,
+  const exclusive = synchronizeInvoiceAmounts(values({
+    amount_mode: "exclusive",
+    lines: [{ ...standard, unit_price: "1000.00" }],
+  }));
+  expect(exclusive).toMatchObject({
+    subtotal: "1000.00", gst_amount: "100.00", total: "1100.00",
   });
-  const exclusive = toCreatePayload(values({ lines: [standard], gst_inclusive: false }), {
-    gst_registered: true,
+  expect(toCreatePayload(exclusive).lines?.[0]).toMatchObject({
+    line_subtotal: "1000.00", line_gst: "100.00", line_total: "1100.00",
   });
-  const capitalPayload = toCreatePayload(values({ lines: [capital] }), {
-    gst_registered: true,
+
+  const inclusive = synchronizeInvoiceAmounts(values({
+    amount_mode: "inclusive",
+    lines: [{ ...standard, unit_price: "1100.00" }],
+  }));
+  expect(inclusive).toMatchObject({
+    subtotal: "1000.00", gst_amount: "100.00", total: "1100.00",
   });
-  expect(inclusive.lines?.[0]).toMatchObject({
-    line_subtotal: "100.00", line_gst: "0.00", line_total: "100.00", tax_code: "standard",
+  expect(toCreatePayload(inclusive).lines?.[0]).toMatchObject({
+    line_subtotal: "1000.00", line_gst: "100.00", line_total: "1100.00",
   });
-  expect(exclusive.lines).toEqual(inclusive.lines);
-  expect(capitalPayload.lines?.[0]).toMatchObject({
-    line_subtotal: "100.00", line_gst: "0.00", line_total: "100.00", tax_code: "capital",
-  });
+
+  const gstFree = synchronizeInvoiceAmounts(values({
+    amount_mode: "inclusive",
+    lines: [{ ...values().lines[0], quantity: "2", unit_price: "55.00" }],
+  }));
+  expect(gstFree).toMatchObject({ subtotal: "110.00", gst_amount: "0.00", total: "110.00" });
 });
 
-test("payload contains every visible neutral line using decimal-dollar strings", () => {
+test("tax-code matrix and integer HALF_UP calculations match cents", () => {
+  for (const amount_mode of ["exclusive", "inclusive"] as const) {
+    for (const tax_code of ["standard", "capital", "gst_free", "input_taxed", "none"] as const) {
+      const taxable = tax_code === "standard" || tax_code === "capital";
+      const unit_price = taxable && amount_mode === "inclusive" ? "110.00" : "100.00";
+      const direction = tax_code === "capital" ? "AP" : "AR";
+      const result = synchronizeInvoiceAmounts(values({
+        direction,
+        amount_mode,
+        lines: [{ ...values().lines[0], tax_code, unit_price }],
+      }));
+      expect(result.gst_amount).toBe(taxable ? "10.00" : "0.00");
+    }
+  }
+
+  const exclusiveHalfUp = synchronizeInvoiceAmounts(values({
+    amount_mode: "exclusive",
+    lines: [{ ...values().lines[0], tax_code: "standard", unit_price: "0.05" }],
+  }));
+  expect(exclusiveHalfUp).toMatchObject({ subtotal: "0.05", gst_amount: "0.01", total: "0.06" });
+
+  expect(calculateNeutralLineAmount("0.5", "0.01")).toBe("0.01");
+  expect(calculateNeutralLineAmount("1.2345", "0.01")).toBe("0.01");
+  expect(calculateNeutralLineAmount("1.00001", "0.01")).toBeNull();
+});
+
+test("line amounts round before header summation and No tax forces none", () => {
+  const line = { ...values().lines[0], tax_code: "standard" as const, unit_price: "0.05" };
+  const rounded = synchronizeInvoiceAmounts(values({ lines: [
+    { ...line, id: "round-first" },
+    { ...line, id: "round-second" },
+  ] }));
+  expect(rounded).toMatchObject({ subtotal: "0.10", gst_amount: "0.02", total: "0.12" });
+
+  const noTax = synchronizeInvoiceAmounts(values({
+    amount_mode: "none",
+    lines: [{ ...line, tax_code: "capital" }],
+  }));
+  expect(noTax.amount_mode).toBe("none");
+  expect(noTax.lines[0].tax_code).toBe("none");
+  expect(noTax).toMatchObject({ subtotal: "0.05", gst_amount: "0.00", total: "0.05" });
+  expect(toCreatePayload(noTax)).toMatchObject({ amount_mode: "none", gst_inclusive: false });
+});
+
+test("payload contains every visible calculated line using decimal-dollar strings", () => {
   const first = {
     ...createInvoiceLine(), id: "payload-1", description: "Consulting",
     quantity: "2", unit_price: "25.00", account_id: 42, tax_code: "standard" as const,
@@ -167,7 +221,7 @@ test("payload contains every visible neutral line using decimal-dollar strings",
   expect(payload.lines).toEqual([
     {
       description: "Consulting", quantity: "2", unit_price: "25.00", account_id: 42,
-      line_subtotal: "50.00", line_gst: "0.00", line_total: "50.00", tax_code: "standard",
+      line_subtotal: "50.00", line_gst: "5.00", line_total: "55.00", tax_code: "standard",
     },
     {
       description: "Materials", quantity: "3", unit_price: "10.00", account_id: 43,
@@ -175,8 +229,8 @@ test("payload contains every visible neutral line using decimal-dollar strings",
     },
   ]);
   expect(payload.subtotal).toBe("80.00");
-  expect(payload.gst_amount).toBe("0.00");
-  expect(payload.total).toBe("80.00");
+  expect(payload.gst_amount).toBe("5.00");
+  expect(payload.total).toBe("85.00");
 
   const invalidVisibleLine = {
     ...createInvoiceLine(), id: "invalid-visible", description: "", unit_price: "",
@@ -193,7 +247,7 @@ test("payload contains every visible neutral line using decimal-dollar strings",
   });
 });
 
-test("non-GST companies submit none without changing neutral amounts", () => {
+test("non-GST companies submit none with zero GST and normalized line codes", () => {
   const payload = toCreatePayload(values({
     gst_inclusive: true,
     lines: [
@@ -201,7 +255,10 @@ test("non-GST companies submit none without changing neutral amounts", () => {
       { ...values().lines[0], id: "second-non-gst", tax_code: "capital" },
     ],
   }), { gst_registered: false });
-  expect(payload).toMatchObject({ subtotal: "200.00", gst_amount: "0.00", total: "200.00" });
+  expect(payload).toMatchObject({
+    subtotal: "200.00", gst_amount: "0.00", total: "200.00",
+    amount_mode: "none", gst_inclusive: false,
+  });
   expect(payload.lines).toHaveLength(2);
   expect(payload.lines?.map((line) => line.tax_code)).toEqual(["none", "none"]);
   expect(payload.lines?.every((line) =>
@@ -232,7 +289,15 @@ test("manual AP form exposes capital only for an Asset account and clears it on 
   const dialog = page.getByRole("heading", { name: "New invoice" }).locator("../..");
   const accountSelect = dialog.getByLabel("Account").first();
   const taxSelect = dialog.getByLabel("Tax rate").first();
+  const amountMode = dialog.getByLabel("Amounts are");
+  await dialog.getByLabel("Description").first().fill("Test equipment");
+  await dialog.getByLabel("Qty").first().fill("1");
+  await dialog.getByLabel("Unit price").first().fill("100.00");
 
+  await expect(amountMode).toHaveValue("exclusive");
+  await expect(amountMode.locator("option")).toHaveText([
+    "Tax exclusive", "Tax inclusive", "No tax",
+  ]);
   await expect(taxSelect).toHaveValue("gst_free");
   await expect(accountSelect.locator(`option[value="${assetId}"]`)).toHaveCount(1);
   await expect(taxSelect.locator('option[value="capital"]')).toHaveCount(0);
@@ -241,10 +306,14 @@ test("manual AP form exposes capital only for an Asset account and clears it on 
   await taxSelect.selectOption("capital");
   await expect(taxSelect).toHaveValue("capital");
 
+  await amountMode.selectOption("none");
+  await expect(taxSelect).toHaveValue("none");
+  await expect(dialog.getByLabel("GST total")).toHaveText("0.00");
+
   await dialog.getByRole("button", { name: /^AR/ }).click();
   await expect(accountSelect).toHaveValue("");
   await expect(taxSelect.locator('option[value="capital"]')).toHaveCount(0);
-  await expect(taxSelect).toHaveValue("gst_free");
+  await expect(taxSelect).toHaveValue("none");
 });
 
 test("manual AR editor keeps independent lines, protects the final line, and submits all visible values", async ({

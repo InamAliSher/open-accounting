@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -97,12 +97,56 @@ class InvoiceCreate(BaseModel):
     )
     total: Decimal = Field(ge=0, le=_MONEY_MAX, max_digits=16, decimal_places=2)
     gst_inclusive: bool = True
+    amount_mode: Literal["exclusive", "inclusive", "none"] | None = None
     notes: str | None = Field(default=None, max_length=1000)
     source: str = Field(default="manual", pattern="^(manual|pdf|excel)$")
     source_ref: str | None = None
     status: str | None = Field(default=None, pattern="^(draft|authorised|unpaid|partial|paid|void)$")
     attachment_id: str | None = None     # link an existing uploaded file to this invoice
     lines: list[InvoiceLineIn] | None = None
+
+    @field_validator("amount_mode", mode="before")
+    @classmethod
+    def _reject_null_amount_mode(cls, value):
+        if value is None:
+            raise ValueError("amount_mode must be omitted or one of exclusive, inclusive, none")
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_explicit_mode_line_inputs(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        mode = data.get("amount_mode")
+        if mode not in ("exclusive", "inclusive", "none"):
+            return data
+        lines = data.get("lines")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("An explicit amount_mode requires at least one invoice line")
+        required = {
+            "description",
+            "account_id",
+            "quantity",
+            "unit_price",
+            "line_subtotal",
+            "line_gst",
+            "line_total",
+            "tax_code",
+        }
+        for index, line in enumerate(lines, start=1):
+            if not isinstance(line, dict):
+                raise ValueError(f"Invoice line {index} must be an object")
+            if line.get("tax_code") not in (
+                "standard", "gst_free", "input_taxed", "capital", "none"
+            ):
+                raise ValueError(f"Invoice line {index} requires a valid tax_code")
+            missing = sorted(required - line.keys())
+            if missing:
+                raise ValueError(
+                    f"Invoice line {index} is missing required explicit-mode fields: "
+                    f"{', '.join(missing)}"
+                )
+        return data
 
     @field_validator("issue_date")
     @classmethod

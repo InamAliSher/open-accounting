@@ -123,6 +123,7 @@ export interface ContactUpdate {
 }
 
 export type InvoiceDirection = "AP" | "AR";
+export type InvoiceAmountMode = "exclusive" | "inclusive" | "none";
 export type InvoiceStatus =
   | "draft"
   | "authorised"
@@ -177,6 +178,7 @@ export interface InvoiceCreate {
   gst_amount?: string;
   total: string;
   gst_inclusive?: boolean;
+  amount_mode?: InvoiceAmountMode;
   notes?: string | null;
   source?: InvoiceSource;
   source_ref?: string | null;

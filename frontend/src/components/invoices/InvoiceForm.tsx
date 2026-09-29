@@ -5,6 +5,7 @@ import { useCurrentCompany } from "../../lib/useCurrentCompany";
 import type {
   Account,
   InvoiceCreate,
+  InvoiceAmountMode,
   InvoiceDirection,
   TaxCode,
 } from "../../types/api";
@@ -18,6 +19,7 @@ function stripMoney(value: string): string {
 }
 
 const TAX_CODES: TaxCode[] = ["standard", "gst_free", "input_taxed", "capital", "none"];
+const AMOUNT_MODES: InvoiceAmountMode[] = ["exclusive", "inclusive", "none"];
 const QUANTITY_SCALE = 10000n;
 const PRICE_SCALE = 100n;
 
@@ -63,6 +65,7 @@ export interface InvoiceFormValues {
   gst_amount: string;
   total: string;
   gst_inclusive: boolean;
+  amount_mode: InvoiceAmountMode;
   notes: string;
   lines: InvoiceLineFormValue[];
 }
@@ -79,6 +82,7 @@ export function createEmptyInvoiceForm(direction: InvoiceDirection = "AP"): Invo
     gst_amount: "",
     total: "",
     gst_inclusive: true,
+    amount_mode: "exclusive",
     notes: "",
     lines: [createInvoiceLine()],
   };
@@ -96,13 +100,23 @@ export const EMPTY_FORM = Object.freeze({
   gst_amount: "",
   total: "",
   gst_inclusive: true,
+  amount_mode: "exclusive" as const,
   notes: "",
   lines: Object.freeze([EMPTY_FORM_LINE]) as unknown as InvoiceLineFormValue[],
 }) as InvoiceFormValues;
 
+export interface InvoiceLineAmounts {
+  subtotal: string;
+  gst: string;
+  total: string;
+}
+
 interface InvoiceAmounts {
   subtotalCents: bigint;
-  lines: Map<string, string | null>;
+  gstCents: bigint;
+  totalCents: bigint;
+  complete: boolean;
+  lines: Map<string, InvoiceLineAmounts | null>;
 }
 
 function parseScaledInteger(value: string, decimalPlaces: number): bigint | null {
@@ -138,6 +152,38 @@ function neutralLineCents(line: InvoiceLineFormValue): bigint | null {
   return (quantityUnits * priceCents + 5000n) / QUANTITY_SCALE;
 }
 
+function roundHalfUp(numerator: bigint, denominator: bigint): bigint {
+  return (numerator + denominator / 2n) / denominator;
+}
+
+function calculateLineAmounts(
+  line: InvoiceLineFormValue,
+  amountMode: InvoiceAmountMode,
+): { subtotalCents: bigint; gstCents: bigint; totalCents: bigint } | null {
+  const extendedCents = neutralLineCents(line);
+  if (extendedCents === null) return null;
+
+  if (amountMode === "none" || !["standard", "capital"].includes(line.tax_code)) {
+    return { subtotalCents: extendedCents, gstCents: 0n, totalCents: extendedCents };
+  }
+
+  if (amountMode === "exclusive") {
+    const gstCents = roundHalfUp(extendedCents, 10n);
+    return {
+      subtotalCents: extendedCents,
+      gstCents,
+      totalCents: extendedCents + gstCents,
+    };
+  }
+
+  const gstCents = roundHalfUp(extendedCents, 11n);
+  return {
+    subtotalCents: extendedCents - gstCents,
+    gstCents,
+    totalCents: extendedCents,
+  };
+}
+
 export function calculateNeutralLineAmount(
   quantity: string,
   unitPrice: string,
@@ -153,15 +199,31 @@ export function calculateNeutralLineAmount(
   return cents === null ? null : formatCents(cents);
 }
 
-function calculateInvoiceAmounts(lines: InvoiceLineFormValue[]): InvoiceAmounts {
-  const lineAmounts = new Map<string, string | null>();
+function calculateInvoiceAmounts(
+  lines: InvoiceLineFormValue[],
+  amountMode: InvoiceAmountMode,
+): InvoiceAmounts {
+  const lineAmounts = new Map<string, InvoiceLineAmounts | null>();
   let subtotalCents = 0n;
+  let gstCents = 0n;
+  let totalCents = 0n;
+  let complete = lines.length > 0;
   for (const line of lines) {
-    const cents = neutralLineCents(line);
-    lineAmounts.set(line.id, cents === null ? null : formatCents(cents));
-    if (cents !== null) subtotalCents += cents;
+    const amounts = calculateLineAmounts(line, amountMode);
+    lineAmounts.set(line.id, amounts === null ? null : {
+      subtotal: formatCents(amounts.subtotalCents),
+      gst: formatCents(amounts.gstCents),
+      total: formatCents(amounts.totalCents),
+    });
+    if (amounts === null) {
+      complete = false;
+      continue;
+    }
+    subtotalCents += amounts.subtotalCents;
+    gstCents += amounts.gstCents;
+    totalCents += amounts.totalCents;
   }
-  return { subtotalCents, lines: lineAmounts };
+  return { subtotalCents, gstCents, totalCents, complete, lines: lineAmounts };
 }
 
 function structurallyComplete(line: InvoiceLineFormValue, direction: InvoiceDirection): boolean {
@@ -175,16 +237,25 @@ function structurallyComplete(line: InvoiceLineFormValue, direction: InvoiceDire
     !(direction === "AR" && line.tax_code === "capital");
 }
 
-export function synchronizeInvoiceAmounts(value: InvoiceFormValues): InvoiceFormValues {
-  const amounts = calculateInvoiceAmounts(value.lines);
-  const complete = value.lines.length > 0 && value.lines.every((line) =>
-    structurallyComplete(line, value.direction) && amounts.lines.get(line.id) !== null,
+export function synchronizeInvoiceAmounts(
+  value: InvoiceFormValues,
+  gstRegistered = true,
+): InvoiceFormValues {
+  const amountMode = gstRegistered ? value.amount_mode : "none";
+  const lines = amountMode === "none"
+    ? value.lines.map((line) => ({ ...line, tax_code: "none" as TaxCode }))
+    : value.lines;
+  const amounts = calculateInvoiceAmounts(lines, amountMode);
+  const complete = amounts.complete && lines.every((line) =>
+    structurallyComplete(line, value.direction),
   );
   return {
     ...value,
+    amount_mode: amountMode,
+    lines,
     subtotal: complete ? formatCents(amounts.subtotalCents) : "",
-    gst_amount: complete ? "0.00" : "",
-    total: complete ? formatCents(amounts.subtotalCents) : "",
+    gst_amount: complete ? formatCents(amounts.gstCents) : "",
+    total: complete ? formatCents(amounts.totalCents) : "",
   };
 }
 
@@ -197,9 +268,11 @@ function validIsoDate(value: string): boolean {
 
 export function validateInvoiceForm(
   value: InvoiceFormValues,
-  _gstRegistered = true,
+  gstRegistered = true,
 ): string[] {
   const errors: string[] = [];
+  const amountMode = gstRegistered ? value.amount_mode : "none";
+  if (!AMOUNT_MODES.includes(amountMode)) errors.push("Select a valid amount mode.");
   if (!value.contact_name.trim()) errors.push("Customer or supplier name is required.");
   if (!value.invoice_number.trim()) errors.push("Invoice number is required.");
   if (!validIsoDate(value.issue_date)) errors.push("A valid issue date is required.");
@@ -217,16 +290,22 @@ export function validateInvoiceForm(
     if (line.tax_code === "capital" && value.direction !== "AP") {
       errors.push(`${label}: capital tax treatment is only valid for AP invoices.`);
     }
+    if (gstRegistered && amountMode === "none" && line.tax_code !== "none") {
+      errors.push(`${label}: No tax mode requires the Outside GST tax code.`);
+    }
   }
 
-  const amounts = calculateInvoiceAmounts(value.lines);
-  const complete = value.lines.length > 0 && value.lines.every((line) =>
-    structurallyComplete(line, value.direction) && amounts.lines.get(line.id) !== null,
+  const lines = amountMode === "none" && !gstRegistered
+    ? value.lines.map((line) => ({ ...line, tax_code: "none" as TaxCode }))
+    : value.lines;
+  const amounts = calculateInvoiceAmounts(lines, amountMode);
+  const complete = amounts.complete && lines.every((line) =>
+    structurallyComplete(line, value.direction),
   );
   if (complete && (
     value.subtotal !== formatCents(amounts.subtotalCents) ||
-    value.gst_amount !== "0.00" ||
-    value.total !== formatCents(amounts.subtotalCents)
+    value.gst_amount !== formatCents(amounts.gstCents) ||
+    value.total !== formatCents(amounts.totalCents)
   )) {
     errors.push("Invoice amounts are inconsistent with the invoice lines.");
   }
@@ -242,23 +321,27 @@ export function toCreatePayload(
   } = {}
 ): InvoiceCreate {
   const gstRegistered = opts.gst_registered !== false;
-  const amounts = calculateInvoiceAmounts(v.lines);
+  const amountMode = gstRegistered ? v.amount_mode : "none";
+  const linesForCalculation = amountMode === "none"
+    ? v.lines.map((line) => ({ ...line, tax_code: "none" as TaxCode }))
+    : v.lines;
+  const amounts = calculateInvoiceAmounts(linesForCalculation, amountMode);
   const lines = v.lines.map((line) => {
-    const lineSubtotal = amounts.lines.get(line.id) ?? "0.00";
+    const lineAmounts = amounts.lines.get(line.id);
     return {
       description: line.description.trim(),
       quantity: stripMoney(line.quantity) || "0",
       unit_price: stripMoney(line.unit_price) || "0",
       account_id: line.account_id === "" ? null : line.account_id,
-      line_subtotal: lineSubtotal,
-      line_gst: "0.00",
-      line_total: lineSubtotal,
-      tax_code: gstRegistered ? line.tax_code : "none",
+      line_subtotal: lineAmounts?.subtotal ?? "0.00",
+      line_gst: lineAmounts?.gst ?? "0.00",
+      line_total: lineAmounts?.total ?? "0.00",
+      tax_code: amountMode === "none" ? "none" : line.tax_code,
     };
   });
   const subtotal = formatCents(amounts.subtotalCents);
-  const gst = "0.00";
-  const total = subtotal;
+  const gst = formatCents(amounts.gstCents);
+  const total = formatCents(amounts.totalCents);
   return {
     direction: v.direction,
     contact_name: v.contact_name.trim() || null,
@@ -269,7 +352,8 @@ export function toCreatePayload(
     subtotal,
     gst_amount: gst,
     total,
-    gst_inclusive: v.gst_inclusive,
+    gst_inclusive: amountMode === "none" ? false : v.gst_inclusive,
+    amount_mode: amountMode,
     notes: v.notes.trim() || null,
     source: opts.source ?? "manual",
     attachment_id: opts.attachment_id ?? null,
@@ -285,9 +369,12 @@ interface Props {
 
 export default function InvoiceForm({ value, onChange, showDirection = true }: Props) {
   const companyQ = useCurrentCompany();
-  const gstRegistered = companyQ.data?.gst_registered === true;
+  const gstRegistered = companyQ.data?.gst_registered !== false;
+  const formGstRegistered = companyQ.data?.gst_registered ?? true;
   const set = <K extends keyof InvoiceFormValues>(k: K, v: InvoiceFormValues[K]) =>
-    onChange(synchronizeInvoiceAmounts({ ...value, [k]: v }));
+    onChange(synchronizeInvoiceAmounts({ ...value, [k]: v }, formGstRegistered));
+  const setAmountMode = (amountMode: InvoiceAmountMode) =>
+    onChange(synchronizeInvoiceAmounts({ ...value, amount_mode: amountMode }, formGstRegistered));
   const setDirection = (direction: InvoiceDirection) => {
     if (direction === value.direction) return;
     const lines = value.lines.map((line) => ({
@@ -297,7 +384,7 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
         ? "gst_free" as TaxCode
         : line.tax_code,
     }));
-    onChange(synchronizeInvoiceAmounts({ ...value, direction, lines }));
+    onChange(synchronizeInvoiceAmounts({ ...value, direction, lines }, formGstRegistered));
   };
   const updateLine = (
     id: string,
@@ -305,17 +392,17 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
   ) => onChange(synchronizeInvoiceAmounts({
     ...value,
     lines: updateInvoiceLine(value.lines, id, updates),
-  }));
+  }, formGstRegistered));
   const addLine = () => onChange(synchronizeInvoiceAmounts({
     ...value,
     lines: [...value.lines, createInvoiceLine()],
-  }));
+  }, formGstRegistered));
   const removeLine = (id: string) => {
     if (value.lines.length <= 1) return;
     onChange(synchronizeInvoiceAmounts({
       ...value,
       lines: value.lines.filter((line) => line.id !== id),
-    }));
+    }, formGstRegistered));
   };
 
   // Keyed by company id like every other accounts query: per-company SQLite
@@ -343,7 +430,8 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
         ),
     )
     .sort((a, b) => a.code.localeCompare(b.code));
-  const amounts = calculateInvoiceAmounts(value.lines);
+  const calculationMode = formGstRegistered ? value.amount_mode : "none";
+  const amounts = calculateInvoiceAmounts(value.lines, calculationMode);
 
   return (
     <div className="space-y-3">
@@ -415,6 +503,20 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
         </Field>
       </div>
 
+      <Field label="Amounts are">
+        <select
+          className="input max-w-xs"
+          aria-label="Amounts are"
+          value={calculationMode}
+          disabled={!gstRegistered}
+          onChange={(event) => setAmountMode(event.target.value as InvoiceAmountMode)}
+        >
+          <option value="exclusive">Tax exclusive</option>
+          <option value="inclusive">Tax inclusive</option>
+          <option value="none">No tax</option>
+        </select>
+      </Field>
+
       <InvoiceLineTable
         lines={value.lines}
         amounts={amounts.lines}
@@ -429,15 +531,15 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
       <div className="grid grid-cols-3 gap-3 border-t border-slate-200 pt-3 text-right tabular-nums">
         <div>
           <div className="text-xs text-slate-500">Subtotal</div>
-          <output aria-label="Subtotal" className="font-medium">{formatCents(amounts.subtotalCents)}</output>
+          <output aria-label="Subtotal" className="font-medium">{amounts.complete ? formatCents(amounts.subtotalCents) : "—"}</output>
         </div>
         <div>
           <div className="text-xs text-slate-500">GST</div>
-          <output aria-label="GST total" className="font-medium">0.00</output>
+          <output aria-label="GST total" className="font-medium">{amounts.complete ? formatCents(amounts.gstCents) : "—"}</output>
         </div>
         <div>
           <div className="text-xs text-slate-500">Total</div>
-          <output aria-label="Invoice total" className="font-semibold">{formatCents(amounts.subtotalCents)}</output>
+          <output aria-label="Invoice total" className="font-semibold">{amounts.complete ? formatCents(amounts.totalCents) : "—"}</output>
         </div>
       </div>
 

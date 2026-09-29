@@ -1,5 +1,5 @@
 import type { Account, InvoiceDirection, TaxCode } from "../../types/api";
-import type { InvoiceLineFormValue } from "./InvoiceForm";
+import type { InvoiceLineAmounts, InvoiceLineFormValue } from "./InvoiceForm";
 
 const TAX_OPTIONS: Array<{ value: TaxCode; label: string }> = [
   { value: "standard", label: "Standard (provisional)" },
@@ -9,12 +9,12 @@ const TAX_OPTIONS: Array<{ value: TaxCode; label: string }> = [
 ];
 
 function amountLabel(amount: string | null | undefined): string {
-  return amount ?? "0.00";
+  return amount ?? "—";
 }
 
 interface Props {
   lines: InvoiceLineFormValue[];
-  amounts: ReadonlyMap<string, string | null>;
+  amounts: ReadonlyMap<string, InvoiceLineAmounts | null>;
   accounts: Account[];
   direction: InvoiceDirection;
   gstRegistered: boolean;
@@ -97,15 +97,17 @@ export default function InvoiceLineTable({
   return (
     <section aria-label="Invoice lines" className="space-y-2">
       <div className="hidden overflow-x-auto md:block">
-        <table className="w-full min-w-[980px] table-fixed text-sm">
+        <table className="w-full min-w-[1100px] table-fixed text-sm">
           <colgroup>
-            <col className="w-[30%]" />
-            <col className="w-[7%]" />
-            <col className="w-[12%]" />
-            <col className="w-[20%]" />
-            <col className="w-[15%]" />
-            <col className="w-[10%]" />
+            <col className="w-[24%]" />
             <col className="w-[6%]" />
+            <col className="w-[10%]" />
+            <col className="w-[18%]" />
+            <col className="w-[14%]" />
+            <col className="w-[8%]" />
+            <col className="w-[7%]" />
+            <col className="w-[8%]" />
+            <col className="w-[5%]" />
           </colgroup>
           <thead>
             <tr className="border-b border-slate-200 text-left text-xs text-slate-600">
@@ -114,7 +116,9 @@ export default function InvoiceLineTable({
               <th className="px-2 py-2 font-medium">Unit price</th>
               <th className="px-2 py-2 font-medium">Account</th>
               <th className="px-2 py-2 font-medium">Tax rate</th>
-              <th className="px-2 py-2 text-right font-medium">Amount</th>
+              <th className="px-2 py-2 text-right font-medium">Subtotal</th>
+              <th className="px-2 py-2 text-right font-medium">GST</th>
+              <th className="px-2 py-2 text-right font-medium">Total</th>
               <th className="px-2 py-2 text-right font-medium">Remove</th>
             </tr>
           </thead>
@@ -149,8 +153,14 @@ export default function InvoiceLineTable({
                 </td>
                 <td className="px-1 py-2">{accountSelect(line)}</td>
                 <td className="px-1 py-2">{taxSelect(line)}</td>
-                <td className="px-2 py-2 text-right tabular-nums" aria-label="Amount">
-                  {amountLabel(amounts.get(line.id))}
+                <td className="px-2 py-2 text-right tabular-nums" aria-label="Line subtotal">
+                  {amountLabel(amounts.get(line.id)?.subtotal)}
+                </td>
+                <td className="px-2 py-2 text-right tabular-nums" aria-label="Line GST">
+                  {amountLabel(amounts.get(line.id)?.gst)}
+                </td>
+                <td className="px-2 py-2 text-right tabular-nums" aria-label="Line total">
+                  {amountLabel(amounts.get(line.id)?.total)}
                 </td>
                 <td className="px-2 py-2 text-right">{removeButton(line)}</td>
               </tr>
@@ -201,9 +211,19 @@ export default function InvoiceLineTable({
                 {taxSelect(line)}
               </label>
             </div>
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-slate-600">Amount</span>
-              <span className="text-right tabular-nums">{amountLabel(amounts.get(line.id))}</span>
+            <div className="grid grid-cols-3 gap-3 text-sm text-right tabular-nums">
+              <div>
+                <span className="block text-slate-600">Subtotal</span>
+                <span>{amountLabel(amounts.get(line.id)?.subtotal)}</span>
+              </div>
+              <div>
+                <span className="block text-slate-600">GST</span>
+                <span>{amountLabel(amounts.get(line.id)?.gst)}</span>
+              </div>
+              <div>
+                <span className="block text-slate-600">Total</span>
+                <span>{amountLabel(amounts.get(line.id)?.total)}</span>
+              </div>
             </div>
             <div className="flex justify-end">{removeButton(line)}</div>
           </div>
