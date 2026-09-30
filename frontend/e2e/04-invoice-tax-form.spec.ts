@@ -303,6 +303,12 @@ test("manual AP form exposes capital only for an Asset account and clears it on 
   await expect(taxSelect.locator('option[value="capital"]')).toHaveCount(0);
   await accountSelect.selectOption(String(assetId));
   await expect(taxSelect.locator('option[value="capital"]')).toHaveCount(1);
+  await expect(taxSelect.locator("option")).toHaveText([
+    "Standard", "GST-free", "Input-taxed", "Capital purchase", "Outside GST",
+  ]);
+  expect(await taxSelect.locator("option").evaluateAll((options) =>
+    options.map((option) => (option as HTMLOptionElement).value),
+  )).toEqual(["standard", "gst_free", "input_taxed", "capital", "none"]);
   await taxSelect.selectOption("capital");
   await expect(taxSelect).toHaveValue("capital");
 
@@ -313,6 +319,12 @@ test("manual AP form exposes capital only for an Asset account and clears it on 
   await dialog.getByRole("button", { name: /^AR/ }).click();
   await expect(accountSelect).toHaveValue("");
   await expect(taxSelect.locator('option[value="capital"]')).toHaveCount(0);
+  await expect(taxSelect.locator("option")).toHaveText([
+    "Standard", "GST-free", "Input-taxed", "Outside GST",
+  ]);
+  expect(await taxSelect.locator("option").evaluateAll((options) =>
+    options.map((option) => (option as HTMLOptionElement).value),
+  )).toEqual(["standard", "gst_free", "input_taxed", "none"]);
   await expect(taxSelect).toHaveValue("none");
 });
 

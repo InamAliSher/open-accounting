@@ -2,10 +2,10 @@ import type { Account, InvoiceDirection, TaxCode } from "../../types/api";
 import type { InvoiceLineAmounts, InvoiceLineFormValue } from "./InvoiceForm";
 
 const TAX_OPTIONS: Array<{ value: TaxCode; label: string }> = [
-  { value: "standard", label: "Standard (provisional)" },
-  { value: "gst_free", label: "GST-free (provisional)" },
-  { value: "input_taxed", label: "Input-taxed (provisional)" },
-  { value: "none", label: "Outside GST (provisional)" },
+  { value: "standard", label: "Standard" },
+  { value: "gst_free", label: "GST-free" },
+  { value: "input_taxed", label: "Input-taxed" },
+  { value: "none", label: "Outside GST" },
 ];
 
 function amountLabel(amount: string | null | undefined): string {
@@ -39,7 +39,7 @@ export default function InvoiceLineTable({
   const taxOptions = (line: InvoiceLineFormValue) => {
     const selectedAccount = accounts.find((account) => account.id === line.account_id);
     return direction === "AP" && selectedAccount?.type === "ASSET"
-      ? [...TAX_OPTIONS.slice(0, 3), { value: "capital" as const, label: "Capital purchase (provisional)" }, TAX_OPTIONS[3]]
+      ? [...TAX_OPTIONS.slice(0, 3), { value: "capital" as const, label: "Capital purchase" }, TAX_OPTIONS[3]]
       : TAX_OPTIONS;
   };
 
