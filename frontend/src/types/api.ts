@@ -123,6 +123,7 @@ export interface ContactUpdate {
 }
 
 export type InvoiceDirection = "AP" | "AR";
+export type InvoiceAmountMode = "exclusive" | "inclusive" | "none";
 export type InvoiceStatus =
   | "draft"
   | "authorised"
@@ -177,6 +178,7 @@ export interface InvoiceCreate {
   gst_amount?: string;
   total: string;
   gst_inclusive?: boolean;
+  amount_mode?: InvoiceAmountMode;
   notes?: string | null;
   source?: InvoiceSource;
   source_ref?: string | null;
@@ -187,6 +189,8 @@ export interface InvoiceCreate {
 export interface InvoiceLineIn {
   description: string;
   account_id?: number | null;
+  quantity: string;
+  unit_price: string;
   line_subtotal: string;
   line_gst?: string;
   line_total: string;
@@ -660,6 +664,9 @@ export interface JournalEntry {
   entry_date: string;     // YYYY-MM-DD
   memo: string;
   reference: string | null;
+  source_type: string;
+  source_id: number | null;
+  reverses_entry_id: number | null;
   created_at: string;
   updated_at: string;
   lines: JournalLine[];

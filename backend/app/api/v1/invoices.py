@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session
 
 from ...deps import PathId, get_company_db, get_current_company
 from ...models.company import (
+    Account,
+    AccountType,
     Attachment,
     Contact,
     Invoice,
@@ -40,7 +42,13 @@ from ...services import (
     invoice_posting,
     period_lock,
 )
-from ...services.invoice_math import GstMathError, check_gst_math, check_invoice_lines
+from ...services.invoice_math import (
+    GstMathError,
+    check_explicit_invoice_lines,
+    check_gst_math,
+    check_invoice_lines,
+    check_legacy_invoice_lines,
+)
 from ...services.journal import JournalError
 from ...utils.http import safe_filename
 from .contacts import get_or_create_contact
@@ -81,9 +89,45 @@ def _check_gst_math(subtotal: Decimal, gst_amount: Decimal, total: Decimal) -> N
 
 def _check_line_math(subtotal: Decimal, gst_amount: Decimal, total: Decimal, lines) -> None:
     try:
-        check_invoice_lines(subtotal, gst_amount, total, lines)
+        check_legacy_invoice_lines(subtotal, gst_amount, total, lines)
     except GstMathError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+def _check_explicit_invoice_math(
+    subtotal: Decimal,
+    gst_amount: Decimal,
+    total: Decimal,
+    lines,
+    *,
+    amount_mode: str,
+) -> None:
+    try:
+        check_explicit_invoice_lines(
+            subtotal,
+            gst_amount,
+            total,
+            lines,
+            amount_mode=amount_mode,
+        )
+    except GstMathError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _validate_capital_line_accounts(db: Session, direction: str, lines) -> None:
+    for index, line in enumerate(lines or [], start=1):
+        if line.tax_code != "capital":
+            continue
+        account = db.get(Account, line.account_id) if line.account_id is not None else None
+        try:
+            is_asset = account is not None and AccountType(account.type) == AccountType.ASSET
+        except ValueError:
+            is_asset = False
+        if direction != "AP" or account is None or not account.active or not is_asset:
+            raise HTTPException(
+                422,
+                f"Invoice line {index}: Capital treatment requires an active AP asset account.",
+            )
 
 
 def _ensure_invoice_gst_allowed(
@@ -315,19 +359,45 @@ def create_invoice(
             "An invoice cannot be created as partial, paid, or void. Create/post "
             "it first, then record settlement through the bank control account.",
         )
-    _ensure_invoice_gst_allowed(
-        company,
-        gst_amount=payload.gst_amount,
-        lines=payload.lines,
-        context="Invoice",
-    )
-    _check_gst_math(payload.subtotal, payload.gst_amount, payload.total)
-    _check_line_math(payload.subtotal, payload.gst_amount, payload.total, payload.lines)
+    if payload.amount_mode is None:
+        _ensure_invoice_gst_allowed(
+            company,
+            gst_amount=payload.gst_amount,
+            lines=payload.lines,
+            context="Invoice",
+        )
+        _check_gst_math(payload.subtotal, payload.gst_amount, payload.total)
+        _check_line_math(payload.subtotal, payload.gst_amount, payload.total, payload.lines)
+    else:
+        if not company.gst_registered and payload.amount_mode != "none":
+            raise HTTPException(
+                422,
+                "A non-GST-registered company must use amount_mode=none.",
+            )
+        if payload.amount_mode == "none":
+            for line in payload.lines or []:
+                line.tax_code = "none"
+            payload.gst_inclusive = False
+        _ensure_invoice_gst_allowed(
+            company,
+            gst_amount=payload.gst_amount,
+            lines=payload.lines,
+            context="Invoice",
+        )
+        _check_explicit_invoice_math(
+            payload.subtotal,
+            payload.gst_amount,
+            payload.total,
+            payload.lines,
+            amount_mode=payload.amount_mode,
+        )
     if payload.lines:
         try:
             invoice_posting.validate_invoice_line_accounts(db, payload.direction, payload.lines)
         except invoice_posting.InvoicePostingError as exc:
             _raise_posting_http(exc)
+        if payload.amount_mode is not None:
+            _validate_capital_line_accounts(db, payload.direction, payload.lines)
     contact = _resolve_contact(db, payload)
 
     existing = _find_source_ref_collision(db, payload.source, payload.source_ref)
