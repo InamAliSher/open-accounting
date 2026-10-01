@@ -1,0 +1,522 @@
+from __future__ import annotations
+
+from datetime import date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload, selectinload
+
+from ..models.company import (
+    Account,
+    AccountType,
+    CreditNote,
+    CreditNoteLine,
+    CreditNoteStatus,
+    Invoice,
+    InvoiceDirection,
+    InvoiceLine,
+    InvoicePaymentAllocation,
+    InvoiceStatus,
+    JournalEntry,
+    JournalEntrySource,
+    JournalLine,
+)
+from ..schemas._limits import SQLITE_EXACT_MONEY_MAX
+from ..schemas.credit_note import CreditNoteCreate, CreditNoteLineDraftIn, CreditNoteUpdate
+
+
+CENT = Decimal("0.01")
+QUANTITY_SCALE = Decimal("0.0001")
+VALID_TAX_CODES = {"standard", "gst_free", "input_taxed", "capital", "none"}
+POSTED_STATUSES = {
+    InvoiceStatus.AUTHORISED.value,
+    InvoiceStatus.UNPAID.value,
+    InvoiceStatus.PARTIAL.value,
+    InvoiceStatus.PAID.value,
+}
+
+
+class CreditNoteError(Exception):
+    http_status = 422
+
+
+class CreditNoteNotFound(CreditNoteError):
+    http_status = 404
+
+
+class InvalidSource(CreditNoteError):
+    http_status = 409
+
+
+class SourceHasSettlement(CreditNoteError):
+    http_status = 409
+
+
+class DraftConflict(CreditNoteError):
+    http_status = 409
+
+
+class DuplicateCreditNoteNumber(CreditNoteError):
+    http_status = 409
+
+
+class CreditNoteValidationError(CreditNoteError):
+    http_status = 422
+
+
+def _value(value) -> str:
+    return value.value if hasattr(value, "value") else str(value)
+
+
+def _money(value: Decimal) -> Decimal:
+    try:
+        result = Decimal(value).quantize(CENT, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise CreditNoteValidationError("Credit-note amount could not be calculated.") from exc
+    if not result.is_finite() or result < 0 or result > SQLITE_EXACT_MONEY_MAX:
+        raise CreditNoteValidationError("Credit-note amount is outside supported limits.")
+    return result
+
+
+def _quantity(value: Decimal) -> Decimal:
+    try:
+        result = Decimal(value).quantize(QUANTITY_SCALE, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise CreditNoteValidationError("Credit quantity must be a positive decimal.") from exc
+    if not result.is_finite() or result <= 0 or result > Decimal("999999.9999"):
+        raise CreditNoteValidationError("Credit quantity must be positive and within supported limits.")
+    return result
+
+
+def _load_invoice(session: Session, invoice_id: int) -> Invoice:
+    invoice = (
+        session.query(Invoice)
+        .options(joinedload(Invoice.contact), selectinload(Invoice.lines))
+        .filter(Invoice.id == invoice_id)
+        .one_or_none()
+    )
+    if invoice is None:
+        raise CreditNoteNotFound("Source invoice not found.")
+    return invoice
+
+
+def _verify_posting(session: Session, invoice: Invoice) -> None:
+    expected_type = (
+        JournalEntrySource.INVOICE_AR
+        if _value(invoice.direction) == InvoiceDirection.AR.value
+        else JournalEntrySource.INVOICE_AP
+    )
+    entries = (
+        session.query(JournalEntry)
+        .options(selectinload(JournalEntry.lines).joinedload(JournalLine.account))
+        .filter(
+            JournalEntry.source_id == invoice.id,
+            JournalEntry.source_type.in_(
+                [JournalEntrySource.INVOICE_AR, JournalEntrySource.INVOICE_AP]
+            ),
+        )
+        .all()
+    )
+    if len(entries) != 1 or _value(entries[0].source_type) != expected_type.value:
+        raise InvalidSource("Source invoice does not have its verified invoice journal posting.")
+
+    entry = entries[0]
+    lines = entry.lines
+    debits = sum((Decimal(line.debit_amount or 0) for line in lines), Decimal("0"))
+    credits = sum((Decimal(line.credit_amount or 0) for line in lines), Decimal("0"))
+    control_code = "1100" if _value(invoice.direction) == "AR" else "2000"
+    control_side = "debit_amount" if control_code == "1100" else "credit_amount"
+    control_amount = sum(
+        (
+            Decimal(getattr(line, control_side) or 0)
+            for line in lines
+            if line.account is not None and line.account.code == control_code
+        ),
+        Decimal("0"),
+    )
+    if not lines or debits <= 0 or debits != credits or control_amount != Decimal(invoice.total):
+        raise InvalidSource("Source invoice journal posting is incomplete or unbalanced.")
+
+
+def _validate_source_line(
+    session: Session,
+    invoice: Invoice,
+    source_line: InvoiceLine,
+) -> Account:
+    if Decimal(source_line.quantity) <= 0:
+        raise CreditNoteValidationError(
+            f"Source invoice line {source_line.id} has no positive original quantity."
+        )
+    if Decimal(source_line.unit_price) < 0:
+        raise CreditNoteValidationError(
+            f"Source invoice line {source_line.id} has an invalid unit price."
+        )
+    try:
+        gst_rate = Decimal(source_line.gst_rate)
+        tax_code = str(source_line.tax_code)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise CreditNoteValidationError("Source invoice line tax data is invalid.") from exc
+    if not gst_rate.is_finite() or gst_rate < 0 or gst_rate > 1 or tax_code not in VALID_TAX_CODES:
+        raise CreditNoteValidationError(
+            f"Source invoice line {source_line.id} has invalid persisted tax data."
+        )
+    if source_line.account_id is None:
+        raise CreditNoteValidationError(
+            f"Source invoice line {source_line.id} has no account."
+        )
+    account = session.get(Account, source_line.account_id)
+    if account is None:
+        raise CreditNoteValidationError(
+            f"Source invoice line {source_line.id} references a missing account."
+        )
+    try:
+        account_type = AccountType(_value(account.type))
+    except ValueError as exc:
+        raise CreditNoteValidationError(
+            f"Source invoice line {source_line.id} has an invalid account type."
+        ) from exc
+    if tax_code == "capital" and (
+        _value(invoice.direction) != "AP"
+        or account_type != AccountType.ASSET
+        or not account.active
+    ):
+        raise CreditNoteValidationError(
+            f"Source invoice line {source_line.id} has invalid Capital account data."
+        )
+    return account
+
+
+def _load_eligible_source(session: Session, invoice_id: int) -> Invoice:
+    invoice = _load_invoice(session, invoice_id)
+    direction = _value(invoice.direction)
+    if direction not in {"AR", "AP"} or _value(invoice.status) not in POSTED_STATUSES:
+        raise InvalidSource("Source invoice must be authorised or otherwise posted and not void.")
+    if invoice.currency != "AUD":
+        raise InvalidSource("Source invoice currency must be AUD.")
+    if invoice.contact is None:
+        raise InvalidSource("Source invoice contact is missing.")
+    if Decimal(invoice.paid_amount or 0) > 0:
+        raise SourceHasSettlement("Source invoice has recorded cash settlement.")
+    if (
+        session.query(InvoicePaymentAllocation.id)
+        .filter(InvoicePaymentAllocation.invoice_id == invoice.id)
+        .first()
+        is not None
+    ):
+        raise SourceHasSettlement("Source invoice has an explicit cash allocation.")
+    # The historical control-account settlement matcher is private to invoice posting;
+    # C1A1 fails closed on paid_amount and explicit allocations without importing it.
+    if not invoice.lines:
+        raise InvalidSource("Source invoice must have at least one persisted line.")
+    _verify_posting(session, invoice)
+    for source_line in invoice.lines:
+        _validate_source_line(session, invoice, source_line)
+    return invoice
+
+
+def _reserved_quantity(
+    session: Session,
+    invoice_id: int,
+    source_line_id: int,
+    *,
+    exclude_credit_note_id: int | None = None,
+) -> Decimal:
+    query = (
+        session.query(func.coalesce(func.sum(CreditNoteLine.quantity), 0))
+        .join(CreditNote, CreditNote.id == CreditNoteLine.credit_note_id)
+        .filter(
+            CreditNote.source_invoice_id == invoice_id,
+            CreditNote.status == CreditNoteStatus.DRAFT.value,
+            CreditNoteLine.source_invoice_line_id == source_line_id,
+        )
+    )
+    if exclude_credit_note_id is not None:
+        query = query.filter(CreditNote.id != exclude_credit_note_id)
+    return Decimal(query.scalar() or 0)
+
+
+def _prepare_lines(
+    session: Session,
+    invoice: Invoice,
+    lines: list[CreditNoteLineDraftIn],
+    *,
+    exclude_credit_note_id: int | None = None,
+) -> list[CreditNoteLine]:
+    source_by_id = {line.id: line for line in invoice.lines}
+    seen: set[int] = set()
+    result: list[CreditNoteLine] = []
+    for request_line in lines:
+        source_line_id = request_line.source_invoice_line_id
+        if source_line_id in seen:
+            raise DraftConflict("A source invoice line may appear only once per credit note.")
+        seen.add(source_line_id)
+        source_line = source_by_id.get(source_line_id)
+        if source_line is None:
+            raise CreditNoteValidationError(
+                f"Source invoice line {source_line_id} does not belong to this invoice."
+            )
+        _validate_source_line(session, invoice, source_line)
+        quantity = _quantity(request_line.quantity)
+        original_quantity = Decimal(source_line.quantity).quantize(QUANTITY_SCALE)
+        reserved = _reserved_quantity(
+            session,
+            invoice.id,
+            source_line_id,
+            exclude_credit_note_id=exclude_credit_note_id,
+        )
+        if reserved + quantity > original_quantity:
+            raise DraftConflict(
+                f"Requested quantity for source invoice line {source_line_id} exceeds its remaining creditable quantity."
+            )
+
+        try:
+            extended = _money(quantity * Decimal(source_line.unit_price))
+            tax_code = str(source_line.tax_code)
+            if tax_code in {"gst_free", "input_taxed", "none"}:
+                subtotal = extended
+                gst = Decimal("0.00")
+                total = extended
+            elif invoice.gst_inclusive:
+                total = extended
+                gst = _money(total / Decimal("11"))
+                subtotal = _money(total - gst)
+            else:
+                subtotal = extended
+                gst = _money(subtotal * Decimal("0.10"))
+                total = _money(subtotal + gst)
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise CreditNoteValidationError("Credit-note line calculation failed.") from exc
+        if subtotal <= 0 or total <= 0 or gst > total:
+            raise CreditNoteValidationError(
+                f"Source invoice line {source_line_id} does not produce a positive credit amount."
+            )
+        result.append(
+            CreditNoteLine(
+                source_invoice_line_id=source_line.id,
+                description=source_line.description,
+                account_id=source_line.account_id,
+                quantity=quantity,
+                unit_price=source_line.unit_price,
+                gst_rate=source_line.gst_rate,
+                line_subtotal=subtotal,
+                line_gst=gst,
+                line_total=total,
+                tax_code=tax_code,
+            )
+        )
+    return result
+
+
+def _set_totals(note: CreditNote) -> None:
+    note.subtotal = _money(sum((line.line_subtotal for line in note.lines), Decimal("0")))
+    note.gst_amount = _money(sum((line.line_gst for line in note.lines), Decimal("0")))
+    note.total = _money(sum((line.line_total for line in note.lines), Decimal("0")))
+    if note.total <= 0:
+        raise CreditNoteValidationError("Credit-note total must be greater than zero.")
+
+
+def _number_available(
+    session: Session,
+    invoice: Invoice,
+    number: str,
+    *,
+    exclude_credit_note_id: int | None = None,
+) -> None:
+    query = session.query(CreditNote.id).filter(
+        CreditNote.direction == _value(invoice.direction),
+        CreditNote.contact_id == invoice.contact_id,
+        CreditNote.credit_note_number == number,
+    )
+    if exclude_credit_note_id is not None:
+        query = query.filter(CreditNote.id != exclude_credit_note_id)
+    if query.first() is not None:
+        raise DuplicateCreditNoteNumber("Credit-note number already exists for this contact and direction.")
+
+
+def create_credit_note(session: Session, payload: CreditNoteCreate) -> CreditNote:
+    invoice = _load_eligible_source(session, payload.source_invoice_id)
+    _number_available(session, invoice, payload.credit_note_number)
+    note = CreditNote(
+        source_invoice_id=invoice.id,
+        direction=_value(invoice.direction),
+        contact_id=invoice.contact_id,
+        credit_note_number=payload.credit_note_number,
+        issue_date=payload.issue_date,
+        currency="AUD",
+        gst_inclusive=invoice.gst_inclusive,
+        status=CreditNoteStatus.DRAFT,
+        notes=payload.notes,
+    )
+    note.lines = _prepare_lines(session, invoice, payload.lines)
+    _set_totals(note)
+    session.add(note)
+    session.flush()
+    return note
+
+
+def get_credit_note(session: Session, credit_note_id: int) -> CreditNote:
+    note = (
+        session.query(CreditNote)
+        .options(
+            joinedload(CreditNote.source_invoice).joinedload(Invoice.contact),
+            joinedload(CreditNote.contact),
+            selectinload(CreditNote.lines),
+        )
+        .filter(CreditNote.id == credit_note_id)
+        .one_or_none()
+    )
+    if note is None:
+        raise CreditNoteNotFound("Credit note not found.")
+    return note
+
+
+def list_credit_notes(
+    session: Session,
+    *,
+    direction: str | None = None,
+    source_invoice_id: int | None = None,
+) -> list[CreditNote]:
+    query = session.query(CreditNote).options(
+        joinedload(CreditNote.source_invoice).joinedload(Invoice.contact),
+        joinedload(CreditNote.contact),
+        selectinload(CreditNote.lines),
+    )
+    if direction is not None:
+        query = query.filter(CreditNote.direction == direction)
+    if source_invoice_id is not None:
+        query = query.filter(CreditNote.source_invoice_id == source_invoice_id)
+    return query.order_by(CreditNote.id.desc()).all()
+
+
+def credit_note_output(note: CreditNote) -> dict:
+    return {
+        "id": note.id,
+        "source_invoice_id": note.source_invoice_id,
+        "source_invoice_number": note.source_invoice.invoice_number,
+        "direction": _value(note.direction),
+        "contact_id": note.contact_id,
+        "contact_name": note.contact.name,
+        "credit_note_number": note.credit_note_number,
+        "issue_date": note.issue_date,
+        "currency": note.currency,
+        "subtotal": note.subtotal,
+        "gst_amount": note.gst_amount,
+        "total": note.total,
+        "gst_inclusive": note.gst_inclusive,
+        "status": _value(note.status),
+        "notes": note.notes,
+        "created_at": note.created_at,
+        "updated_at": note.updated_at,
+        "lines": [
+            {
+                "id": line.id,
+                "source_invoice_line_id": line.source_invoice_line_id,
+                "description": line.description,
+                "account_id": line.account_id,
+                "quantity": line.quantity,
+                "unit_price": line.unit_price,
+                "gst_rate": line.gst_rate,
+                "line_subtotal": line.line_subtotal,
+                "line_gst": line.line_gst,
+                "line_total": line.line_total,
+                "tax_code": line.tax_code,
+            }
+            for line in note.lines
+        ],
+    }
+
+
+def source_snapshot(session: Session, invoice_id: int) -> dict:
+    invoice = _load_eligible_source(session, invoice_id)
+    lines = []
+    for source_line in invoice.lines:
+        reserved = _reserved_quantity(session, invoice.id, source_line.id)
+        original_quantity = Decimal(source_line.quantity).quantize(QUANTITY_SCALE)
+        if reserved > original_quantity:
+            raise DraftConflict("Existing draft reservations exceed a source line quantity.")
+        lines.append(
+            {
+                "source_invoice_line_id": source_line.id,
+                "description": source_line.description,
+                "account_id": source_line.account_id,
+                "quantity": source_line.quantity,
+                "unit_price": source_line.unit_price,
+                "gst_rate": source_line.gst_rate,
+                "tax_code": source_line.tax_code,
+                "line_subtotal": source_line.line_subtotal,
+                "line_gst": source_line.line_gst,
+                "line_total": source_line.line_total,
+                "quantity_reserved": reserved,
+                "remaining_creditable_quantity": original_quantity - reserved,
+            }
+        )
+    return {
+        "source_invoice_id": invoice.id,
+        "source_invoice_number": invoice.invoice_number,
+        "direction": _value(invoice.direction),
+        "contact_id": invoice.contact_id,
+        "contact_name": invoice.contact.name,
+        "issue_date": invoice.issue_date,
+        "currency": invoice.currency,
+        "gst_inclusive": invoice.gst_inclusive,
+        "status": _value(invoice.status),
+        "subtotal": invoice.subtotal,
+        "gst_amount": invoice.gst_amount,
+        "total": invoice.total,
+        "paid_amount": invoice.paid_amount,
+        "lines": lines,
+    }
+
+
+def update_credit_note(
+    session: Session,
+    credit_note_id: int,
+    payload: CreditNoteUpdate,
+) -> CreditNote:
+    note = get_credit_note(session, credit_note_id)
+    if _value(note.status) != CreditNoteStatus.DRAFT.value:
+        raise DraftConflict("Only draft credit notes can be updated.")
+    invoice = _load_eligible_source(session, note.source_invoice_id)
+    changes = payload.model_fields_set
+    if "credit_note_number" in changes:
+        _number_available(
+            session,
+            invoice,
+            payload.credit_note_number,
+            exclude_credit_note_id=note.id,
+        )
+        note.credit_note_number = payload.credit_note_number
+    if "issue_date" in changes:
+        note.issue_date = payload.issue_date
+    if "notes" in changes:
+        note.notes = payload.notes
+    if "lines" in changes:
+        replacement = payload.lines
+    else:
+        replacement = [
+            CreditNoteLineDraftIn(
+                source_invoice_line_id=line.source_invoice_line_id,
+                quantity=line.quantity,
+            )
+            for line in note.lines
+        ]
+    replacement_lines = _prepare_lines(
+        session,
+        invoice,
+        replacement,
+        exclude_credit_note_id=note.id,
+    )
+    note.lines.clear()
+    session.flush()
+    note.lines = replacement_lines
+    _set_totals(note)
+    session.flush()
+    return note
+
+
+def delete_credit_note(session: Session, credit_note_id: int) -> None:
+    note = get_credit_note(session, credit_note_id)
+    if _value(note.status) != CreditNoteStatus.DRAFT.value:
+        raise DraftConflict("Only draft credit notes can be deleted.")
+    session.delete(note)
+    session.flush()
