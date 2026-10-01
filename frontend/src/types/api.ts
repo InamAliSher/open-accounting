@@ -215,6 +215,95 @@ export interface InvoiceUpdate {
   lines?: InvoiceLineIn[] | null;
 }
 
+export type CreditNoteStatus = "draft" | "authorised" | "void";
+
+export interface CreditNoteLine {
+  id: number;
+  source_invoice_line_id: number;
+  description: string;
+  account_id: number;
+  quantity: string;
+  unit_price: string;
+  gst_rate: string;
+  line_subtotal: string;
+  line_gst: string;
+  line_total: string;
+  tax_code: TaxCode;
+}
+
+export interface CreditNote {
+  id: number;
+  source_invoice_id: number;
+  source_invoice_number: string;
+  direction: InvoiceDirection;
+  contact_id: number;
+  contact_name: string;
+  credit_note_number: string;
+  issue_date: string;
+  currency: string;
+  subtotal: string;
+  gst_amount: string;
+  total: string;
+  gst_inclusive: boolean;
+  status: CreditNoteStatus;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  lines: CreditNoteLine[];
+}
+
+export interface CreditNoteSourceLine {
+  source_invoice_line_id: number;
+  description: string;
+  account_id: number;
+  quantity: string;
+  unit_price: string;
+  gst_rate: string;
+  tax_code: TaxCode;
+  line_subtotal: string;
+  line_gst: string;
+  line_total: string;
+  quantity_reserved: string;
+  remaining_creditable_quantity: string;
+}
+
+export interface CreditNoteSource {
+  source_invoice_id: number;
+  source_invoice_number: string;
+  direction: InvoiceDirection;
+  contact_id: number;
+  contact_name: string;
+  issue_date: string;
+  currency: string;
+  gst_inclusive: boolean;
+  status: InvoiceStatus;
+  subtotal: string;
+  gst_amount: string;
+  total: string;
+  paid_amount: string;
+  lines: CreditNoteSourceLine[];
+}
+
+export interface CreditNoteLineDraftIn {
+  source_invoice_line_id: number;
+  quantity: string;
+}
+
+export interface CreditNoteCreate {
+  source_invoice_id: number;
+  credit_note_number: string;
+  issue_date: string;
+  notes?: string | null;
+  lines: CreditNoteLineDraftIn[];
+}
+
+export interface CreditNoteUpdate {
+  credit_note_number?: string;
+  issue_date?: string;
+  notes?: string | null;
+  lines?: CreditNoteLineDraftIn[];
+}
+
 export interface PdfUploadResult {
   attachment_id: string;
   filename: string;
