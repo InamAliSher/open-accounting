@@ -10,6 +10,7 @@ import type {
   TaxCode,
 } from "../../types/api";
 import DateInput from "../DateInput";
+import AccountingContactSelect from "./AccountingContactSelect";
 import InvoiceLineTable from "./InvoiceLineTable";
 
 // Strip thousands separators so "1,000" parses/submits as 1000 instead of
@@ -56,6 +57,7 @@ export function updateInvoiceLine(
 
 export interface InvoiceFormValues {
   direction: InvoiceDirection;
+  contact_id: number | null;
   contact_name: string;
   contact_abn: string;
   invoice_number: string;
@@ -73,6 +75,7 @@ export interface InvoiceFormValues {
 export function createEmptyInvoiceForm(direction: InvoiceDirection = "AP"): InvoiceFormValues {
   return {
     direction,
+    contact_id: null,
     contact_name: "",
     contact_abn: "",
     invoice_number: "",
@@ -91,6 +94,7 @@ export function createEmptyInvoiceForm(direction: InvoiceDirection = "AP"): Invo
 const EMPTY_FORM_LINE = Object.freeze(createInvoiceLine());
 export const EMPTY_FORM = Object.freeze({
   direction: "AP" as const,
+  contact_id: null,
   contact_name: "",
   contact_abn: "",
   invoice_number: "",
@@ -273,7 +277,7 @@ export function validateInvoiceForm(
   const errors: string[] = [];
   const amountMode = gstRegistered ? value.amount_mode : "none";
   if (!AMOUNT_MODES.includes(amountMode)) errors.push("Select a valid amount mode.");
-  if (!value.contact_name.trim()) errors.push("Customer or supplier name is required.");
+  if (!value.contact_id) errors.push(value.direction === "AP" ? "Select a supplier." : "Select a customer.");
   if (!value.invoice_number.trim()) errors.push("Invoice number is required.");
   if (!validIsoDate(value.issue_date)) errors.push("A valid issue date is required.");
   if (!value.lines.length) errors.push("At least one invoice line is required.");
@@ -344,15 +348,14 @@ export function toCreatePayload(
   const total = formatCents(amounts.totalCents);
   return {
     direction: v.direction,
-    contact_name: v.contact_name.trim() || null,
-    contact_abn: v.contact_abn.trim() || null,
+    contact_id: v.contact_id,
     invoice_number: v.invoice_number.trim(),
     issue_date: v.issue_date,
     due_date: v.due_date || null,
     subtotal,
     gst_amount: gst,
     total,
-    gst_inclusive: amountMode === "none" ? false : v.gst_inclusive,
+    gst_inclusive: amountMode === "inclusive",
     amount_mode: amountMode,
     notes: v.notes.trim() || null,
     source: opts.source ?? "manual",
@@ -384,7 +387,14 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
         ? "gst_free" as TaxCode
         : line.tax_code,
     }));
-    onChange(synchronizeInvoiceAmounts({ ...value, direction, lines }, formGstRegistered));
+    onChange(synchronizeInvoiceAmounts({
+      ...value,
+      direction,
+      contact_id: null,
+      contact_name: "",
+      contact_abn: "",
+      lines,
+    }, formGstRegistered));
   };
   const updateLine = (
     id: string,
@@ -436,8 +446,11 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
   return (
     <div className="space-y-3">
       {showDirection && (
-        <Field label="Direction">
-          <div className="flex gap-2">
+        <div className="block text-sm">
+          <span id="invoice-direction-label" className="block text-slate-600 mb-1">
+            Direction
+          </span>
+          <div role="group" aria-labelledby="invoice-direction-label" className="flex gap-2">
             <button
               type="button"
               className={`px-3 py-1 text-sm rounded border ${
@@ -461,25 +474,21 @@ export default function InvoiceForm({ value, onChange, showDirection = true }: P
               AR · Invoice to customer
             </button>
           </div>
-        </Field>
+        </div>
       )}
 
-      <div className="grid grid-cols-2 gap-3">
-        <Field label={value.direction === "AP" ? "Supplier name" : "Customer name"}>
-          <input
-            className="input"
-            value={value.contact_name}
-            onChange={(e) => set("contact_name", e.target.value)}
-          />
-        </Field>
-        <Field label="ABN (optional)">
-          <input
-            className="input"
-            value={value.contact_abn}
-            onChange={(e) => set("contact_abn", e.target.value)}
-          />
-        </Field>
-      </div>
+      <AccountingContactSelect
+        direction={value.direction}
+        contactId={value.contact_id}
+        contactName={value.contact_name}
+        contactAbn={value.contact_abn}
+        onChange={(contact) => onChange({
+          ...value,
+          contact_id: contact?.id ?? null,
+          contact_name: contact?.name ?? "",
+          contact_abn: contact?.abn ?? "",
+        })}
+      />
 
       <div className="grid grid-cols-3 gap-3">
         <Field label="Invoice #">

@@ -86,6 +86,18 @@ class InvoiceCreate(BaseModel):
         if v is not None and not v.strip():
             raise ValueError("contact_name must not be blank")
         return v
+
+    @model_validator(mode="after")
+    def _require_one_contact_reference(self):
+        if self.contact_id is not None:
+            if self.contact_name is not None:
+                raise ValueError("contact_id cannot be combined with contact_name")
+            if self.contact_abn is not None:
+                raise ValueError("contact_id cannot be combined with contact_abn")
+        elif self.contact_name is None:
+            raise ValueError("Either contact_id or contact_name must be provided")
+        return self
+
     contact_abn: str | None = None
     invoice_number: str = Field(min_length=1, max_length=80)
     issue_date: date
@@ -270,6 +282,11 @@ class InvoiceOut(BaseModel):
     updated_at: datetime
     attachments: list[AttachmentOut] = []
     journal_entries: list[JournalEntrySummary] = []
+
+
+class InvoicePostOut(BaseModel):
+    invoice: InvoiceOut
+    journal_entry: JournalEntrySummary
 
 
 class PdfUploadResult(BaseModel):
