@@ -1,7 +1,9 @@
 import { test, expect } from "@playwright/test";
 import {
+  BACKEND_URL,
   COMPANY_ID,
   COMPANY_NAME,
+  companyHeaders,
   ensureCompany,
 } from "./helpers";
 
@@ -118,7 +120,15 @@ test("04 — Customer Invoices link, route, and AR-only list behavior", async ({
 });
 
 test("05 — Customer Invoices manual create posts direction=AR", async ({ page }) => {
-  await ensureCompany(page.context().request);
+  const requestContext = page.context().request;
+  await ensureCompany(requestContext);
+  const contactName = "Fictional Bootstrap Customer";
+  const contactResponse = await requestContext.post(`${BACKEND_URL}/api/v1/contacts`, {
+    headers: companyHeaders(COMPANY_ID),
+    data: { name: contactName, kind: "customer", active: true },
+  });
+  expect(contactResponse.ok(), await contactResponse.text()).toBeTruthy();
+  const contact = (await contactResponse.json()) as { id: number };
 
   const createRequest = page.waitForRequest(
     (request) =>
@@ -135,19 +145,23 @@ test("05 — Customer Invoices manual create posts direction=AR", async ({ page 
   await expect(page.getByRole("button", { name: /AR · Invoice to customer/i })).toHaveCount(0);
 
   const dialog = page.getByRole("heading", { name: "New invoice" }).locator("../..");
-  await dialog.getByLabel("Customer name").fill("Customer UI");
+  await dialog.getByLabel("Search customer contacts").fill(contactName);
+  await page.getByRole("option", { name: `Select ${contactName}` }).click();
   await dialog.getByLabel("Invoice #").fill("AR-UI-001");
   await dialog.getByLabel("Issue date").fill("01/09/2026");
   await dialog.getByLabel("Description").first().fill("Regression consulting");
   await dialog.getByLabel("Qty").first().fill("1");
   await dialog.getByLabel("Unit price").first().fill("100.00");
-  const accountSelect = dialog.getByLabel("Account").first();
+  const accountSelect = dialog.getByRole("cell", { name: "Select account" }).getByRole("combobox", { name: "Account" });
   await accountSelect.selectOption({ index: 1 });
   await dialog.getByRole("button", { name: "Save Draft" }).click();
 
   const req = await createRequest;
   const payload = JSON.parse(req.postData() ?? "{}");
   expect(payload.direction).toBe("AR");
+  expect(payload.contact_id).toBe(contact.id);
+  expect(payload).not.toHaveProperty("contact_name");
+  expect(payload).not.toHaveProperty("contact_abn");
   expect(payload.lines).toHaveLength(1);
   expect(payload.lines[0]).toMatchObject({
     description: "Regression consulting",

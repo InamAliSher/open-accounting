@@ -124,6 +124,12 @@ class InvoiceSource(str, Enum):
     EXCEL = "excel"
 
 
+class CreditNoteStatus(str, Enum):
+    DRAFT = "draft"
+    AUTHORISED = "authorised"
+    VOID = "void"
+
+
 # Decimal precision used throughout: 2 decimal places, up to 14 integer digits.
 MONEY = Numeric(16, 2)
 
@@ -201,6 +207,106 @@ class InvoiceLine(CompanyBase):
 
     invoice: Mapped[Invoice] = relationship(back_populates="lines")
     account: Mapped[Account | None] = relationship()
+
+
+class CreditNote(CompanyBase):
+    __tablename__ = "credit_notes"
+    __table_args__ = (
+        UniqueConstraint(
+            "direction",
+            "contact_id",
+            "credit_note_number",
+            name="uq_credit_note_dir_contact_no",
+        ),
+        CheckConstraint("direction IN ('AR', 'AP')", name="ck_credit_note_direction"),
+        CheckConstraint("currency = 'AUD'", name="ck_credit_note_currency_aud"),
+        CheckConstraint(
+            "status IN ('draft', 'authorised', 'void')",
+            name="ck_credit_note_status_allowed",
+        ),
+        CheckConstraint("subtotal >= 0", name="ck_credit_note_subtotal_nonneg"),
+        CheckConstraint("gst_amount >= 0", name="ck_credit_note_gst_nonneg"),
+        CheckConstraint("total >= 0", name="ck_credit_note_total_nonneg"),
+        CheckConstraint("total > 0", name="ck_credit_note_total_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("invoices.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    direction: Mapped[str] = mapped_column(String(2), nullable=False, index=True)
+    contact_id: Mapped[int] = mapped_column(
+        ForeignKey("contacts.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    credit_note_number: Mapped[str] = mapped_column(String(80), nullable=False)
+    issue_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="AUD")
+    subtotal: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    gst_amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    total: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    gst_inclusive: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    status: Mapped[CreditNoteStatus] = mapped_column(
+        String(10), nullable=False, default=CreditNoteStatus.DRAFT, index=True
+    )
+    notes: Mapped[str | None] = mapped_column(String(1000))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    source_invoice: Mapped[Invoice] = relationship()
+    contact: Mapped[Contact] = relationship()
+    lines: Mapped[list["CreditNoteLine"]] = relationship(
+        back_populates="credit_note", cascade="all, delete-orphan"
+    )
+
+
+class CreditNoteLine(CompanyBase):
+    __tablename__ = "credit_note_lines"
+    __table_args__ = (
+        UniqueConstraint(
+            "credit_note_id",
+            "source_invoice_line_id",
+            name="uq_credit_note_line_note_source_line",
+        ),
+        CheckConstraint("quantity > 0", name="ck_credit_note_line_quantity_positive"),
+        CheckConstraint("unit_price >= 0", name="ck_credit_note_line_unit_price_nonneg"),
+        CheckConstraint("line_subtotal >= 0", name="ck_credit_note_line_subtotal_nonneg"),
+        CheckConstraint("line_gst >= 0", name="ck_credit_note_line_gst_nonneg"),
+        CheckConstraint("line_total >= 0", name="ck_credit_note_line_total_nonneg"),
+        CheckConstraint("line_subtotal > 0", name="ck_credit_note_line_subtotal_positive"),
+        CheckConstraint("line_total > 0", name="ck_credit_note_line_total_positive"),
+        CheckConstraint("line_gst <= line_total", name="ck_credit_note_line_gst_within"),
+        CheckConstraint(
+            "tax_code IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none')",
+            name="ck_credit_note_line_tax_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    credit_note_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_notes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_invoice_line_id: Mapped[int] = mapped_column(
+        ForeignKey("invoice_lines.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    description: Mapped[str] = mapped_column(String(500), nullable=False)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    quantity: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    gst_rate: Mapped[Decimal] = mapped_column(Numeric(5, 4), nullable=False)
+    line_subtotal: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    line_gst: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    line_total: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    tax_code: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    credit_note: Mapped[CreditNote] = relationship(back_populates="lines")
+    source_invoice_line: Mapped[InvoiceLine] = relationship()
+    account: Mapped[Account] = relationship()
 
 
 # ---------------------------------------------------------------------------

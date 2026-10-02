@@ -71,6 +71,243 @@ def _create_invoice(client, accounts, *, number="INV-API-1"):
     return r.json()
 
 
+def _create_contact(client, *, name, kind, active=True):
+    response = client.post(
+        "/api/v1/contacts",
+        headers=HEAD,
+        json={"name": name, "kind": kind, "active": active},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _linked_invoice_payload(accounts, *, contact_id, direction="AR", number="LINKED-1"):
+    payload = _invoice_payload(accounts, number=number)
+    payload.pop("contact_name")
+    payload["contact_id"] = contact_id
+    payload["direction"] = direction
+    if direction == "AP":
+        payload["lines"][0]["account_id"] = accounts["6100"]["id"]
+    return payload
+
+
+def _invoice_state(client, invoice_id):
+    response = client.get(f"/api/v1/invoices/{invoice_id}", headers=HEAD)
+    assert response.status_code == 200, response.text
+    invoice = response.json()
+
+    from app.db.company import company_session
+    from app.models.company import Invoice
+
+    with company_session("tc") as db:
+        stored = db.get(Invoice, invoice_id)
+        lines = [
+            (
+                line.id,
+                line.account_id,
+                str(line.quantity),
+                str(line.unit_price),
+                str(line.line_subtotal),
+                str(line.line_gst),
+                str(line.line_total),
+            )
+            for line in sorted(stored.lines, key=lambda line: line.id)
+        ]
+
+    return {
+        "direction": invoice["direction"],
+        "contact_id": invoice["contact_id"],
+        "subtotal": invoice["subtotal"],
+        "gst_amount": invoice["gst_amount"],
+        "total": invoice["total"],
+        "lines": lines,
+    }
+
+
+def test_contact_id_create_accepts_only_active_compatible_roles(client, accounts):
+    cases = (
+        ("customer", "AR"),
+        ("supplier", "AP"),
+        ("both", "AR"),
+        ("both", "AP"),
+    )
+    for index, (kind, direction) in enumerate(cases):
+        contact = _create_contact(
+            client,
+            name=f"Fictional {kind} {direction} {index}",
+            kind=kind,
+        )
+        payload = _linked_invoice_payload(
+            accounts,
+            contact_id=contact["id"],
+            direction=direction,
+            number=f"LINKED-ACCEPT-{index}",
+        )
+        response = client.post("/api/v1/invoices", headers=HEAD, json=payload)
+        assert response.status_code == 201, response.text
+        assert response.json()["contact_id"] == contact["id"]
+
+
+def test_contact_id_create_rejects_unknown_inactive_and_incompatible_contacts(client, accounts):
+    customer = _create_contact(client, name="Fictional customer", kind="customer")
+    supplier = _create_contact(client, name="Fictional supplier", kind="supplier")
+    inactive = _create_contact(
+        client,
+        name="Fictional inactive supplier",
+        kind="supplier",
+        active=False,
+    )
+    cases = (
+        (_linked_invoice_payload(accounts, contact_id=customer["id"], direction="AP"), 422),
+        (_linked_invoice_payload(accounts, contact_id=supplier["id"], direction="AR"), 422),
+        (_linked_invoice_payload(accounts, contact_id=inactive["id"], direction="AP"), 409),
+        (_linked_invoice_payload(accounts, contact_id=999999, direction="AR"), 422),
+    )
+    for payload, expected_status in cases:
+        response = client.post("/api/v1/invoices", headers=HEAD, json=payload)
+        assert response.status_code == expected_status, response.text
+
+
+def test_contact_id_create_rejects_ambiguous_legacy_fields(client, accounts):
+    contact = _create_contact(client, name="Fictional linked contact", kind="customer")
+    for field, value in (("contact_name", "Fictional typed name"), ("contact_abn", "12 345 678 901")):
+        payload = _linked_invoice_payload(accounts, contact_id=contact["id"])
+        payload[field] = value
+        response = client.post("/api/v1/invoices", headers=HEAD, json=payload)
+        assert response.status_code == 422, response.text
+
+
+def test_typed_contact_name_legacy_create_remains_supported(client, accounts):
+    payload = _invoice_payload(accounts, number="LEGACY-TYPED-CONTACT")
+    payload["contact_name"] = "Fictional Legacy Contact"
+    payload["contact_abn"] = "12 345 678 901"
+    response = client.post("/api/v1/invoices", headers=HEAD, json=payload)
+    assert response.status_code == 201, response.text
+    invoice = response.json()
+    assert invoice["contact_name"] == "Fictional Legacy Contact"
+    contacts_response = client.get(
+        "/api/v1/contacts",
+        headers=HEAD,
+        params={"q": "Fictional Legacy Contact"},
+    )
+    assert contacts_response.status_code == 200, contacts_response.text
+    matches = [
+        contact for contact in contacts_response.json()
+        if contact["name"] == "Fictional Legacy Contact"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["abn"] == "12345678901"
+    assert invoice["direction"] == "AR"
+    assert matches[0]["kind"] == "customer"
+
+
+def test_draft_patch_validates_effective_contact_and_direction(client, accounts):
+    customer = _create_contact(client, name="Fictional draft customer", kind="customer")
+    supplier = _create_contact(client, name="Fictional draft supplier", kind="supplier")
+    inactive_supplier = _create_contact(
+        client,
+        name="Fictional inactive draft supplier",
+        kind="supplier",
+        active=False,
+    )
+    payload = _linked_invoice_payload(accounts, contact_id=customer["id"], number="PATCH-CONTACT")
+    created = client.post("/api/v1/invoices", headers=HEAD, json=payload)
+    assert created.status_code == 201, created.text
+    invoice_id = created.json()["id"]
+
+    expected_state = _invoice_state(client, invoice_id)
+    incompatible_direction = client.patch(
+        f"/api/v1/invoices/{invoice_id}", headers=HEAD, json={"direction": "AP"}
+    )
+    assert incompatible_direction.status_code == 422, incompatible_direction.text
+    assert _invoice_state(client, invoice_id) == expected_state
+
+    ap_lines = _linked_invoice_payload(
+        accounts,
+        contact_id=supplier["id"],
+        direction="AP",
+    )["lines"]
+    switched = client.patch(
+        f"/api/v1/invoices/{invoice_id}",
+        headers=HEAD,
+        json={"direction": "AP", "contact_id": supplier["id"], "lines": ap_lines},
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["direction"] == "AP"
+    assert switched.json()["contact_id"] == supplier["id"]
+    expected_state = _invoice_state(client, invoice_id)
+
+    for contact_id, expected_status in ((customer["id"], 422), (inactive_supplier["id"], 409), (999999, 422)):
+        expected_state = _invoice_state(client, invoice_id)
+        response = client.patch(
+            f"/api/v1/invoices/{invoice_id}",
+            headers=HEAD,
+            json={"contact_id": contact_id},
+        )
+        assert response.status_code == expected_status, response.text
+        assert _invoice_state(client, invoice_id) == expected_state
+
+
+def test_posted_invoice_contact_and_direction_remain_locked(client, accounts):
+    customer = _create_contact(client, name="Fictional locked customer", kind="customer")
+    supplier = _create_contact(client, name="Fictional locked supplier", kind="supplier")
+    created = client.post(
+        "/api/v1/invoices",
+        headers=HEAD,
+        json=_linked_invoice_payload(accounts, contact_id=customer["id"], number="LOCKED-CONTACT"),
+    )
+    assert created.status_code == 201, created.text
+    invoice = created.json()
+    assert client.post(f"/api/v1/invoices/{invoice['id']}/post", headers=HEAD).status_code == 200
+
+    response = client.patch(
+        f"/api/v1/invoices/{invoice['id']}",
+        headers=HEAD,
+        json={"direction": "AP", "contact_id": supplier["id"]},
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_duplicate_invoice_number_is_scoped_by_direction_and_contact(client, accounts):
+    contact = _create_contact(client, name="Fictional both-role contact", kind="both")
+    other_customer = _create_contact(
+        client,
+        name="Fictional separate customer",
+        kind="customer",
+    )
+    number = "DIRECTION-CONTACT-DUPLICATE"
+    ar = client.post(
+        "/api/v1/invoices",
+        headers=HEAD,
+        json=_linked_invoice_payload(accounts, contact_id=contact["id"], number=number),
+    )
+    assert ar.status_code == 201, ar.text
+    ap = client.post(
+        "/api/v1/invoices",
+        headers=HEAD,
+        json=_linked_invoice_payload(accounts, contact_id=contact["id"], direction="AP", number=number),
+    )
+    assert ap.status_code == 201, ap.text
+
+    other_contact_ar = client.post(
+        "/api/v1/invoices",
+        headers=HEAD,
+        json=_linked_invoice_payload(
+            accounts,
+            contact_id=other_customer["id"],
+            number=number,
+        ),
+    )
+    assert other_contact_ar.status_code == 201, other_contact_ar.text
+
+    duplicate = client.post(
+        "/api/v1/invoices",
+        headers=HEAD,
+        json=_linked_invoice_payload(accounts, contact_id=contact["id"], number=number),
+    )
+    assert duplicate.status_code == 409, duplicate.text
+
+
 def _explicit_payload(
     accounts,
     *,
@@ -356,7 +593,12 @@ def test_post_endpoint_creates_journal_and_list_filter_finds_it(client, accounts
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["invoice"]["status"] == "authorised"
+    assert body["invoice"]["subtotal"] == "100.00"
+    assert body["invoice"]["gst_amount"] == "10.00"
+    assert body["invoice"]["total"] == "110.00"
+    assert body["invoice"]["paid_amount"] == "0.00"
     assert body["journal_entry"]["source_type"] == "invoice_ar"
+    assert body["journal_entry"]["source_id"] == inv["id"]
 
     r = client.get("/api/v1/journal/entries?source_type=invoice_ar", headers=HEAD)
     assert r.status_code == 200, r.text

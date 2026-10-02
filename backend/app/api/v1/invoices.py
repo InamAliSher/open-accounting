@@ -30,6 +30,7 @@ from ...schemas.invoice import (
     ExcelImportPayload,
     InvoiceCreate,
     InvoiceOut,
+    InvoicePostOut,
     InvoiceUpdate,
     PdfUploadResult,
     SpreadsheetPreview,
@@ -476,15 +477,27 @@ def _is_void(inv: Invoice) -> bool:
 
 
 def _resolve_contact(db: Session, payload: InvoiceCreate) -> Contact:
-    if payload.contact_id:
+    if payload.contact_id is not None:
         c = db.get(Contact, payload.contact_id)
         if c is None:
-            raise HTTPException(404, f"Contact {payload.contact_id} not found")
+            raise HTTPException(422, f"Contact {payload.contact_id} not found")
+        _validate_contact_for_direction(c, payload.direction)
         return c
     if not payload.contact_name:
         raise HTTPException(422, "Either contact_id or contact_name must be provided")
     kind = "supplier" if payload.direction == "AP" else "customer"
     return get_or_create_contact(db=db, name=payload.contact_name, kind=kind, abn=payload.contact_abn)
+
+
+def _validate_contact_for_direction(contact: Contact, direction: str) -> None:
+    if not contact.active:
+        raise HTTPException(409, f"Contact {contact.id} is inactive")
+    required_kind = "supplier" if direction == "AP" else "customer"
+    if contact.kind not in {required_kind, "both"}:
+        raise HTTPException(
+            422,
+            f"Contact {contact.id} is not compatible with {direction} invoices",
+        )
 
 
 @router.patch("/{invoice_id}", response_model=InvoiceOut)
@@ -540,6 +553,12 @@ def update_invoice(
     # same PATCH.  Posting repeats the check to protect legacy/drifted rows.
     effective_direction = changes.get("direction", inv.direction)
     effective_lines = lines if lines is not None else inv.lines
+    effective_contact_id = changes.get("contact_id", inv.contact_id)
+    if _is_draft(inv):
+        contact = db.get(Contact, effective_contact_id)
+        if contact is None:
+            raise HTTPException(422, f"Contact {effective_contact_id} not found")
+        _validate_contact_for_direction(contact, effective_direction)
     if effective_lines:
         try:
             invoice_posting.validate_invoice_line_accounts(
@@ -570,7 +589,7 @@ def update_invoice(
     return _serialize(_attach_journal_entries(db, inv))
 
 
-@router.post("/{invoice_id}/post")
+@router.post("/{invoice_id}/post", response_model=InvoicePostOut)
 def post_invoice_endpoint(
     invoice_id: PathId,
     company: Company = Depends(get_current_company),

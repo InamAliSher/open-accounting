@@ -36,6 +36,7 @@ function values(overrides: Partial<InvoiceFormValues> = {}): InvoiceFormValues {
   };
   return {
     ...createEmptyInvoiceForm(),
+    contact_id: 42,
     contact_name: "Tax Test",
     invoice_number: "TAX-1",
     issue_date: "2024-07-01",
@@ -53,6 +54,7 @@ test("fresh forms and immutable line updates keep stable independent IDs", () =>
   expect(firstForm.lines).not.toBe(secondForm.lines);
   expect(firstForm.lines[0]).not.toBe(secondForm.lines[0]);
   expect(firstForm.lines[0].id).not.toBe(secondForm.lines[0].id);
+  expect(firstForm.contact_id).toBeNull();
   expect(Object.isFrozen(EMPTY_FORM.lines)).toBeTruthy();
   expect(Object.isFrozen(EMPTY_FORM.lines[0])).toBeTruthy();
   const sentinelUpdate = updateInvoiceLine(EMPTY_FORM.lines, EMPTY_FORM.lines[0].id, {
@@ -106,7 +108,8 @@ test("stored headers stay empty until every visible line is complete", () => {
 test("validation rejects every incomplete or inconsistent Phase A draft", () => {
   const valid = values();
   expect(validateInvoiceForm(valid)).toEqual([]);
-  expect(validateInvoiceForm(values({ contact_name: " " })).join(" ")).toContain("name is required");
+  expect(validateInvoiceForm(values({ contact_id: null, contact_name: "Typed but unlinked" })).join(" ")).toContain("Select a supplier.");
+  expect(validateInvoiceForm(values({ direction: "AR", contact_id: null })).join(" ")).toContain("Select a customer.");
   expect(validateInvoiceForm(values({ invoice_number: " " })).join(" ")).toContain("Invoice number is required");
   expect(validateInvoiceForm(values({ issue_date: "2024-02-30" })).join(" ")).toContain("valid issue date");
   expect(validateInvoiceForm(values({ lines: [] })).join(" ")).toContain("At least one invoice line");
@@ -215,6 +218,9 @@ test("payload contains every visible calculated line using decimal-dollar string
   }), { gst_registered: true });
 
   expect(payload.direction).toBe("AR");
+  expect(payload.contact_id).toBe(42);
+  expect(payload).not.toHaveProperty("contact_name");
+  expect(payload).not.toHaveProperty("contact_abn");
   expect(payload).not.toHaveProperty("status");
   expect(payload.notes).toBe("Separate header note");
   expect(payload).not.toHaveProperty("account_id");
@@ -345,13 +351,21 @@ test("manual AR editor keeps independent lines, protects the final line, and sub
   }>;
   const incomeAccount = accounts.find((account) => account.type === "INCOME" && account.active);
   expect(incomeAccount).toBeTruthy();
+  const contactName = `Fictional Line State Customer ${Date.now()}`;
+  const contactResponse = await request.post(`${BACKEND_URL}/api/v1/contacts`, {
+    headers: companyHeaders(COMPANY_ID),
+    data: { name: contactName, kind: "customer" },
+  });
+  expect(contactResponse.ok(), await contactResponse.text()).toBeTruthy();
+  const contact = (await contactResponse.json()) as { id: number };
 
   await page.goto("/invoices");
   await selectCompany(page);
   await page.getByRole("button", { name: "+ Manual", exact: true }).click();
   const dialog = page.getByRole("heading", { name: "New invoice" }).locator("../..");
   await dialog.getByRole("button", { name: /^AR/ }).click();
-  await dialog.getByLabel("Customer name").fill("Line State Customer");
+  await dialog.getByLabel("Search customer contacts").fill(contactName);
+  await dialog.getByRole("option", { name: `Select ${contactName}` }).click();
   await dialog.getByLabel("Invoice #").fill(`AR-LINES-${Date.now()}`);
   await dialog.getByLabel(/Issue date/).fill("01/07/2026");
 
@@ -399,6 +413,9 @@ test("manual AR editor keeps independent lines, protects the final line, and sub
   const outgoing = await createRequest;
   const payload = outgoing.postDataJSON();
   expect(payload.direction).toBe("AR");
+  expect(payload.contact_id).toBe(contact.id);
+  expect(payload).not.toHaveProperty("contact_name");
+  expect(payload).not.toHaveProperty("contact_abn");
   expect(payload.lines).toHaveLength(2);
   expect(payload.lines[0]).toMatchObject({
     description: "Consulting", quantity: "2", unit_price: "25.00", account_id: incomeAccount!.id,
@@ -422,9 +439,9 @@ test("manual keyboard submission rejects invalid fields while Save Draft is disa
   await page.getByRole("button", { name: "+ Manual", exact: true }).click();
   const dialog = page.getByRole("heading", { name: "New invoice" }).locator("../..");
   await expect(dialog.getByRole("button", { name: "Save Draft" })).toBeDisabled();
-  await dialog.getByLabel("Supplier name").focus();
+  await dialog.getByLabel("Search supplier contacts").focus();
   await page.keyboard.press("Enter");
-  await expect(dialog.getByRole("alert")).toContainText("name is required");
+  await expect(dialog.getByRole("alert")).toContainText("Select a supplier.");
   await expect(dialog.getByRole("alert")).toContainText("Invoice number is required");
   await expect(dialog.getByRole("alert")).toContainText("valid issue date is required");
   await expect(dialog.getByRole("alert")).toContainText("description is required");

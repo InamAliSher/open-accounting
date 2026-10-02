@@ -7,6 +7,7 @@ import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { useModalKeys } from "../../lib/useModalKeys";
 import type { Invoice } from "../../types/api";
 import { displayDocNumber, displayName, formatDate, formatMoney, statusBadgeClass } from "../../lib/format";
+import SourceCreditNoteDrafts from "../credit-notes/SourceCreditNoteDrafts";
 
 async function voidInvoice(id: number): Promise<void> {
   await api.delete(`/invoices/${id}`);
@@ -100,6 +101,10 @@ export default function InvoiceDetailDrawer({ invoice, onClose }: Props) {
                 {invoice.notes}
               </div>
             </div>
+          )}
+
+          {invoice.status !== "draft" && invoice.status !== "void" && (
+            <SourceCreditNoteDrafts invoiceId={invoice.id} />
           )}
 
           {!isDraft && invoice.status !== "void" && (

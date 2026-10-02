@@ -67,7 +67,7 @@ export default function ImportPdfDialog({
     !!preview &&
     !!companyQ.data &&
     !createMut.isPending &&
-    !!form.contact_name &&
+    form.contact_id !== null &&
     !!form.invoice_number &&
     !!form.issue_date &&
     !!form.total;
