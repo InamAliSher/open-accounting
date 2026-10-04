@@ -13,7 +13,9 @@ import sqlite3
 import pytest
 from sqlalchemy import create_engine, event, text
 
+from app.db.base import CompanyBase
 from app.db import migrations
+import app.models.company  # noqa: F401
 
 
 def _engine():
@@ -604,14 +606,26 @@ def test_noop_migration_rejects_preexisting_fk_violation_and_restores_fk(tmp_pat
 
 
 def test_migrations_on_fresh_db_is_safe_noop():
-    """Brand-new empty DB (no legacy tables, no columns to drop): the
-    migration run must not raise and must not claim any drops happened.
+    """Brand-new company schema (no legacy tables or columns to drop): the
+    migration run must remain valid and must not claim any drops happened.
     """
     engine = _engine()
+    CompanyBase.metadata.create_all(engine)
     applied = migrations.run_company_migrations(engine)
     # No drops should be reported on an empty DB.
     drops = [step for step in applied if step.startswith("drop_")]
     assert drops == [], f"expected no drops on empty DB, got {drops}"
+    with engine.connect() as conn:
+        invoice_columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(invoices)")).fetchall()
+        }
+    assert {
+        "contact_name_snapshot",
+        "contact_abn_snapshot",
+        "contact_address_snapshot",
+        "contact_email_snapshot",
+        "contact_phone_snapshot",
+    }.issubset(invoice_columns)
 
 
 def test_system_account_reconciliation_error_rolls_back_and_keeps_backup(tmp_path):

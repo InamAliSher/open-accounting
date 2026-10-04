@@ -1403,6 +1403,57 @@ def _backfill_invoice_authorised_at(conn) -> int:
     return result.rowcount or 0
 
 
+def _backfill_invoice_contact_snapshots(conn) -> int:
+    if not _table_exists(conn, "invoices") or not _table_exists(conn, "contacts"):
+        return 0
+    invoice_columns = _existing_columns(conn, "invoices")
+    snapshot_columns = {
+        "contact_name_snapshot",
+        "contact_abn_snapshot",
+        "contact_address_snapshot",
+        "contact_email_snapshot",
+        "contact_phone_snapshot",
+    }
+    if not {"id", "contact_id", *snapshot_columns}.issubset(invoice_columns):
+        return 0
+    contact_columns = {"id", "name", "abn", "address", "email", "phone"}
+    if not contact_columns.issubset(_existing_columns(conn, "contacts")):
+        return 0
+
+    missing_contacts = conn.execute(
+        text(
+            "SELECT i.id FROM invoices AS i "
+            "LEFT JOIN contacts AS c ON c.id = i.contact_id "
+            "WHERE i.contact_name_snapshot IS NULL AND c.id IS NULL "
+            "ORDER BY i.id"
+        )
+    ).scalars().all()
+    if missing_contacts:
+        raise DataRecoveryRequiredError(
+            "Cannot backfill invoice contact snapshots: invoice(s) "
+            f"{missing_contacts!r} reference a missing Contact. Restore the Contact "
+            "or resolve the invoice through an operator-reviewed recovery workflow."
+        )
+
+    result = conn.execute(
+        text(
+            "UPDATE invoices SET "
+            "contact_name_snapshot = (SELECT c.name FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id), "
+            "contact_abn_snapshot = (SELECT c.abn FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id), "
+            "contact_address_snapshot = (SELECT c.address FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id), "
+            "contact_email_snapshot = (SELECT c.email FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id), "
+            "contact_phone_snapshot = (SELECT c.phone FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id) "
+            "WHERE contact_name_snapshot IS NULL"
+        )
+    )
+    return int(result.rowcount or 0)
+
+
 def _backfill_doc_number_version_suffix(conn) -> int:
     """Rename `XX-YYYY-NNNN` documents to `XX-YYYY-NNNN-1`.
 
@@ -1579,6 +1630,11 @@ def run_company_migrations(
         invoice_rows = _backfill_invoice_authorised_at(conn)
         if invoice_rows:
             applied.append(f"backfill:invoice_authorised_at:{invoice_rows}")
+        invoice_contact_rows = _backfill_invoice_contact_snapshots(conn)
+        if invoice_contact_rows:
+            applied.append(
+                f"backfill:invoice_contact_snapshot:{invoice_contact_rows}"
+            )
 
         # 6. Data backfill: ensure every outgoing_documents row has a
         # version-suffixed doc_number (`XX-YYYY-NNNN-1` for the original).

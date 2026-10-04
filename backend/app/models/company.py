@@ -145,6 +145,11 @@ class Invoice(CompanyBase):
     contact_id: Mapped[int] = mapped_column(
         ForeignKey("contacts.id", ondelete="RESTRICT"), nullable=False, index=True
     )
+    contact_name_snapshot: Mapped[str | None] = mapped_column(String(200))
+    contact_abn_snapshot: Mapped[str | None] = mapped_column(String(20))
+    contact_address_snapshot: Mapped[str | None] = mapped_column(String(500))
+    contact_email_snapshot: Mapped[str | None] = mapped_column(String(200))
+    contact_phone_snapshot: Mapped[str | None] = mapped_column(String(50))
     invoice_number: Mapped[str] = mapped_column(String(80), nullable=False)
     issue_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     due_date: Mapped[date | None] = mapped_column(Date)
