@@ -184,3 +184,33 @@ test("06 — Receipts route remains available", async ({ page }) => {
   await page.getByRole("link", { name: "Documents", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Receipts" })).toBeVisible();
 });
+
+test("07 — Contacts hub distinguishes accounting contacts from service clients", async ({
+  page,
+}) => {
+  await ensureCompany(page.context().request);
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "Contacts", exact: true }).click();
+  await expect(page).toHaveURL(/\/contacts-hub$/);
+  await expect(page.getByRole("heading", { name: "Contacts", exact: true })).toBeVisible();
+
+  const accountingDescription =
+    "Customers and suppliers used for customer invoices and supplier bills.";
+  const serviceDescription =
+    "People and entities used for outgoing documents and migration-service workflows.";
+  await expect(page.getByText(accountingDescription, { exact: true })).toBeVisible();
+  await expect(page.getByText(serviceDescription, { exact: true })).toBeVisible();
+
+  await page.getByRole("link", { name: /^Accounting Contacts/ }).click();
+  await expect(page).toHaveURL(/\/contacts$/);
+  await expect(
+    page.getByRole("heading", { name: "Accounting Contacts", exact: true }),
+  ).toBeVisible();
+
+  await page.getByRole("link", { name: "Contacts", exact: true }).click();
+  await expect(page).toHaveURL(/\/contacts-hub$/);
+  await page.getByRole("link", { name: /^Service Clients/ }).click();
+  await expect(page).toHaveURL(/\/clients$/);
+  await expect(page.getByRole("heading", { name: "Clients", exact: true })).toBeVisible();
+});
