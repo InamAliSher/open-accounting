@@ -344,6 +344,16 @@ def _source_ref_collision_message(source, source_ref: str, existing: Invoice) ->
     )
 
 
+def _contact_snapshot_values(contact: Contact) -> dict[str, str | None]:
+    return {
+        "contact_name_snapshot": contact.name,
+        "contact_abn_snapshot": contact.abn,
+        "contact_address_snapshot": contact.address,
+        "contact_email_snapshot": contact.email,
+        "contact_phone_snapshot": contact.phone,
+    }
+
+
 @router.post("", response_model=InvoiceOut, status_code=201)
 def create_invoice(
     payload: InvoiceCreate,
@@ -411,6 +421,7 @@ def create_invoice(
     inv = Invoice(
         direction=payload.direction,
         contact_id=contact.id,
+        **_contact_snapshot_values(contact),
         invoice_number=payload.invoice_number,
         issue_date=payload.issue_date,
         due_date=payload.due_date,
@@ -569,6 +580,9 @@ def update_invoice(
 
     for field, value in changes.items():
         setattr(inv, field, value)
+    if _is_draft(inv) and "contact_id" in changes:
+        for field, value in _contact_snapshot_values(contact).items():
+            setattr(inv, field, value)
     if lines is not None:
         inv.lines.clear()
         db.flush()
@@ -925,6 +939,7 @@ def import_excel_rows(
             inv = Invoice(
                 direction=direction,
                 contact_id=contact.id,
+                **_contact_snapshot_values(contact),
                 invoice_number=parsed["invoice_number"],
                 issue_date=date.fromisoformat(parsed["issue_date"]),
                 due_date=date.fromisoformat(parsed["due_date"]) if parsed.get("due_date") else None,

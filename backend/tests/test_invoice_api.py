@@ -71,11 +71,29 @@ def _create_invoice(client, accounts, *, number="INV-API-1"):
     return r.json()
 
 
-def _create_contact(client, *, name, kind, active=True):
+def _create_contact(
+    client,
+    *,
+    name,
+    kind,
+    active=True,
+    abn=None,
+    address=None,
+    email=None,
+    phone=None,
+):
     response = client.post(
         "/api/v1/contacts",
         headers=HEAD,
-        json={"name": name, "kind": kind, "active": active},
+        json={
+            "name": name,
+            "kind": kind,
+            "active": active,
+            "abn": abn,
+            "address": address,
+            "email": email,
+            "phone": phone,
+        },
     )
     assert response.status_code == 201, response.text
     return response.json()
@@ -122,6 +140,210 @@ def _invoice_state(client, invoice_id):
         "total": invoice["total"],
         "lines": lines,
     }
+
+
+def _invoice_snapshots(invoice_id):
+    from app.db.company import company_session
+    from app.models.company import Invoice
+
+    fields = (
+        "contact_name_snapshot",
+        "contact_abn_snapshot",
+        "contact_address_snapshot",
+        "contact_email_snapshot",
+        "contact_phone_snapshot",
+    )
+    with company_session("tc") as db:
+        invoice = db.get(Invoice, invoice_id)
+        return tuple(getattr(invoice, field) for field in fields)
+
+
+def _contact_snapshot(contact):
+    return (
+        contact["name"],
+        contact["abn"],
+        contact["address"],
+        contact["email"],
+        contact["phone"],
+    )
+
+
+def test_contact_id_create_persists_contact_snapshots(client, accounts):
+    contact = _create_contact(
+        client,
+        name="Snapshot customer",
+        kind="customer",
+        abn="12345678901",
+        address="10 Snapshot Street",
+        email="billing@snapshot.test",
+        phone="0400000000",
+    )
+    response = client.post(
+        "/api/v1/invoices",
+        headers=HEAD,
+        json=_linked_invoice_payload(accounts, contact_id=contact["id"], number="CONTACT-SNAPSHOT"),
+    )
+    assert response.status_code == 201, response.text
+    assert _invoice_snapshots(response.json()["id"]) == _contact_snapshot(contact)
+
+
+def test_legacy_contact_create_persists_contact_snapshots(client, accounts):
+    payload = _invoice_payload(accounts, number="LEGACY-SNAPSHOT")
+    payload["contact_name"] = "Legacy Snapshot Customer"
+    payload["contact_abn"] = "12 345 678 901"
+    response = client.post("/api/v1/invoices", headers=HEAD, json=payload)
+    assert response.status_code == 201, response.text
+    assert _invoice_snapshots(response.json()["id"]) == (
+        "Legacy Snapshot Customer",
+        "12345678901",
+        None,
+        None,
+        None,
+    )
+
+
+def test_excel_import_persists_resolved_contact_snapshots(client):
+    mapping = {
+        "direction": 0,
+        "contact_name": 1,
+        "invoice_number": 2,
+        "issue_date": 3,
+        "total": 4,
+        "contact_abn": 5,
+    }
+    response = client.post(
+        "/api/v1/invoices/import-excel-rows",
+        headers=HEAD,
+        json={
+            "mapping": mapping,
+            "rows": [{
+                "row_no": 2,
+                "raw": ["AR", "Excel Snapshot Customer", "EXCEL-SNAPSHOT", "2026-05-01", "110.00", "12345678901"],
+            }],
+            "direction_default": "AR",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["created"]) == 1
+    assert body["skipped"] == []
+    assert _invoice_snapshots(body["created"][0]) == (
+        "Excel Snapshot Customer",
+        "12345678901",
+        None,
+        None,
+        None,
+    )
+
+
+def test_draft_contact_change_refreshes_snapshots(client, accounts):
+    original = _create_contact(
+        client,
+        name="Original Snapshot Customer",
+        kind="customer",
+        abn="11111111111",
+        address="1 Original Street",
+        email="original@snapshot.test",
+        phone="0400000001",
+    )
+    replacement = _create_contact(
+        client,
+        name="Replacement Snapshot Customer",
+        kind="customer",
+        abn="22222222222",
+        address="2 Replacement Street",
+        email="replacement@snapshot.test",
+        phone="0400000002",
+    )
+    created = client.post(
+        "/api/v1/invoices",
+        headers=HEAD,
+        json=_linked_invoice_payload(accounts, contact_id=original["id"], number="PATCH-SNAPSHOT"),
+    )
+    assert created.status_code == 201, created.text
+    invoice_id = created.json()["id"]
+
+    updated = client.patch(
+        f"/api/v1/invoices/{invoice_id}",
+        headers=HEAD,
+        json={"contact_id": replacement["id"]},
+    )
+    assert updated.status_code == 200, updated.text
+    assert _invoice_snapshots(invoice_id) == _contact_snapshot(replacement)
+
+
+def test_unrelated_draft_edit_preserves_contact_snapshots(client, accounts):
+    contact = _create_contact(
+        client,
+        name="Stable Snapshot Customer",
+        kind="customer",
+        abn="33333333333",
+        address="3 Stable Street",
+        email="stable@snapshot.test",
+        phone="0400000003",
+    )
+    created = client.post(
+        "/api/v1/invoices",
+        headers=HEAD,
+        json=_linked_invoice_payload(accounts, contact_id=contact["id"], number="STABLE-SNAPSHOT"),
+    )
+    assert created.status_code == 201, created.text
+    invoice_id = created.json()["id"]
+    expected = _contact_snapshot(contact)
+
+    live_edit = client.patch(
+        f"/api/v1/contacts/{contact['id']}",
+        headers=HEAD,
+        json={
+            "name": "Live Contact Renamed",
+            "abn": "44444444444",
+            "address": "4 Live Street",
+            "email": "live@snapshot.test",
+            "phone": "0400000004",
+        },
+    )
+    assert live_edit.status_code == 200, live_edit.text
+    assert _invoice_snapshots(invoice_id) == expected
+
+    unrelated_edit = client.patch(
+        f"/api/v1/invoices/{invoice_id}", headers=HEAD, json={"notes": "Updated note"}
+    )
+    assert unrelated_edit.status_code == 200, unrelated_edit.text
+    assert _invoice_snapshots(invoice_id) == expected
+
+
+def test_snapshot_field_injection_cannot_override_post_or_patch(client, accounts):
+    original = _create_contact(
+        client,
+        name="Protected Snapshot Customer",
+        kind="customer",
+        abn="55555555555",
+        address="5 Protected Street",
+        email="protected@snapshot.test",
+        phone="0400000005",
+    )
+    injected = {
+        "contact_name_snapshot": "Forged Name",
+        "contact_abn_snapshot": "99999999999",
+        "contact_address_snapshot": "Forged Address",
+        "contact_email_snapshot": "forged@snapshot.test",
+        "contact_phone_snapshot": "0499999999",
+    }
+    payload = _linked_invoice_payload(
+        accounts, contact_id=original["id"], number="INJECTED-SNAPSHOT"
+    )
+    payload.update(injected)
+    created = client.post("/api/v1/invoices", headers=HEAD, json=payload)
+    assert created.status_code == 201, created.text
+    invoice_id = created.json()["id"]
+    expected = _contact_snapshot(original)
+    assert _invoice_snapshots(invoice_id) == expected
+
+    patched = client.patch(
+        f"/api/v1/invoices/{invoice_id}", headers=HEAD, json={**injected, "notes": "Still protected"}
+    )
+    assert patched.status_code == 200, patched.text
+    assert _invoice_snapshots(invoice_id) == expected
 
 
 def test_contact_id_create_accepts_only_active_compatible_roles(client, accounts):
