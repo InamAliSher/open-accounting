@@ -29,6 +29,8 @@ async function createInvoice(
     tax_code: "standard" | "gst_free" | "none";
     gst_rate: string;
   }>,
+  direction: "AR" | "AP" = "AR",
+  contactName = "Fictional Credit Note Customer",
 ): Promise<number> {
   const subtotal = lines.reduce((sum, line) => sum + BigInt(line.line_subtotal.replace(".", "")), 0n);
   const gst = lines.reduce((sum, line) => sum + BigInt(line.line_gst.replace(".", "")), 0n);
@@ -37,8 +39,8 @@ async function createInvoice(
   const response = await request.post(`${BACKEND_URL}/api/v1/invoices`, {
     headers,
     data: {
-      direction: "AR",
-      contact_name: "Fictional Credit Note Customer",
+      direction,
+      contact_name: contactName,
       invoice_number: invoiceNumber,
       issue_date: ISSUE_DATE,
       currency: "AUD",
@@ -181,7 +183,7 @@ test("source-linked credit-note drafts stay isolated from invoice accounting", a
   await closeInvoice(page);
 
   await openInvoice(page, "FICTIONAL-NO-TAX-001");
-  const noTaxSection = page.getByRole("region", { name: "Draft credit notes for source invoice" });
+  const noTaxSection = page.getByRole("region", { name: "Credit notes for source invoice" });
   await noTaxSection.getByRole("button", { name: "Create credit note" }).click();
   const noTaxDialog = page.getByRole("heading", { name: "Create draft credit note" }).locator("../..");
   await expect(noTaxDialog.getByText("No tax", { exact: true })).toBeVisible();
@@ -203,9 +205,9 @@ test("source-linked credit-note drafts stay isolated from invoice accounting", a
       remaining_creditable_quantity: string;
     }>;
   };
-  const sourceSection = page.getByRole("region", { name: "Draft credit notes for source invoice" });
+  const sourceSection = page.getByRole("region", { name: "Credit notes for source invoice" });
   await expect(sourceSection.getByRole("button", { name: "Create credit note" })).toBeEnabled();
-  await expect(sourceSection.getByText("Draft credit notes for this invoice")).toBeVisible();
+  await expect(sourceSection.getByText("Credit notes for this invoice")).toBeVisible();
   await sourceSection.getByRole("button", { name: "Create credit note" }).click();
 
   const createDialog = page.getByRole("heading", { name: "Create draft credit note" }).locator("../..");
@@ -322,7 +324,7 @@ test("source-linked credit-note drafts stay isolated from invoice accounting", a
   });
   await createDialog.getByRole("button", { name: "Close" }).click();
 
-  const sourceSectionAfterCreate = page.getByRole("region", { name: "Draft credit notes for source invoice" });
+  const sourceSectionAfterCreate = page.getByRole("region", { name: "Credit notes for source invoice" });
   const creditNoteRow = sourceSectionAfterCreate.getByRole("row").filter({ hasText: "FICTIONAL-CN-001" });
   await expect(creditNoteRow).toContainText("draft");
   await expect(creditNoteRow).toContainText("$125.00");
@@ -418,4 +420,178 @@ test("source-linked credit-note drafts stay isolated from invoice accounting", a
   expect(transactions.flat().some((transaction) =>
     transaction.invoice_allocations.some((allocation) => allocation.invoice_id === sourceInvoiceId),
   )).toBeFalsy();
+});
+
+test("AR and AP credit notes authorise to unapplied credits with immutable journals", async ({
+  page,
+  request,
+}) => {
+  await ensureCompanyById(request, COMPANY_ID, "Credit Note Draft Fictional Pty Ltd");
+  const headers = companyHeaders(COMPANY_ID);
+  const accountsResponse = await request.get(`${BACKEND_URL}/api/v1/accounts`, { headers });
+  expect(accountsResponse.ok()).toBeTruthy();
+  const accounts = (await accountsResponse.json()) as Array<{ id: number; code: string }>;
+  const scenarios = [
+    {
+      direction: "AR" as const,
+      account: accounts.find((item) => item.code === "4000"),
+      invoice: "FICTIONAL-AUTH-AR-SOURCE",
+      creditNote: "FICTIONAL-AUTH-AR-CN",
+      contact: "Fictional Authorisation Customer",
+    },
+    {
+      direction: "AP" as const,
+      account: accounts.find((item) => item.code === "6100"),
+      invoice: "FICTIONAL-AUTH-AP-SOURCE",
+      creditNote: "FICTIONAL-AUTH-AP-CN",
+      contact: "Fictional Authorisation Supplier",
+    },
+  ];
+  const sourceInvoiceIds = new Map<string, number>();
+  for (const scenario of scenarios) {
+    expect(scenario.account).toBeTruthy();
+    const invoiceId = await createInvoice(
+      request,
+      scenario.invoice,
+      scenario.account!.id,
+      [{
+        description: `Fictional ${scenario.direction} authorisation service`,
+        quantity: "1",
+        unit_price: "50.00",
+        line_subtotal: "50.00",
+        line_gst: "5.00",
+        line_total: "55.00",
+        tax_code: "standard",
+        gst_rate: "0.10",
+      }],
+      scenario.direction,
+      scenario.contact,
+    );
+    await postInvoice(request, invoiceId);
+    sourceInvoiceIds.set(scenario.invoice, invoiceId);
+  }
+
+  await page.goto("/invoices");
+  await selectCompany(page);
+
+  for (const scenario of scenarios) {
+    const invoiceId = sourceInvoiceIds.get(scenario.invoice)!;
+    const invoiceBeforeResponse = await request.get(`${BACKEND_URL}/api/v1/invoices/${invoiceId}`, { headers });
+    expect(invoiceBeforeResponse.ok()).toBeTruthy();
+    const invoiceBefore = (await invoiceBeforeResponse.json()) as {
+      status: string;
+      paid_amount: string;
+      subtotal: string;
+      gst_amount: string;
+      total: string;
+    };
+    await openInvoice(page, scenario.invoice);
+
+    const sourceSection = page.getByRole("region", { name: "Credit notes for source invoice" });
+    await sourceSection.getByRole("button", { name: "Create credit note" }).click();
+    const createDialog = page.getByRole("heading", { name: "Create draft credit note" }).locator("../..");
+    await createDialog.getByLabel("Credit-note number").fill(scenario.creditNote);
+    await createDialog.getByLabel("Issue date").fill("2026-08-15");
+    await createDialog.getByLabel(new RegExp("Credited quantity for Fictional")).fill("1");
+    await createDialog.getByRole("button", { name: "Create draft" }).click();
+    await expect(createDialog.getByText("Status draft", { exact: true })).toBeVisible();
+    await createDialog.getByRole("button", { name: "Close" }).click();
+    const createdNotesResponse = await request.get(`${BACKEND_URL}/api/v1/credit-notes`, {
+      headers,
+      params: { source_invoice_id: invoiceId, status: "draft" },
+    });
+    expect(createdNotesResponse.ok()).toBeTruthy();
+    const createdNotes = (await createdNotesResponse.json()) as Array<{ id: number }>;
+    expect(createdNotes).toHaveLength(1);
+
+    const draftRow = sourceSection.getByRole("row").filter({ hasText: scenario.creditNote });
+    await expect(draftRow).toContainText("draft");
+    await expect(draftRow.getByRole("button", { name: "View/Edit" })).toBeVisible();
+    await expect(draftRow.getByRole("button", { name: "Delete draft" })).toBeVisible();
+    await draftRow.getByRole("button", { name: "View/Edit" }).click();
+
+    const editDialog = page.getByRole("heading", { name: "Edit draft credit note" }).locator("../..");
+    await editDialog.getByRole("button", { name: "Authorise" }).click();
+    const confirmation = page.getByRole("heading", { name: "Authorise this credit note?" }).locator("../..");
+    await expect(confirmation).toContainText("posts this credit note to the ledger");
+    await expect(confirmation).toContainText("makes it immutable");
+    await expect(confirmation).toContainText("leaves it unapplied to invoices");
+    await confirmation.getByRole("button", { name: "Cancel" }).click();
+    await expect(editDialog.getByRole("button", { name: "Authorise" })).toBeVisible();
+
+    await editDialog.getByRole("button", { name: "Authorise" }).click();
+    const confirmationAgain = page.getByRole("heading", { name: "Authorise this credit note?" }).locator("../..");
+    const postPromise = page.waitForResponse((response) =>
+      response.url().includes(`/api/v1/credit-notes/${createdNotes[0].id}/post`) &&
+      response.url().endsWith("/post") &&
+      response.request().method() === "POST",
+    );
+    await confirmationAgain.getByRole("button", { name: "Authorise credit note" }).click();
+    const postResponse = await postPromise;
+    expect(postResponse.ok(), await postResponse.text()).toBeTruthy();
+    expect(((await postResponse.json()) as { status: string }).status).toBe("authorised");
+    const journalResponse = await request.get(`${BACKEND_URL}/api/v1/journal`, {
+      headers,
+      params: { source_type: scenario.direction === "AR" ? "credit_note_ar" : "credit_note_ap" },
+    });
+    expect(journalResponse.ok()).toBeTruthy();
+    const journalEntries = (await journalResponse.json()) as Array<{
+      source_id: number | null;
+      memo: string;
+      lines: unknown[];
+    }>;
+    expect(journalEntries.find((entry) => entry.source_id === createdNotes[0].id)).toMatchObject({
+      memo: `Credit note ${scenario.creditNote}`,
+      lines: expect.any(Array),
+    });
+
+    const authorisedDialog = page.getByRole("heading", { name: "View authorised credit note" }).locator("../..");
+    await expect(authorisedDialog.getByText("Status authorised", { exact: true })).toBeVisible();
+    await expect(authorisedDialog.getByText("Unapplied credit", { exact: true })).toBeVisible();
+    await expect(authorisedDialog.getByText("remains unapplied to invoices")).toBeVisible();
+    await expect(authorisedDialog.getByText(/Journal entry #\d+/)).toBeVisible();
+    await expect(authorisedDialog.getByRole("columnheader", { name: "Debit" })).toBeVisible();
+    await expect(authorisedDialog.getByRole("columnheader", { name: "Credit", exact: true })).toBeVisible();
+    await expect(authorisedDialog.getByLabel("Credit-note number")).toHaveCount(0);
+    await expect(authorisedDialog.getByLabel("Issue date")).toHaveCount(0);
+    await expect(authorisedDialog.getByLabel(/Credited quantity/)).toHaveCount(0);
+    for (const forbidden of [/authorise/i, /apply/i, /refund/i, /payment/i, /void/i, /delete/i]) {
+      await expect(authorisedDialog.getByRole("button", { name: forbidden })).toHaveCount(0);
+    }
+
+    await authorisedDialog.getByRole("button", { name: "Close" }).click();
+    const authorisedRow = sourceSection.getByRole("row").filter({ hasText: scenario.creditNote });
+    await expect(authorisedRow).toContainText("authorised · unapplied");
+    await expect(authorisedRow.getByRole("button", { name: "View" })).toBeVisible();
+    await expect(authorisedRow.getByRole("button", { name: "View/Edit" })).toHaveCount(0);
+    await expect(authorisedRow.getByRole("button", { name: "Delete draft" })).toHaveCount(0);
+    await authorisedRow.getByRole("button", { name: "View" }).click();
+    await expect(authorisedDialog.getByText("Status authorised", { exact: true })).toBeVisible();
+    await expect(authorisedDialog.getByText("Unapplied credit", { exact: true })).toBeVisible();
+    await expect(authorisedDialog.getByRole("button", { name: /authorise|apply|refund|payment|void|delete/i })).toHaveCount(0);
+    await authorisedDialog.getByRole("button", { name: "Close" }).click();
+    await closeInvoice(page);
+
+    const sourceAfter = await request.get(
+      `${BACKEND_URL}/api/v1/credit-notes/source-invoices/${invoiceId}`,
+      { headers },
+    );
+    expect(sourceAfter.ok()).toBeTruthy();
+    const sourceSnapshot = (await sourceAfter.json()) as {
+      lines: Array<{ quantity_reserved: string; remaining_creditable_quantity: string }>;
+    };
+    expect(sourceSnapshot.lines[0]).toMatchObject({
+      quantity_reserved: "1.0000",
+      remaining_creditable_quantity: "0.0000",
+    });
+    const invoiceAfter = await request.get(`${BACKEND_URL}/api/v1/invoices/${invoiceId}`, { headers });
+    expect(invoiceAfter.ok()).toBeTruthy();
+    expect(await invoiceAfter.json()).toMatchObject({
+      status: invoiceBefore.status,
+      paid_amount: invoiceBefore.paid_amount,
+      subtotal: invoiceBefore.subtotal,
+      gst_amount: invoiceBefore.gst_amount,
+      total: invoiceBefore.total,
+    });
+  }
 });

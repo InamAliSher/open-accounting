@@ -26,7 +26,7 @@ export default function SourceCreditNoteDrafts({ invoiceId }: { invoiceId: numbe
     queryKey: ["credit-notes", "source-list", currentId, invoiceId],
     queryFn: async () =>
       (await api.get<CreditNote[]>("/credit-notes", {
-        params: { source_invoice_id: invoiceId, status: "draft" },
+        params: { source_invoice_id: invoiceId },
       })).data,
     enabled: !!currentId && !!snapshotQuery.data && !snapshotQuery.isError,
     retry: false,
@@ -64,9 +64,9 @@ export default function SourceCreditNoteDrafts({ invoiceId }: { invoiceId: numbe
   const createDisabled = !snapshotReady || snapshotQuery.isFetching || allRemainingReserved;
 
   return (
-    <section className="border border-slate-200 rounded p-3" aria-label="Draft credit notes for source invoice">
+    <section className="border border-slate-200 rounded p-3" aria-label="Credit notes for source invoice">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-        <h3 className="text-sm font-medium text-slate-900">Draft credit notes for this invoice</h3>
+        <h3 className="text-sm font-medium text-slate-900">Credit notes for this invoice</h3>
         {snapshotQuery.isFetching ? (
           <button type="button" className="btn-secondary text-xs" disabled>
             Checking eligibility…
@@ -127,7 +127,9 @@ export default function SourceCreditNoteDrafts({ invoiceId }: { invoiceId: numbe
                 <tr key={draft.id} className="border-b last:border-b-0">
                   <td className="py-2 pr-2 font-medium">{draft.credit_note_number}</td>
                   <td className="py-2 pr-2">{formatDate(draft.issue_date)}</td>
-                  <td className="py-2 pr-2">{draft.status}</td>
+                  <td className="py-2 pr-2">
+                    {draft.status === "authorised" ? "authorised · unapplied" : draft.status}
+                  </td>
                   <td className="py-2 pr-2 text-right">{formatMoney(draft.subtotal, draft.currency)}</td>
                   <td className="py-2 pr-2 text-right">{formatMoney(draft.gst_amount, draft.currency)}</td>
                   <td className="py-2 pr-2 text-right font-medium">{formatMoney(draft.total, draft.currency)}</td>
@@ -137,15 +139,17 @@ export default function SourceCreditNoteDrafts({ invoiceId }: { invoiceId: numbe
                       className="text-sky-700 hover:underline mr-3"
                       onClick={() => setEditingId(draft.id)}
                     >
-                      View/Edit
+                      {draft.status === "draft" ? "View/Edit" : "View"}
                     </button>
-                    <button
-                      type="button"
-                      className="text-rose-700 hover:underline"
-                      onClick={() => setDeleteTarget(draft)}
-                    >
-                      Delete draft
-                    </button>
+                    {draft.status === "draft" && (
+                      <button
+                        type="button"
+                        className="text-rose-700 hover:underline"
+                        onClick={() => setDeleteTarget(draft)}
+                      >
+                        Delete draft
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}

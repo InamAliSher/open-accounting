@@ -11,7 +11,9 @@ import type {
   CreditNoteLineDraftIn,
   CreditNoteSource,
   CreditNoteUpdate,
+  JournalEntry,
 } from "../../types/api";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 
 const QUANTITY_SCALE = 10000n;
 
@@ -83,6 +85,7 @@ export default function CreditNoteDraftDialog({
   const [notes, setNotes] = useState("");
   const [quantities, setQuantities] = useState<Record<number, string>>({});
   const [savedDraft, setSavedDraft] = useState<CreditNote | null>(null);
+  const [confirmAuthorise, setConfirmAuthorise] = useState(false);
   const editing = creditNoteId !== undefined;
 
   const snapshotQuery = useQuery({
@@ -98,6 +101,26 @@ export default function CreditNoteDraftDialog({
     queryFn: async () =>
       (await api.get<CreditNote>(`/credit-notes/${creditNoteId}`)).data,
     enabled: !!currentId && editing,
+    retry: false,
+  });
+  const draft = detailQuery.data;
+  const displayedCreditNote = savedDraft ?? draft;
+  const journalSourceType = displayedCreditNote?.direction === "AR"
+    ? "credit_note_ar"
+    : "credit_note_ap";
+  const journalQuery = useQuery({
+    queryKey: ["journal", "credit-note", currentId, displayedCreditNote?.id],
+    queryFn: async () => {
+      const response = await api.get<JournalEntry[]>("/journal", {
+        params: {
+          source_type: journalSourceType,
+          q: displayedCreditNote!.credit_note_number,
+          limit: 500,
+        },
+      });
+      return response.data.find((entry) => entry.source_id === displayedCreditNote?.id) ?? null;
+    },
+    enabled: !!currentId && displayedCreditNote?.status === "authorised",
     retry: false,
   });
 
@@ -141,8 +164,31 @@ export default function CreditNoteDraftDialog({
     },
   });
 
+  const authoriseMutation = useMutation({
+    mutationFn: async () =>
+      (await api.post<CreditNote>(`/credit-notes/${displayedCreditNote!.id}/post`)).data,
+    onSuccess: (authorised) => {
+      setSavedDraft(authorised);
+      setConfirmAuthorise(false);
+      void queryClient.invalidateQueries({
+        queryKey: ["credit-notes", "source-list", currentId, sourceInvoiceId],
+        exact: true,
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["credit-notes", "source-snapshot", currentId, sourceInvoiceId],
+        exact: true,
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["credit-notes", "detail", currentId, authorised.id],
+        exact: true,
+      });
+      void queryClient.invalidateQueries({ queryKey: ["journal"] });
+    },
+  });
+
   const snapshot = snapshotQuery.data;
-  const draft = detailQuery.data;
+  const readOnly = !!displayedCreditNote && displayedCreditNote.status !== "draft";
+  const isDraftNote = displayedCreditNote?.status === "draft";
   const lineErrors: Record<number, string> = {};
   const payloadLines: CreditNoteLineDraftIn[] = [];
   let positiveLineCount = 0;
@@ -184,6 +230,7 @@ export default function CreditNoteDraftDialog({
     !!snapshot &&
     !snapshotQuery.isError &&
     !snapshotQuery.isFetching &&
+    !readOnly &&
     (!editing || !!draft) &&
     !detailQuery.isError &&
     (editing || savedDraft === null) &&
@@ -224,7 +271,11 @@ export default function CreditNoteDraftDialog({
       <div className="bg-surface rounded-lg shadow-xl border border-slate-200 w-[900px] max-w-full max-h-[94vh] flex flex-col">
         <div className="px-5 py-3 border-b border-slate-200 flex items-center justify-between">
           <h2 className="text-lg font-semibold">
-            {editing ? "Edit draft credit note" : "Create draft credit note"}
+            {readOnly
+              ? "View authorised credit note"
+              : editing
+                ? "Edit draft credit note"
+                : "Create draft credit note"}
           </h2>
           <button type="button" className="text-slate-500 hover:text-slate-900" onClick={onClose}>
             ×
@@ -244,6 +295,16 @@ export default function CreditNoteDraftDialog({
         {saveMutation.isError && (
           <p className="mx-5 mt-3 text-sm text-rose-700" role="alert">
             {apiErrorMessage(saveMutation.error)}
+          </p>
+        )}
+        {authoriseMutation.isError && (
+          <p className="mx-5 mt-3 text-sm text-rose-700" role="alert">
+            {apiErrorMessage(authoriseMutation.error)}
+          </p>
+        )}
+        {journalQuery.isError && (
+          <p className="mx-5 mt-3 text-sm text-rose-700" role="alert">
+            {apiErrorMessage(journalQuery.error)}
           </p>
         )}
 
@@ -267,38 +328,52 @@ export default function CreditNoteDraftDialog({
             </section>
 
             <section aria-label="Credit-note identity">
-              <h3 className="font-medium mb-2">Draft identity</h3>
+              <h3 className="font-medium mb-2">{readOnly ? "Credit-note identity" : "Draft identity"}</h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <label className="block">
-                  <span className="block text-xs text-slate-600 mb-1">Credit-note number</span>
-                  <input
-                    className="input w-full"
-                    aria-label="Credit-note number"
-                    maxLength={80}
-                    value={creditNoteNumber}
-                    onChange={(event) => setCreditNoteNumber(event.target.value)}
-                  />
-                </label>
-                <label className="block">
-                  <span className="block text-xs text-slate-600 mb-1">Issue date</span>
-                  <input
-                    className="input w-full"
-                    type="date"
-                    aria-label="Issue date"
-                    value={issueDate}
-                    onChange={(event) => setIssueDate(event.target.value)}
-                  />
-                </label>
-                <label className="block md:col-span-2">
-                  <span className="block text-xs text-slate-600 mb-1">Notes</span>
-                  <textarea
-                    className="input w-full min-h-20"
-                    aria-label="Notes"
-                    maxLength={1000}
-                    value={notes}
-                    onChange={(event) => setNotes(event.target.value)}
-                  />
-                </label>
+                {readOnly ? (
+                  <>
+                    <LockedValue label="Credit-note number" value={displayedCreditNote!.credit_note_number} />
+                    <LockedValue label="Issue date" value={formatDate(displayedCreditNote!.issue_date)} />
+                    {displayedCreditNote!.notes && (
+                      <div className="md:col-span-2">
+                        <LockedValue label="Notes" value={displayedCreditNote!.notes} />
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <label className="block">
+                      <span className="block text-xs text-slate-600 mb-1">Credit-note number</span>
+                      <input
+                        className="input w-full"
+                        aria-label="Credit-note number"
+                        maxLength={80}
+                        value={creditNoteNumber}
+                        onChange={(event) => setCreditNoteNumber(event.target.value)}
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="block text-xs text-slate-600 mb-1">Issue date</span>
+                      <input
+                        className="input w-full"
+                        type="date"
+                        aria-label="Issue date"
+                        value={issueDate}
+                        onChange={(event) => setIssueDate(event.target.value)}
+                      />
+                    </label>
+                    <label className="block md:col-span-2">
+                      <span className="block text-xs text-slate-600 mb-1">Notes</span>
+                      <textarea
+                        className="input w-full min-h-20"
+                        aria-label="Notes"
+                        maxLength={1000}
+                        value={notes}
+                        onChange={(event) => setNotes(event.target.value)}
+                      />
+                    </label>
+                  </>
+                )}
               </div>
             </section>
 
@@ -316,9 +391,14 @@ export default function CreditNoteDraftDialog({
                   </thead>
                   <tbody>
                     {snapshot.lines.map((line) => {
-                      const maximum = editableMaximum(line.source_invoice_line_id, snapshot, draft);
+                      const maximum = readOnly
+                        ? null
+                        : editableMaximum(line.source_invoice_line_id, snapshot, draft);
                       const remaining = parseQuantity(line.remaining_creditable_quantity, true);
                       const inputDisabled = maximum === null || maximum === 0n;
+                      const creditLine = displayedCreditNote?.lines.find(
+                        (item) => item.source_invoice_line_id === line.source_invoice_line_id,
+                      );
                       return (
                         <tr key={line.source_invoice_line_id} className="border-b last:border-b-0 align-top">
                           <td className="p-2 space-y-0.5">
@@ -334,21 +414,25 @@ export default function CreditNoteDraftDialog({
                           <td className="p-2 text-right">{line.quantity_reserved}</td>
                           <td className="p-2 text-right">{line.remaining_creditable_quantity}</td>
                           <td className="p-2">
-                            <label className="block">
-                              <span className="sr-only">Credited quantity for {line.description}</span>
-                              <input
-                                className="input w-28"
-                                type="text"
-                                inputMode="decimal"
-                                aria-label={`Credited quantity for ${line.description}`}
-                                value={quantities[line.source_invoice_line_id] ?? ""}
-                                disabled={inputDisabled}
-                                onChange={(event) => setQuantities((previous) => ({
-                                  ...previous,
-                                  [line.source_invoice_line_id]: event.target.value,
-                                }))}
-                              />
-                            </label>
+                            {readOnly ? (
+                              <span>{creditLine?.quantity ?? "Not credited"}</span>
+                            ) : (
+                              <label className="block">
+                                <span className="sr-only">Credited quantity for {line.description}</span>
+                                <input
+                                  className="input w-28"
+                                  type="text"
+                                  inputMode="decimal"
+                                  aria-label={`Credited quantity for ${line.description}`}
+                                  value={quantities[line.source_invoice_line_id] ?? ""}
+                                  disabled={inputDisabled}
+                                  onChange={(event) => setQuantities((previous) => ({
+                                    ...previous,
+                                    [line.source_invoice_line_id]: event.target.value,
+                                  }))}
+                                />
+                              </label>
+                            )}
                             {editing && maximum !== null && (
                               <div className="mt-1 text-slate-500">
                                 Maximum for this draft: {formatQuantity(maximum)}
@@ -376,20 +460,65 @@ export default function CreditNoteDraftDialog({
               )}
             </section>
 
-            {savedDraft && (
+            {displayedCreditNote && (
               <section className="border-t border-slate-200 pt-3" aria-live="polite">
-                <h3 className="font-medium">Saved draft totals</h3>
+                <h3 className="font-medium">
+                  {displayedCreditNote.status === "draft" ? "Saved draft totals" : "Credit note totals"}
+                </h3>
                 <div className="flex flex-wrap gap-x-5 gap-y-1 mt-1">
-                  <span>Subtotal {formatMoney(savedDraft.subtotal, savedDraft.currency)}</span>
-                  <span>GST {formatMoney(savedDraft.gst_amount, savedDraft.currency)}</span>
-                  <span className="font-medium">Total {formatMoney(savedDraft.total, savedDraft.currency)}</span>
-                  <span>Status {savedDraft.status}</span>
+                  <span>Subtotal {formatMoney(displayedCreditNote.subtotal, displayedCreditNote.currency)}</span>
+                  <span>GST {formatMoney(displayedCreditNote.gst_amount, displayedCreditNote.currency)}</span>
+                  <span className="font-medium">Total {formatMoney(displayedCreditNote.total, displayedCreditNote.currency)}</span>
+                  <span>Status {displayedCreditNote.status}</span>
                 </div>
               </section>
             )}
-            <p className="text-xs text-slate-500">
-              A draft reserves source quantity only. It does not change the source invoice, journal, invoice balance, payment allocation, or GST report.
-            </p>
+            {isDraftNote && (
+              <p className="text-xs text-slate-500">
+                A draft reserves source quantity only. It does not change the source invoice, journal, invoice balance, payment allocation, or GST report.
+              </p>
+            )}
+            {displayedCreditNote?.status === "authorised" && (
+              <section className="border-t border-slate-200 pt-3 space-y-2" aria-label="Credit note journal entry">
+                <div>
+                  <h3 className="font-medium">Unapplied credit</h3>
+                  <p className="text-xs text-slate-600">
+                    This authorised credit note is posted to the ledger and remains unapplied to invoices. It has not been refunded or paid.
+                  </p>
+                </div>
+                {journalQuery.isLoading ? (
+                  <p className="text-xs text-slate-500">Loading journal entry…</p>
+                ) : journalQuery.data ? (
+                  <div>
+                    <div className="text-xs text-slate-600">
+                      Journal entry #{journalQuery.data.id} · {formatDate(journalQuery.data.entry_date)} · {journalQuery.data.memo}
+                    </div>
+                    <table className="w-full text-xs mt-2">
+                      <thead className="text-left text-slate-500 border-b">
+                        <tr>
+                          <th className="py-1 pr-2">Account ID</th>
+                          <th className="py-1 pr-2">Description</th>
+                          <th className="py-1 pr-2 text-right">Debit</th>
+                          <th className="py-1 text-right">Credit</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {journalQuery.data.lines.map((line) => (
+                          <tr key={line.id} className="border-b last:border-b-0">
+                            <td className="py-1 pr-2">{line.account_id}</td>
+                            <td className="py-1 pr-2">{line.description ?? ""}</td>
+                            <td className="py-1 pr-2 text-right">{formatMoney(line.debit_amount, displayedCreditNote.currency)}</td>
+                            <td className="py-1 text-right">{formatMoney(line.credit_amount, displayedCreditNote.currency)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="text-xs text-rose-700" role="status">No journal entry was found for this authorised credit note.</p>
+                )}
+              </section>
+            )}
           </div>
         )}
 
@@ -400,22 +529,45 @@ export default function CreditNoteDraftDialog({
           <button type="button" className="btn-secondary" onClick={onClose} disabled={saveMutation.isPending}>
             Close
           </button>
-          <button
-            type="button"
-            className="btn-primary"
-            disabled={!canSave}
-            onClick={submit}
-          >
-            {saveMutation.isPending
-              ? "Saving draft…"
-              : !editing && savedDraft
-                ? "Draft saved"
-                : editing
-                ? "Update draft"
-                : "Create draft"}
-          </button>
+          {isDraftNote && (
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={authoriseMutation.isPending}
+              onClick={() => setConfirmAuthorise(true)}
+            >
+              {authoriseMutation.isPending ? "Authorising…" : "Authorise"}
+            </button>
+          )}
+          {!readOnly && (
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={!canSave}
+              onClick={submit}
+            >
+              {saveMutation.isPending
+                ? "Saving draft…"
+                : !editing && savedDraft
+                  ? "Draft saved"
+                  : editing
+                    ? "Update draft"
+                    : "Create draft"}
+            </button>
+          )}
         </div>
       </div>
+      <ConfirmDialog
+        open={confirmAuthorise}
+        title="Authorise this credit note?"
+        message="Authorising posts this credit note to the ledger, makes it immutable, and leaves it unapplied to invoices."
+        confirmLabel="Authorise credit note"
+        busy={authoriseMutation.isPending}
+        onCancel={() => setConfirmAuthorise(false)}
+        onConfirm={() => {
+          if (isDraftNote) authoriseMutation.mutate();
+        }}
+      />
     </div>
   );
 }
