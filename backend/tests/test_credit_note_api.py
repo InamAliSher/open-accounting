@@ -224,6 +224,52 @@ def test_source_snapshot_lifecycle_and_ar_ap_sources(client, accounts):
 
 
 @pytest.mark.parametrize(
+    ("direction", "account_code", "contact_kind"),
+    [("AR", "4000", "customer"), ("AP", "6100", "supplier")],
+)
+def test_source_identity_uses_invoice_snapshot_for_draft_credit_notes(
+    client, accounts, direction, account_code, contact_kind
+):
+    source = _create_source(
+        client,
+        accounts,
+        number=f"FICTIONAL-SNAPSHOT-IDENTITY-{direction}",
+        direction=direction,
+        contact_name=f"Original {direction} Contact",
+        lines=[_source_line(accounts, account_code=account_code)],
+    )
+    contact_id = source["contact_id"]
+    renamed = client.patch(
+        f"/api/v1/contacts/{contact_id}",
+        headers=HEAD,
+        json={"name": f"Renamed {direction} Contact"},
+    )
+    assert renamed.status_code == 200, renamed.text
+
+    source_snapshot = client.get(
+        f"/api/v1/credit-notes/source-invoices/{source['id']}",
+        headers=HEAD,
+    )
+    assert source_snapshot.status_code == 200, source_snapshot.text
+    source_body = source_snapshot.json()
+    assert source_body["contact_id"] == contact_id
+    assert source_body["contact_name"] == f"Original {direction} Contact"
+
+    created = _create_credit_note(client, source)
+    assert created.status_code == 201, created.text
+    note = created.json()
+    assert note["direction"] == direction
+    assert note["contact_id"] == contact_id
+    assert note["contact_name"] == f"Original {direction} Contact"
+    assert note["status"] == "draft"
+
+    read = client.get(f"/api/v1/credit-notes/{note['id']}", headers=HEAD)
+    assert read.status_code == 200, read.text
+    assert read.json()["contact_name"] == f"Original {direction} Contact"
+    assert read.json()["contact_id"] == contact_id
+
+
+@pytest.mark.parametrize(
     ("mode", "tax_code", "direction", "account_code", "unit_price", "expected"),
     [
         ("exclusive", "standard", "AR", "4000", "100.00", ("100.00", "10.00", "110.00")),

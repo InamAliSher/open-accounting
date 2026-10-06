@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...deps import PathId, get_company_db, get_current_company
+from ...models.company import Invoice
 from ...models.master import Company
 from ...schemas._limits import SQLITE_INT_MAX
 from ...schemas.credit_note import (
@@ -34,6 +35,13 @@ def _raise_integrity_conflict(db: Session, exc: IntegrityError) -> None:
     ) from exc
 
 
+def _with_source_contact_snapshot(db: Session, output: dict) -> dict:
+    invoice = db.get(Invoice, output["source_invoice_id"])
+    if invoice is not None and invoice.contact_name_snapshot is not None:
+        output["contact_name"] = invoice.contact_name_snapshot
+    return output
+
+
 @router.get("", response_model=list[CreditNoteOut])
 def list_credit_notes(
     direction: Literal["AR", "AP"] | None = None,
@@ -43,7 +51,10 @@ def list_credit_notes(
     db: Session = Depends(get_company_db),
 ):
     return [
-        credit_note_service.credit_note_output(note)
+        _with_source_contact_snapshot(
+            db,
+            credit_note_service.credit_note_output(note),
+        )
         for note in credit_note_service.list_credit_notes(
             db,
             direction=direction,
@@ -60,7 +71,8 @@ def get_source_invoice(
     db: Session = Depends(get_company_db),
 ):
     try:
-        return credit_note_service.source_snapshot(db, invoice_id)
+        output = credit_note_service.source_snapshot(db, invoice_id)
+        return _with_source_contact_snapshot(db, output)
     except credit_note_service.CreditNoteError as exc:
         _raise_domain_error(exc)
 
@@ -72,9 +84,10 @@ def get_credit_note(
     db: Session = Depends(get_company_db),
 ):
     try:
-        return credit_note_service.credit_note_output(
+        output = credit_note_service.credit_note_output(
             credit_note_service.get_credit_note(db, credit_note_id)
         )
+        return _with_source_contact_snapshot(db, output)
     except credit_note_service.CreditNoteError as exc:
         _raise_domain_error(exc)
 
@@ -90,7 +103,7 @@ def create_credit_note(
         note = credit_note_service.create_credit_note(db, payload)
         output = credit_note_service.credit_note_output(note)
         db.commit()
-        return output
+        return _with_source_contact_snapshot(db, output)
     except credit_note_service.CreditNoteError as exc:
         db.rollback()
         _raise_domain_error(exc)
@@ -110,7 +123,7 @@ def update_credit_note(
         note = credit_note_service.update_credit_note(db, credit_note_id, payload)
         output = credit_note_service.credit_note_output(note)
         db.commit()
-        return output
+        return _with_source_contact_snapshot(db, output)
     except credit_note_service.CreditNoteError as exc:
         db.rollback()
         _raise_domain_error(exc)

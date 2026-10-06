@@ -321,6 +321,37 @@ def test_unrelated_draft_edit_preserves_contact_snapshots(client, accounts):
     assert _invoice_snapshots(invoice_id) == expected
 
 
+def test_posting_uses_contact_name_snapshot_for_journal_memo(client, accounts):
+    contact = _create_contact(
+        client,
+        name="Original Posting Contact",
+        kind="customer",
+    )
+    created = client.post(
+        "/api/v1/invoices",
+        headers=HEAD,
+        json=_linked_invoice_payload(
+            accounts,
+            contact_id=contact["id"],
+            number="POSTING-SNAPSHOT-MEMO",
+        ),
+    )
+    assert created.status_code == 201, created.text
+    invoice_id = created.json()["id"]
+
+    renamed = client.patch(
+        f"/api/v1/contacts/{contact['id']}",
+        headers=HEAD,
+        json={"name": "Renamed Posting Contact"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    posted = client.post(f"/api/v1/invoices/{invoice_id}/post", headers=HEAD)
+    assert posted.status_code == 200, posted.text
+
+    journal_entry = posted.json()["journal_entry"]
+    assert journal_entry["memo"] == "Invoice POSTING-SNAPSHOT-MEMO — Original Posting Contact"
+
+
 def test_snapshot_field_injection_cannot_override_post_or_patch(client, accounts):
     original = _create_contact(
         client,
