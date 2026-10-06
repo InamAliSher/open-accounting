@@ -305,6 +305,15 @@ def test_unrelated_draft_edit_preserves_contact_snapshots(client, accounts):
     assert live_edit.status_code == 200, live_edit.text
     assert _invoice_snapshots(invoice_id) == expected
 
+    detail = client.get(f"/api/v1/invoices/{invoice_id}", headers=HEAD)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["contact_name"] == "Stable Snapshot Customer"
+
+    listed = client.get("/api/v1/invoices", headers=HEAD)
+    assert listed.status_code == 200, listed.text
+    listed_invoice = next(invoice for invoice in listed.json() if invoice["id"] == invoice_id)
+    assert listed_invoice["contact_name"] == "Stable Snapshot Customer"
+
     unrelated_edit = client.patch(
         f"/api/v1/invoices/{invoice_id}", headers=HEAD, json={"notes": "Updated note"}
     )

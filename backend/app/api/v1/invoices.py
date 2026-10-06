@@ -237,7 +237,7 @@ def _serialize(inv: Invoice) -> dict:
         "id": inv.id,
         "direction": inv.direction,
         "contact_id": inv.contact_id,
-        "contact_name": inv.contact.name if inv.contact else None,
+        "contact_name": inv.contact_name_snapshot,
         "invoice_number": inv.invoice_number,
         "issue_date": inv.issue_date,
         "due_date": inv.due_date,
