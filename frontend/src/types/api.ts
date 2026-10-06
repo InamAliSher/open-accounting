@@ -156,6 +156,8 @@ export interface Invoice {
   gst_inclusive: boolean;
   status: InvoiceStatus;
   paid_amount: string;
+  credit_applied_amount: string;
+  outstanding_amount: string;
   paid_date: string | null;
   notes: string | null;
   source: InvoiceSource;
@@ -231,6 +233,18 @@ export interface CreditNoteLine {
   tax_code: TaxCode;
 }
 
+export interface CreditNoteApplication {
+  id: number;
+  invoice_id: number;
+  amount: string;
+  application_date: string;
+  status: "active" | "reversed";
+  created_at: string;
+  updated_at: string;
+  reversed_at: string | null;
+  reversal_date: string | null;
+}
+
 export interface CreditNote {
   id: number;
   source_invoice_id: number;
@@ -249,6 +263,9 @@ export interface CreditNote {
   notes: string | null;
   created_at: string;
   updated_at: string;
+  applied_amount: string;
+  remaining_amount: string;
+  applications: CreditNoteApplication[];
   lines: CreditNoteLine[];
 }
 

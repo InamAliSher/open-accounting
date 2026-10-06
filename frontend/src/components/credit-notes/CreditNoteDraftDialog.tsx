@@ -14,6 +14,7 @@ import type {
   JournalEntry,
 } from "../../types/api";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
+import CreditNoteApplications from "./CreditNoteApplications";
 
 const QUANTITY_SCALE = 10000n;
 
@@ -481,9 +482,11 @@ export default function CreditNoteDraftDialog({
             {displayedCreditNote?.status === "authorised" && (
               <section className="border-t border-slate-200 pt-3 space-y-2" aria-label="Credit note journal entry">
                 <div>
-                  <h3 className="font-medium">Unapplied credit</h3>
+                  <h3 className="font-medium">Credit balances</h3>
                   <p className="text-xs text-slate-600">
-                    This authorised credit note is posted to the ledger and remains unapplied to invoices. It has not been refunded or paid.
+                    Applied credit {formatMoney(displayedCreditNote.applied_amount, displayedCreditNote.currency)} ·
+                    Remaining credit {formatMoney(displayedCreditNote.remaining_amount, displayedCreditNote.currency)}.
+                    The credit has not been refunded or paid.
                   </p>
                 </div>
                 {journalQuery.isLoading ? (
@@ -518,6 +521,9 @@ export default function CreditNoteDraftDialog({
                   <p className="text-xs text-rose-700" role="status">No journal entry was found for this authorised credit note.</p>
                 )}
               </section>
+            )}
+            {displayedCreditNote?.status === "authorised" && displayedCreditNote && (
+              <CreditNoteApplications creditNote={displayedCreditNote} />
             )}
           </div>
         )}
@@ -560,7 +566,7 @@ export default function CreditNoteDraftDialog({
       <ConfirmDialog
         open={confirmAuthorise}
         title="Authorise this credit note?"
-        message="Authorising posts this credit note to the ledger, makes it immutable, and leaves it unapplied to invoices."
+        message="Authorising posts this credit note to the ledger, makes it immutable, and leaves the credit available for approved invoice applications."
         confirmLabel="Authorise credit note"
         busy={authoriseMutation.isPending}
         onCancel={() => setConfirmAuthorise(false)}

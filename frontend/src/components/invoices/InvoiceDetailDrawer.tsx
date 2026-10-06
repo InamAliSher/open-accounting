@@ -91,7 +91,9 @@ export default function InvoiceDetailDrawer({ invoice, onClose }: Props) {
                 {formatMoney(invoice.total, invoice.currency)}
               </span>
             </Row>
-            <Row label="Paid">{formatMoney(invoice.paid_amount, invoice.currency)}</Row>
+            <Row label="Cash paid">{formatMoney(invoice.paid_amount, invoice.currency)}</Row>
+            <Row label="Credit applied">{formatMoney(invoice.credit_applied_amount, invoice.currency)}</Row>
+            <Row label="Outstanding">{formatMoney(invoice.outstanding_amount, invoice.currency)}</Row>
           </DetailGrid>
 
           {invoice.notes && (

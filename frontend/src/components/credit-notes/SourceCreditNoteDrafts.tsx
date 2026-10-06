@@ -128,7 +128,9 @@ export default function SourceCreditNoteDrafts({ invoiceId }: { invoiceId: numbe
                   <td className="py-2 pr-2 font-medium">{draft.credit_note_number}</td>
                   <td className="py-2 pr-2">{formatDate(draft.issue_date)}</td>
                   <td className="py-2 pr-2">
-                    {draft.status === "authorised" ? "authorised · unapplied" : draft.status}
+                    {draft.status === "authorised"
+                      ? `authorised · ${Number(draft.applied_amount) > 0 ? "partially applied" : "unapplied"}`
+                      : draft.status}
                   </td>
                   <td className="py-2 pr-2 text-right">{formatMoney(draft.subtotal, draft.currency)}</td>
                   <td className="py-2 pr-2 text-right">{formatMoney(draft.gst_amount, draft.currency)}</td>
