@@ -373,10 +373,10 @@ test("contact-first AP entry posts correctly and keeps draft credit notes isolat
     response.request().method() === "GET",
   );
   await openInvoice(page, invoiceNumber);
-  const sourceSection = page.getByRole("region", { name: "Draft credit notes for source invoice" });
+  const sourceSection = page.getByRole("region", { name: "Credit notes for source invoice" });
   const createCreditNote = sourceSection.getByRole("button", { name: "Create credit note" });
   await expect(createCreditNote).toBeEnabled();
-  await expect(sourceSection.getByText("Draft credit notes for this invoice")).toBeVisible();
+  await expect(sourceSection.getByText("Credit notes for this invoice")).toBeVisible();
   await createCreditNote.click();
   const sourceSnapshot = (await (await sourceSnapshotResponse).json()) as {
     direction: string;
