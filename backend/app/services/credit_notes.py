@@ -21,8 +21,12 @@ from ..models.company import (
     JournalEntrySource,
     JournalLine,
 )
+from ..schemas.journal import JournalLineCreate
 from ..schemas._limits import SQLITE_EXACT_MONEY_MAX
 from ..schemas.credit_note import CreditNoteCreate, CreditNoteLineDraftIn, CreditNoteUpdate
+from . import invoice_posting
+from .invoice_math import GstMathError, check_gst_math, check_invoice_lines
+from .journal import _validate_lines
 
 
 CENT = Decimal("0.01")
@@ -136,6 +140,11 @@ def _verify_posting(session: Session, invoice: Invoice) -> None:
     )
     if not lines or debits <= 0 or debits != credits or control_amount != Decimal(invoice.total):
         raise InvalidSource("Source invoice journal posting is incomplete or unbalanced.")
+    try:
+        check_gst_math(invoice.subtotal, invoice.gst_amount, invoice.total)
+        check_invoice_lines(invoice.subtotal, invoice.gst_amount, invoice.total, invoice.lines)
+    except GstMathError as exc:
+        raise InvalidSource(f"Source invoice totals are invalid: {exc}") from exc
 
 
 def _validate_source_line(
@@ -175,6 +184,15 @@ def _validate_source_line(
         raise CreditNoteValidationError(
             f"Source invoice line {source_line.id} has an invalid account type."
         ) from exc
+    allowed_types = (
+        {AccountType.INCOME}
+        if _value(invoice.direction) == "AR"
+        else {AccountType.ASSET, AccountType.EXPENSE, AccountType.COST_OF_SALES}
+    )
+    if not account.active or account_type not in allowed_types:
+        raise CreditNoteValidationError(
+            f"Source invoice line {source_line.id} account is inactive or invalid for its direction."
+        )
     if tax_code == "capital" and (
         _value(invoice.direction) != "AP"
         or account_type != AccountType.ASSET
@@ -226,7 +244,9 @@ def _reserved_quantity(
         .join(CreditNote, CreditNote.id == CreditNoteLine.credit_note_id)
         .filter(
             CreditNote.source_invoice_id == invoice_id,
-            CreditNote.status == CreditNoteStatus.DRAFT.value,
+            CreditNote.status.in_(
+                [CreditNoteStatus.DRAFT.value, CreditNoteStatus.AUTHORISED.value]
+            ),
             CreditNoteLine.source_invoice_line_id == source_line_id,
         )
     )
@@ -520,3 +540,180 @@ def delete_credit_note(session: Session, credit_note_id: int) -> None:
         raise DraftConflict("Only draft credit notes can be deleted.")
     session.delete(note)
     session.flush()
+
+
+def _control_account(session: Session, code: str, expected_type: AccountType) -> Account:
+    account = session.query(Account).filter(Account.code == code).one_or_none()
+    if account is None or not account.active:
+        raise CreditNoteValidationError(f"Required active control account {code} is missing.")
+    try:
+        actual_type = AccountType(_value(account.type))
+    except ValueError as exc:
+        raise CreditNoteValidationError(
+            f"Control account {code} has an invalid account type."
+        ) from exc
+    if actual_type != expected_type:
+        raise CreditNoteValidationError(
+            f"Control account {code} must have type {expected_type.value}."
+        )
+    return account
+
+
+def post_credit_note(
+    session: Session,
+    credit_note_id: int,
+    *,
+    gst_registered: bool,
+) -> JournalEntry:
+    note = get_credit_note(session, credit_note_id)
+    if _value(note.status) != CreditNoteStatus.DRAFT.value:
+        raise DraftConflict("Only draft credit notes can be posted.")
+    source_type = (
+        JournalEntrySource.CREDIT_NOTE_AR
+        if _value(note.direction) == "AR"
+        else JournalEntrySource.CREDIT_NOTE_AP
+    )
+    existing = (
+        session.query(JournalEntry)
+        .filter(
+            JournalEntry.source_type.in_(
+                [
+                    JournalEntrySource.CREDIT_NOTE_AR.value,
+                    JournalEntrySource.CREDIT_NOTE_AP.value,
+                ]
+            ),
+            JournalEntry.source_id == note.id,
+        )
+        .one_or_none()
+    )
+    if existing is not None:
+        raise DraftConflict(f"Credit note {note.id} is already posted.")
+
+    invoice = _load_eligible_source(session, note.source_invoice_id)
+    expected_contact_kind = "customer" if note.direction == "AR" else "supplier"
+    if (
+        _value(note.direction) != _value(invoice.direction)
+        or note.contact_id != invoice.contact_id
+        or note.currency != "AUD"
+        or note.gst_inclusive != invoice.gst_inclusive
+        or not invoice.contact.active
+        or invoice.contact.kind not in {expected_contact_kind, "both"}
+    ):
+        raise InvalidSource("Credit-note identity no longer matches its source invoice.")
+    if invoice_posting._matching_control_settlement(session, invoice) is not None:
+        raise SourceHasSettlement(
+            "Source invoice has a bank settlement on its AR/AP control account."
+        )
+
+    requested_lines = [
+        CreditNoteLineDraftIn(
+            source_invoice_line_id=line.source_invoice_line_id,
+            quantity=line.quantity,
+        )
+        for line in note.lines
+    ]
+    recalculated = _prepare_lines(
+        session, invoice, requested_lines, exclude_credit_note_id=note.id
+    )
+    for stored, current in zip(note.lines, recalculated, strict=True):
+        if any(
+            getattr(stored, field) != getattr(current, field)
+            for field in (
+                "source_invoice_line_id",
+                "description",
+                "account_id",
+                "quantity",
+                "unit_price",
+                "gst_rate",
+                "line_subtotal",
+                "line_gst",
+                "line_total",
+                "tax_code",
+            )
+        ):
+            raise InvalidSource("Credit-note line no longer matches its source invoice.")
+    subtotal = _money(sum((line.line_subtotal for line in recalculated), Decimal("0")))
+    gst_amount = _money(sum((line.line_gst for line in recalculated), Decimal("0")))
+    total = _money(sum((line.line_total for line in recalculated), Decimal("0")))
+    if (note.subtotal, note.gst_amount, note.total) != (subtotal, gst_amount, total):
+        raise CreditNoteValidationError("Credit-note totals no longer match its lines.")
+    if not gst_registered and gst_amount != 0:
+        raise CreditNoteValidationError(
+            "This company is not GST-registered; a credit note with GST cannot be posted."
+        )
+
+    lines: list[JournalLineCreate] = []
+    if note.direction == "AR":
+        receivables = _control_account(session, "1100", AccountType.ASSET)
+        lines.extend(
+            JournalLineCreate(
+                account_id=line.account_id,
+                debit_amount=line.line_subtotal,
+                description=line.description,
+            )
+            for line in recalculated
+        )
+        if gst_amount:
+            gst_control = _control_account(session, "2100", AccountType.LIABILITY)
+            lines.append(
+                JournalLineCreate(
+                    account_id=gst_control.id,
+                    debit_amount=gst_amount,
+                    description="GST collected reversal",
+                )
+            )
+        lines.append(
+            JournalLineCreate(
+                account_id=receivables.id,
+                credit_amount=total,
+                description=f"Credit note {note.credit_note_number} receivable",
+            )
+        )
+    else:
+        payables = _control_account(session, "2000", AccountType.LIABILITY)
+        lines.append(
+            JournalLineCreate(
+                account_id=payables.id,
+                debit_amount=total,
+                description=f"Credit note {note.credit_note_number} payable",
+            )
+        )
+        lines.extend(
+            JournalLineCreate(
+                account_id=line.account_id,
+                credit_amount=line.line_subtotal,
+                description=line.description,
+            )
+            for line in recalculated
+        )
+        if gst_amount:
+            gst_control = _control_account(session, "1200", AccountType.ASSET)
+            lines.append(
+                JournalLineCreate(
+                    account_id=gst_control.id,
+                    credit_amount=gst_amount,
+                    description="GST paid reversal",
+                )
+            )
+
+    _validate_lines(session, lines)
+    entry = JournalEntry(
+        entry_date=note.issue_date,
+        memo=f"Credit note {note.credit_note_number}",
+        reference=note.credit_note_number,
+        source_type=source_type,
+        source_id=note.id,
+    )
+    for line in lines:
+        entry.lines.append(
+            JournalLine(
+                account_id=line.account_id,
+                debit_amount=line.debit_amount or Decimal("0"),
+                credit_amount=line.credit_amount or Decimal("0"),
+                description=line.description,
+            )
+        )
+    note.status = CreditNoteStatus.AUTHORISED
+    session.add(entry)
+    session.flush()
+    return entry

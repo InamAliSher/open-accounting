@@ -630,6 +630,110 @@ def test_cash_basis_invoice_receipt_reports_net_income_and_no_open_ar(client, ac
     assert ar_lines == []
 
 
+def test_unapplied_credit_totals_reconcile_controls_and_reclassify_balance_sheet(
+    client, accounts
+):
+    def post_invoice(direction, number, account, contact):
+        response = client.post(
+            "/api/v1/invoices",
+            headers=HEAD,
+            json={
+                "direction": direction,
+                "contact_name": contact,
+                "invoice_number": number,
+                "issue_date": "2026-05-31",
+                "subtotal": "200.00",
+                "gst_amount": "20.00",
+                "total": "220.00",
+                "gst_inclusive": False,
+                "amount_mode": "exclusive",
+                "lines": [
+                    {
+                        "description": f"{number} line",
+                        "account_id": accounts[account]["id"],
+                        "quantity": "2",
+                        "unit_price": "100.00",
+                        "gst_rate": "0.10",
+                        "tax_code": "standard",
+                        "line_subtotal": "200.00",
+                        "line_gst": "20.00",
+                        "line_total": "220.00",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 201, response.text
+        invoice = response.json()
+        posted = client.post(f"/api/v1/invoices/{invoice['id']}/post", headers=HEAD)
+        assert posted.status_code == 200, posted.text
+        source = client.get(
+            f"/api/v1/credit-notes/source-invoices/{invoice['id']}", headers=HEAD
+        )
+        assert source.status_code == 200, source.text
+        return source.json()
+
+    ar_source = post_invoice("AR", "REPORT-AR-SOURCE", "4000", "Report Customer")
+    ap_source = post_invoice("AP", "REPORT-AP-SOURCE", "6100", "Report Supplier")
+    for source, number, quantity in (
+        (ar_source, "REPORT-AR-CREDIT", "1.0000"),
+        (ap_source, "REPORT-AP-CREDIT", "0.5000"),
+    ):
+        created = client.post(
+            "/api/v1/credit-notes",
+            headers=HEAD,
+            json={
+                "source_invoice_id": source["source_invoice_id"],
+                "credit_note_number": number,
+                "issue_date": "2026-06-01",
+                "lines": [
+                    {
+                        "source_invoice_line_id": source["lines"][0]["source_invoice_line_id"],
+                        "quantity": quantity,
+                    }
+                ],
+            },
+        )
+        assert created.status_code == 201, created.text
+        posted = client.post(
+            f"/api/v1/credit-notes/{created.json()['id']}/post", headers=HEAD
+        )
+        assert posted.status_code == 200, posted.text
+
+    tb_response = client.get(
+        "/api/v1/reports/trial-balance",
+        headers=HEAD,
+        params={"as_of": "2026-06-30"},
+    )
+    assert tb_response.status_code == 200, tb_response.text
+    tb = tb_response.json()
+    assert tb["is_balanced"], tb
+    by_code = {row["code"]: row for row in tb["rows"]}
+    assert Decimal(by_code["1100"]["net_debit"]) == Decimal("110.00")
+    assert Decimal(by_code["2000"]["net_debit"]) == Decimal("-165.00")
+    supplementary = tb["supplementary"]
+    assert Decimal(supplementary["ar_open_total"]) == Decimal("220.00")
+    assert Decimal(supplementary["ar_open_credit_total"]) == Decimal("110.00")
+    assert Decimal(supplementary["ar_net_open_total"]) == Decimal("110.00")
+    assert Decimal(supplementary["ap_open_total"]) == Decimal("220.00")
+    assert Decimal(supplementary["ap_open_credit_total"]) == Decimal("55.00")
+    assert Decimal(supplementary["ap_net_open_total"]) == Decimal("165.00")
+
+    balance_sheet = client.get(
+        "/api/v1/reports/balance-sheet",
+        headers=HEAD,
+        params={"as_of": "2026-06-30"},
+    )
+    assert balance_sheet.status_code == 200, balance_sheet.text
+    bs = balance_sheet.json()
+    assert bs["is_balanced"], bs
+    assets = [line for group in bs["assets"] for line in group["lines"]]
+    liabilities = [line for group in bs["liabilities"] for line in group["lines"]]
+    assert next(line["balance"] for line in assets if line["name"] == "Accounts Receivable (open invoices)") == "220.00"
+    assert next(line["balance"] for line in assets if line["name"] == "Supplier credits (unapplied)") == "55.00"
+    assert next(line["balance"] for line in liabilities if line["name"] == "Accounts Payable (open invoices)") == "220.00"
+    assert next(line["balance"] for line in liabilities if line["name"] == "Customer credits (unapplied)") == "110.00"
+
+
 def test_bas_decimal_serialisation_always_two_decimals(client):
     r = client.get(
         "/api/v1/reports/bas",

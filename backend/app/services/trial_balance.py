@@ -21,11 +21,9 @@ Sources combined here:
      with a contra Cr against equity so the books stay balanced (reversed
      legs for negative openings).
 
-Deliberately NOT in the main aggregation (yet):
-
-  - Legacy unposted Invoice AP/AR — surfaced separately under
-    `supplementary.ap_ar`; invoices with journal provenance are counted
-    through JournalLine only.
+AR/AP invoice and authorised credit-note balances are also exposed as
+supplementary document totals. The Balance Sheet reclassifies their GL control
+rows into gross open-document lines and separate unapplied-credit lines.
 
 Result-shape contract:
 
@@ -53,6 +51,10 @@ Result-shape contract:
       "supplementary": {
          "ap_open_total": Decimal,
          "ar_open_total": Decimal,
+            "ap_open_credit_total": Decimal,
+            "ar_open_credit_total": Decimal,
+            "ap_net_open_total": Decimal,
+            "ar_net_open_total": Decimal,
       },
     }
 """
@@ -71,11 +73,12 @@ from ..models.company import (
     BankAccount,
     BankTransaction,
     BankTxnDirection,
+    CreditNote,
+    CreditNoteStatus,
     Invoice,
     InvoiceDirection,
     InvoiceStatus,
     JournalEntry,
-    JournalEntrySource,
     JournalLine,
     TaxCode,
 )
@@ -346,6 +349,7 @@ def trial_balance(db: Session, *, as_of: date | None = None) -> dict:
     # Phase 4: supplementary blocks (AP/AR).
     # ------------------------------------------------------------------
     ap_open_total, ar_open_total = _ap_ar_outstanding(db, as_of=as_of)
+    ap_open_credit_total, ar_open_credit_total = _open_credit_totals(db, as_of=as_of)
 
     return {
         "as_of": as_of,
@@ -359,6 +363,10 @@ def trial_balance(db: Session, *, as_of: date | None = None) -> dict:
         "supplementary": {
             "ap_open_total": ap_open_total,
             "ar_open_total": ar_open_total,
+            "ap_open_credit_total": ap_open_credit_total,
+            "ar_open_credit_total": ar_open_credit_total,
+            "ap_net_open_total": ap_open_total - ap_open_credit_total,
+            "ar_net_open_total": ar_open_total - ar_open_credit_total,
         },
     }
 
@@ -366,8 +374,10 @@ def trial_balance(db: Session, *, as_of: date | None = None) -> dict:
 def balance_sheet(db: Session, *, as_of: date | None = None) -> dict:
     """Balance Sheet at a point in time.
 
-    Assets   = Σ(ASSET account net_debit) + Σ(bank net_debit) + AR outstanding
-    Liabs    = Σ(LIABILITY account net_credit) + AP outstanding
+    Assets   = Σ(ASSET account net_debit) + Σ(bank net_debit)
+               + AR invoices + unapplied supplier credits
+    Liabs    = Σ(LIABILITY account net_credit) + AP invoices
+               + unapplied customer credits
     Equity   = Σ(EQUITY account net_credit) + retained earnings (income - expense)
 
     Notes:
@@ -397,6 +407,9 @@ def balance_sheet(db: Session, *, as_of: date | None = None) -> dict:
                 "name": row["name"],
                 "balance": row["net_debit"],
             })
+            continue
+
+        if row["code"] in INVOICE_CONTROL_ACCOUNT_CODES:
             continue
 
         atype = row["account_type"]
@@ -448,6 +461,20 @@ def balance_sheet(db: Session, *, as_of: date | None = None) -> dict:
             "name": "Accounts Payable (open invoices)",
             "balance": supp["ap_open_total"],
         })
+    if supp["ar_open_credit_total"] > 0:
+        groups_liabs["Payables"].append({
+            "account_id": None,
+            "code": None,
+            "name": "Customer credits (unapplied)",
+            "balance": supp["ar_open_credit_total"],
+        })
+    if supp["ap_open_credit_total"] > 0:
+        groups_assets["Receivables"].append({
+            "account_id": None,
+            "code": None,
+            "name": "Supplier credits (unapplied)",
+            "balance": supp["ap_open_credit_total"],
+        })
 
     pnl_to_date = profit_and_loss(db, period_start=date.min, period_end=as_of)
     retained = pnl_to_date["net_profit"]
@@ -498,23 +525,11 @@ def _ap_ar_outstanding(db: Session, *, as_of: date | None) -> tuple[Decimal, Dec
     Capped to as_of by issue_date; an invoice issued after the cutoff doesn't
     exist on a trial balance "as of" that date.
     """
-    posted_invoice_ids = (
-        select(JournalEntry.source_id)
-        .where(
-            JournalEntry.source_type.in_(
-                [JournalEntrySource.INVOICE_AR, JournalEntrySource.INVOICE_AP]
-            ),
-            JournalEntry.source_id.isnot(None),
-        )
-    )
     q = (
         db.query(Invoice)
-        # Exclude void (cancelled) and draft (not a live document yet — a draft
-        # isn't in the ledger or AP/AR totals until it's authorised). Posted
-        # invoices live in the GL control accounts, so they're excluded here
-        # via the posted-ids subquery to avoid double counting.
+        # Drafts are not open documents until authorised. Posted and legacy
+        # authorised documents are presented from their open balances.
         .filter(Invoice.status.notin_([InvoiceStatus.VOID, InvoiceStatus.DRAFT]))
-        .filter(~Invoice.id.in_(posted_invoice_ids))
     )
     if as_of is not None:
         q = q.filter(Invoice.issue_date <= as_of)
@@ -529,4 +544,20 @@ def _ap_ar_outstanding(db: Session, *, as_of: date | None) -> tuple[Decimal, Dec
             ap_total += outstanding
         else:
             ar_total += outstanding
+    return ap_total, ar_total
+
+
+def _open_credit_totals(db: Session, *, as_of: date | None) -> tuple[Decimal, Decimal]:
+    query = db.query(CreditNote).filter(
+        CreditNote.status == CreditNoteStatus.AUTHORISED.value
+    )
+    if as_of is not None:
+        query = query.filter(CreditNote.issue_date <= as_of)
+    ap_total = ZERO
+    ar_total = ZERO
+    for note in query.all():
+        if note.direction == InvoiceDirection.AP.value:
+            ap_total += Decimal(note.total or ZERO)
+        else:
+            ar_total += Decimal(note.total or ZERO)
     return ap_total, ar_total

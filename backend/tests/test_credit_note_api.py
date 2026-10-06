@@ -686,3 +686,239 @@ def test_startup_creates_credit_note_tables_and_named_constraints(client):
         and foreign_key["options"].get("ondelete") == "RESTRICT"
         for foreign_key in line_fks
     )
+
+
+@pytest.mark.parametrize(
+    ("direction", "expected"),
+    [
+        (
+            "AR",
+            {
+                "4000": ("100.00", "0.00"),
+                "4010": ("100.00", "0.00"),
+                "2100": ("10.00", "0.00"),
+                "1100": ("0.00", "210.00"),
+            },
+        ),
+        (
+            "AP",
+            {
+                "2000": ("220.00", "0.00"),
+                "6100": ("0.00", "100.00"),
+                "1700": ("0.00", "100.00"),
+                "1200": ("0.00", "20.00"),
+            },
+        ),
+    ],
+)
+def test_post_creates_exact_mixed_ar_ap_journal(
+    client, accounts, direction, expected
+):
+    source_lines = (
+        [
+            _source_line(accounts, tax_code="standard", account_code="4000"),
+            _source_line(accounts, tax_code="none", account_code="4010"),
+        ]
+        if direction == "AR"
+        else [
+            _source_line(accounts, tax_code="standard", account_code="6100"),
+            _source_line(accounts, tax_code="capital", account_code="1700"),
+        ]
+    )
+
+    source = _create_source(
+        client,
+        accounts,
+        number=f"FICTIONAL-POST-{direction}",
+        direction=direction,
+        contact_name=f"Fictional {direction} Posting Contact",
+        lines=source_lines,
+    )
+    created = _create_credit_note(
+        client,
+        source,
+        number=f"FICTIONAL-POST-CN-{direction}",
+        lines=[
+            {"source_invoice_line_id": line["source_invoice_line_id"], "quantity": "1"}
+            for line in source["lines"]
+        ],
+    )
+    assert created.status_code == 201, created.text
+    note = created.json()
+
+    posted = client.post(f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD)
+    assert posted.status_code == 200, posted.text
+    assert posted.json()["status"] == "authorised"
+
+    from app.db.company import company_session
+    from app.models.company import Account, CreditNote, JournalEntry, JournalEntrySource
+
+    with company_session("tc") as db:
+        saved_note = db.get(CreditNote, note["id"])
+        source_type = (
+            JournalEntrySource.CREDIT_NOTE_AR
+            if direction == "AR"
+            else JournalEntrySource.CREDIT_NOTE_AP
+        )
+        entries = db.query(JournalEntry).filter_by(
+            source_type=source_type.value, source_id=note["id"]
+        ).all()
+        assert saved_note.status == "authorised"
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry.entry_date.isoformat() == "2026-06-01"
+        assert entry.source_id == note["id"]
+        account_codes = {account.id: account.code for account in db.query(Account).all()}
+        actual = {
+            account_codes[line.account_id]: (
+                f"{line.debit_amount:.2f}",
+                f"{line.credit_amount:.2f}",
+            )
+            for line in entry.lines
+        }
+        assert actual == expected
+
+    assert client.post(f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD).status_code == 409
+    assert client.patch(
+        f"/api/v1/credit-notes/{note['id']}", headers=HEAD, json={"notes": "changed"}
+    ).status_code == 409
+    assert client.delete(f"/api/v1/credit-notes/{note['id']}", headers=HEAD).status_code == 409
+
+
+def test_zero_gst_credit_note_omits_gst_control_line(client, accounts):
+    source = _create_source(
+        client,
+        accounts,
+        number="FICTIONAL-ZERO-GST-SOURCE",
+        lines=[_source_line(accounts, tax_code="gst_free", account_code="4000")],
+    )
+    note = _create_credit_note(client, source, number="FICTIONAL-ZERO-GST-CN").json()
+    posted = client.post(f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD)
+    assert posted.status_code == 200, posted.text
+
+    from app.db.company import company_session
+    from app.models.company import Account, JournalEntry
+
+    with company_session("tc") as db:
+        entry = db.query(JournalEntry).filter_by(
+            source_type="credit_note_ar", source_id=note["id"]
+        ).one()
+        codes = {account.id: account.code for account in db.query(Account).all()}
+        assert "2100" not in {codes[line.account_id] for line in entry.lines}
+
+
+def test_locked_period_and_failed_post_leave_note_draft_without_journal(client, accounts):
+    source = _create_source(client, accounts, number="FICTIONAL-LOCKED-CN-SOURCE")
+    note = _create_credit_note(
+        client,
+        source,
+        number="FICTIONAL-LOCKED-CN",
+        issue_date="2026-06-01",
+    ).json()
+    locked = client.patch(
+        "/api/v1/companies/tc", headers=HEAD, json={"books_locked_through": "2026-06-01"}
+    )
+    assert locked.status_code == 200, locked.text
+    blocked = client.post(f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD)
+    assert blocked.status_code == 409
+    assert "locked" in blocked.json()["detail"].lower()
+
+    from app.db.company import company_session
+    from app.models.company import CreditNote, JournalEntry
+
+    with company_session("tc") as db:
+        saved_note = db.get(CreditNote, note["id"])
+        assert saved_note.status == "draft"
+        assert db.query(JournalEntry).filter_by(
+            source_type="credit_note_ar", source_id=note["id"]
+        ).count() == 0
+
+
+def test_post_rechecks_settlement_added_after_draft_creation(client, accounts):
+    from app.db.company import company_session
+    from app.models.company import Invoice
+
+    source = _create_source(client, accounts, number="FICTIONAL-LATE-SETTLEMENT-SOURCE")
+    note = _create_credit_note(client, source, number="FICTIONAL-LATE-SETTLEMENT-CN").json()
+    with company_session("tc") as db:
+        invoice = db.get(Invoice, source["id"])
+        invoice.paid_amount = Decimal("1.00")
+        db.commit()
+
+    failed = client.post(f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD)
+    assert failed.status_code == 409
+    with company_session("tc") as db:
+        assert db.get(Invoice, source["id"]).paid_amount == Decimal("1.00")
+
+
+def test_post_rechecks_allocation_added_after_draft_creation(client, accounts):
+    source = _create_source(client, accounts, number="FICTIONAL-LATE-ALLOCATION-SOURCE")
+    note = _create_credit_note(client, source, number="FICTIONAL-LATE-ALLOCATION-CN").json()
+    bank_account_id = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0]["id"]
+    transaction = client.post(
+        f"/api/v1/bank-accounts/{bank_account_id}/transactions",
+        headers={**HEAD, "Idempotency-Key": "fictional-late-credit-allocation"},
+        json={
+            "direction": "in",
+            "amount": "1.00",
+            "occurred_at": "2026-06-01",
+            "memo": "Fictional late allocation",
+            "account_id": accounts["1100"]["id"],
+            "gst_amount": "0.00",
+            "tax_code": "none",
+            "invoice_allocations": [{"invoice_id": source["id"], "amount": "1.00"}],
+        },
+    )
+    assert transaction.status_code == 201, transaction.text
+    failed = client.post(f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD)
+    assert failed.status_code == 409
+
+
+def test_authorised_and_draft_notes_both_reserve_source_quantity(client, accounts):
+    source = _create_source(client, accounts, number="FICTIONAL-AUTHORISED-RESERVATION-SOURCE")
+    line_id = source["lines"][0]["source_invoice_line_id"]
+    first = _create_credit_note(
+        client,
+        source,
+        number="FICTIONAL-AUTHORISED-RESERVATION-1",
+        lines=[{"source_invoice_line_id": line_id, "quantity": "1.0000"}],
+    ).json()
+    second = _create_credit_note(
+        client,
+        source,
+        number="FICTIONAL-AUTHORISED-RESERVATION-2",
+        lines=[{"source_invoice_line_id": line_id, "quantity": "1.0000"}],
+    )
+    assert second.status_code == 201, second.text
+    assert client.post(f"/api/v1/credit-notes/{first['id']}/post", headers=HEAD).status_code == 200
+
+    exhausted = _create_credit_note(
+        client,
+        source,
+        number="FICTIONAL-AUTHORISED-RESERVATION-3",
+        lines=[{"source_invoice_line_id": line_id, "quantity": "0.0001"}],
+    )
+    assert exhausted.status_code == 409
+    source_after = _get_source_snapshot(client, source["id"])
+    assert source_after["lines"][0]["quantity_reserved"] == "2.0000"
+    assert source_after["lines"][0]["remaining_creditable_quantity"] == "0.0000"
+
+
+def test_corrupt_draft_totals_fail_atomically(client, accounts):
+    from app.db.company import company_session
+    from app.models.company import CreditNote, JournalEntry
+
+    source = _create_source(client, accounts, number="FICTIONAL-FAILED-POST-SOURCE")
+    note = _create_credit_note(client, source, number="FICTIONAL-FAILED-POST-CN").json()
+    with company_session("tc") as db:
+        saved_note = db.get(CreditNote, note["id"])
+        saved_note.total += Decimal("1.00")
+        db.commit()
+
+    failed = client.post(f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD)
+    assert failed.status_code == 422
+    with company_session("tc") as db:
+        assert db.get(CreditNote, note["id"]).status == "draft"
+        assert db.query(JournalEntry).filter_by(
+            source_type="credit_note_ar", source_id=note["id"]
+        ).count() == 0

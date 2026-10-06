@@ -18,6 +18,8 @@ from ...schemas.credit_note import (
 )
 from ...services import credit_notes as credit_note_service
 from ...services import doc_numbering
+from ...services.journal import JournalError
+from ...services.period_lock import AccountingPeriodLockedError, require_open_date
 
 
 router = APIRouter(prefix="/credit-notes", tags=["credit-notes"])
@@ -144,5 +146,38 @@ def delete_credit_note(
     except credit_note_service.CreditNoteError as exc:
         db.rollback()
         _raise_domain_error(exc)
+    except IntegrityError as exc:
+        _raise_integrity_conflict(db, exc)
+
+
+@router.post("/{credit_note_id}/post", response_model=CreditNoteOut)
+def post_credit_note(
+    credit_note_id: PathId,
+    company: Company = Depends(get_current_company),
+    db: Session = Depends(get_company_db),
+):
+    doc_numbering._begin_sqlite_immediate(db)
+    try:
+        note = credit_note_service.get_credit_note(db, credit_note_id)
+        require_open_date(company, note.issue_date, operation="post a credit note")
+        credit_note_service.post_credit_note(
+            db,
+            credit_note_id,
+            gst_registered=company.gst_registered,
+        )
+        output = credit_note_service.credit_note_output(
+            credit_note_service.get_credit_note(db, credit_note_id)
+        )
+        db.commit()
+        return _with_source_contact_snapshot(db, output)
+    except credit_note_service.CreditNoteError as exc:
+        db.rollback()
+        _raise_domain_error(exc)
+    except AccountingPeriodLockedError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except JournalError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except IntegrityError as exc:
         _raise_integrity_conflict(db, exc)

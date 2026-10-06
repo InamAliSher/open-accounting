@@ -669,6 +669,8 @@ class JournalEntrySource(str, Enum):
     INVOICE_AR = "invoice_ar"
     INVOICE_AP = "invoice_ap"
     INVOICE_REVERSAL = "invoice_reversal"
+    CREDIT_NOTE_AR = "credit_note_ar"
+    CREDIT_NOTE_AP = "credit_note_ap"
 
 
 class JournalEntry(CompanyBase):
