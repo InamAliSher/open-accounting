@@ -161,6 +161,43 @@ def _journal_entries(client):
     return response.json()
 
 
+def test_credit_note_application_and_reversal_are_reconciled(client, accounts):
+    source = _create_source(client, accounts, number="APP-AR-SOURCE")
+    credit_note = _create_credit_note(client, source, number="APP-AR-CREDIT")
+    assert credit_note.status_code == 201, credit_note.text
+    posted_credit = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/post",
+        headers=HEAD,
+    )
+    assert posted_credit.status_code == 200, posted_credit.text
+
+    application = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/applications",
+        headers={**HEAD, "Idempotency-Key": "application-1"},
+        json={
+            "invoice_id": source["id"],
+            "amount": "110.00",
+            "application_date": "2026-06-30",
+        },
+    )
+    assert application.status_code == 201, application.text
+    assert application.json()["status"] == "active"
+    invoice = client.get(f"/api/v1/invoices/{source['id']}", headers=HEAD).json()
+    assert Decimal(invoice["credit_applied_amount"]) == Decimal("110.00")
+    assert Decimal(invoice["outstanding_amount"]) == Decimal("110.00")
+
+    reversed_application = client.post(
+        f"/api/v1/credit-note-applications/{application.json()['id']}/reverse",
+        headers=HEAD,
+        json={"reversal_date": "2026-07-01"},
+    )
+    assert reversed_application.status_code == 200, reversed_application.text
+    assert reversed_application.json()["status"] == "reversed"
+    invoice = client.get(f"/api/v1/invoices/{source['id']}", headers=HEAD).json()
+    assert Decimal(invoice["credit_applied_amount"]) == Decimal("0.00")
+    assert Decimal(invoice["outstanding_amount"]) == Decimal("220.00")
+
+
 def test_source_snapshot_lifecycle_and_ar_ap_sources(client, accounts):
     missing = client.get("/api/v1/credit-notes/source-invoices/999", headers=HEAD)
     assert missing.status_code == 404

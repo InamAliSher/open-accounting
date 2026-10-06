@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -11,6 +11,9 @@ from ...models.company import Invoice
 from ...models.master import Company
 from ...schemas._limits import SQLITE_INT_MAX
 from ...schemas.credit_note import (
+    CreditNoteApplicationCreate,
+    CreditNoteApplicationOut,
+    CreditNoteApplicationReverse,
     CreditNoteCreate,
     CreditNoteOut,
     CreditNoteSourceOut,
@@ -23,6 +26,7 @@ from ...services.period_lock import AccountingPeriodLockedError, require_open_da
 
 
 router = APIRouter(prefix="/credit-notes", tags=["credit-notes"])
+application_router = APIRouter(prefix="/credit-note-applications", tags=["credit-notes"])
 
 
 def _raise_domain_error(exc: credit_note_service.CreditNoteError) -> None:
@@ -179,5 +183,66 @@ def post_credit_note(
     except JournalError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        _raise_integrity_conflict(db, exc)
+
+
+@router.post(
+    "/{credit_note_id}/applications",
+    response_model=CreditNoteApplicationOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def apply_credit_note(
+    credit_note_id: PathId,
+    payload: CreditNoteApplicationCreate,
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    ),
+    company: Company = Depends(get_current_company),
+    db: Session = Depends(get_company_db),
+):
+    try:
+        application = credit_note_service.apply_credit_note(
+            db,
+            credit_note_id,
+            payload,
+            company=company,
+            idempotency_key=idempotency_key,
+        )
+        db.commit()
+        return credit_note_service._credit_note_application_output(application)
+    except credit_note_service.CreditNoteError as exc:
+        db.rollback()
+        _raise_domain_error(exc)
+    except IntegrityError as exc:
+        _raise_integrity_conflict(db, exc)
+
+
+@application_router.post(
+    "/{credit_note_application_id}/reverse",
+    response_model=CreditNoteApplicationOut,
+)
+def reverse_credit_note_application(
+    credit_note_application_id: PathId,
+    payload: CreditNoteApplicationReverse,
+    company: Company = Depends(get_current_company),
+    db: Session = Depends(get_company_db),
+):
+    try:
+        application = credit_note_service.reverse_credit_note_application(
+            db,
+            credit_note_application_id,
+            payload,
+            company=company,
+        )
+        db.commit()
+        return credit_note_service._credit_note_application_output(application)
+    except credit_note_service.CreditNoteError as exc:
+        db.rollback()
+        _raise_domain_error(exc)
     except IntegrityError as exc:
         _raise_integrity_conflict(db, exc)

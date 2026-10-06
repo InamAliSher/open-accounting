@@ -64,7 +64,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models.company import (
@@ -74,6 +74,8 @@ from ..models.company import (
     BankTransaction,
     BankTxnDirection,
     CreditNote,
+    CreditNoteApplication,
+    CreditNoteApplicationStatus,
     CreditNoteStatus,
     Invoice,
     InvoiceDirection,
@@ -556,8 +558,21 @@ def _open_credit_totals(db: Session, *, as_of: date | None) -> tuple[Decimal, De
     ap_total = ZERO
     ar_total = ZERO
     for note in query.all():
+        active_applied = (
+            db.query(func.coalesce(func.sum(CreditNoteApplication.amount), 0))
+            .filter(
+                CreditNoteApplication.credit_note_id == note.id,
+                CreditNoteApplication.status
+                == CreditNoteApplicationStatus.ACTIVE,
+            )
+            .scalar()
+            or 0
+        )
+        remaining = Decimal(note.total or ZERO) - Decimal(active_applied)
+        if remaining <= 0:
+            continue
         if note.direction == InvoiceDirection.AP.value:
-            ap_total += Decimal(note.total or ZERO)
+            ap_total += remaining
         else:
-            ar_total += Decimal(note.total or ZERO)
+            ar_total += remaining
     return ap_total, ar_total

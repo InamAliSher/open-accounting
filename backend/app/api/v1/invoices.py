@@ -248,6 +248,27 @@ def _serialize(inv: Invoice) -> dict:
         "gst_inclusive": inv.gst_inclusive,
         "status": inv.status,
         "paid_amount": inv.paid_amount,
+        "credit_applied_amount": sum(
+            (
+                application.amount
+                for application in inv.credit_applications
+                if application.status == "active"
+            ),
+            Decimal("0"),
+        ),
+        "outstanding_amount": max(
+            Decimal("0"),
+            Decimal(inv.total)
+            - Decimal(inv.paid_amount or 0)
+            - sum(
+                (
+                    application.amount
+                    for application in inv.credit_applications
+                    if application.status == "active"
+                ),
+                Decimal("0"),
+            ),
+        ),
         "paid_date": inv.paid_date,
         "authorised_at": inv.authorised_at,
         "notes": inv.notes,

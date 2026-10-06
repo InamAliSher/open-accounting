@@ -273,6 +273,8 @@ class InvoiceOut(BaseModel):
     gst_inclusive: bool
     status: str
     paid_amount: Money
+    credit_applied_amount: Money
+    outstanding_amount: Money
     paid_date: date | None
     authorised_at: datetime | None
     notes: str | None

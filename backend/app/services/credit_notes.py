@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import date
+import hashlib
+import json
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from sqlalchemy import func
@@ -10,6 +12,10 @@ from ..models.company import (
     Account,
     AccountType,
     CreditNote,
+    CreditNoteApplication,
+    CreditNoteApplicationIdempotencyKey,
+    CreditNoteApplicationReversal,
+    CreditNoteApplicationStatus,
     CreditNoteLine,
     CreditNoteStatus,
     Invoice,
@@ -66,6 +72,14 @@ class DuplicateCreditNoteNumber(CreditNoteError):
 
 class CreditNoteValidationError(CreditNoteError):
     http_status = 422
+
+
+class CreditNoteApplicationNotFound(CreditNoteError):
+    http_status = 404
+
+
+class CreditNoteApplicationConflict(CreditNoteError):
+    http_status = 409
 
 
 def _value(value) -> str:
@@ -381,6 +395,9 @@ def get_credit_note(session: Session, credit_note_id: int) -> CreditNote:
             joinedload(CreditNote.source_invoice).joinedload(Invoice.contact),
             joinedload(CreditNote.contact),
             selectinload(CreditNote.lines),
+            selectinload(CreditNote.applications).selectinload(
+                CreditNoteApplication.reversal
+            ),
         )
         .filter(CreditNote.id == credit_note_id)
         .one_or_none()
@@ -400,6 +417,9 @@ def list_credit_notes(
         joinedload(CreditNote.source_invoice).joinedload(Invoice.contact),
         joinedload(CreditNote.contact),
         selectinload(CreditNote.lines),
+        selectinload(CreditNote.applications).selectinload(
+            CreditNoteApplication.reversal
+        ),
     )
     if direction is not None:
         query = query.filter(CreditNote.direction == direction)
@@ -409,6 +429,18 @@ def list_credit_notes(
 
 
 def credit_note_output(note: CreditNote) -> dict:
+    applications = [
+        _credit_note_application_output(application)
+        for application in note.applications
+    ]
+    applied_amount = sum(
+        (
+            application.amount
+            for application in note.applications
+            if application.status == CreditNoteApplicationStatus.ACTIVE
+        ),
+        Decimal("0"),
+    )
     return {
         "id": note.id,
         "source_invoice_id": note.source_invoice_id,
@@ -427,6 +459,9 @@ def credit_note_output(note: CreditNote) -> dict:
         "notes": note.notes,
         "created_at": note.created_at,
         "updated_at": note.updated_at,
+        "applied_amount": applied_amount,
+        "remaining_amount": Decimal(note.total) - applied_amount,
+        "applications": applications,
         "lines": [
             {
                 "id": line.id,
@@ -717,3 +752,181 @@ def post_credit_note(
     session.add(entry)
     session.flush()
     return entry
+
+
+def _application_payload_hash(
+    *, credit_note_id: int, invoice_id: int, amount: Decimal, application_date: date
+) -> str:
+    payload = {
+        "credit_note_id": credit_note_id,
+        "invoice_id": invoice_id,
+        "amount": str(amount),
+        "application_date": application_date.isoformat(),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _credit_note_application_output(application: CreditNoteApplication) -> dict:
+    reversal = application.reversal
+    return {
+        "id": application.id,
+        "invoice_id": application.invoice_id,
+        "amount": application.amount,
+        "application_date": application.application_date,
+        "status": _value(application.status),
+        "created_at": application.created_at,
+        "updated_at": application.updated_at,
+        "reversed_at": application.reversed_at,
+        "reversal_date": reversal.reversal_date if reversal is not None else None,
+    }
+
+
+def _application_energy(
+    session: Session, credit_note: CreditNote, invoice: Invoice
+) -> tuple[Decimal, Decimal]:
+    credit_applied = Decimal(
+        session.query(func.coalesce(func.sum(CreditNoteApplication.amount), 0))
+        .filter(
+            CreditNoteApplication.credit_note_id == credit_note.id,
+            CreditNoteApplication.invoice_id == invoice.id,
+            CreditNoteApplication.status == CreditNoteApplicationStatus.ACTIVE,
+        )
+        .scalar()
+        or 0
+    )
+    invoice_applied = Decimal(
+        session.query(func.coalesce(func.sum(CreditNoteApplication.amount), 0))
+        .filter(
+            CreditNoteApplication.invoice_id == invoice.id,
+            CreditNoteApplication.status == CreditNoteApplicationStatus.ACTIVE,
+        )
+        .scalar()
+        or 0
+    )
+    return credit_applied, invoice_applied
+
+
+def apply_credit_note(
+    session: Session,
+    credit_note_id: int,
+    payload,
+    *,
+    company,
+    idempotency_key: str,
+) -> CreditNoteApplication:
+    credit_note = get_credit_note(session, credit_note_id)
+    if _value(credit_note.status) != CreditNoteStatus.AUTHORISED.value:
+        raise CreditNoteApplicationConflict(
+            "Only an authorised credit note may be applied."
+        )
+    from .period_lock import require_open_date
+
+    require_open_date(
+        company,
+        payload.application_date,
+        operation="apply a credit note",
+    )
+    invoice = session.get(Invoice, payload.invoice_id)
+    if invoice is None:
+        raise CreditNoteApplicationNotFound("Target invoice not found.")
+    if _value(invoice.status) != InvoiceStatus.AUTHORISED.value:
+        raise CreditNoteApplicationConflict(
+            "Target invoice must be authorised and not void."
+        )
+    if (
+        credit_note.direction != invoice.direction
+        or credit_note.contact_id != invoice.contact_id
+        or credit_note.currency != invoice.currency
+    ):
+        raise CreditNoteApplicationConflict(
+            "Credit note and invoice must match by Contact, direction, and currency."
+        )
+
+    credit_applied, invoice_applied = _application_energy(
+        session, credit_note, invoice
+    )
+    remaining_credit = Decimal(credit_note.total) - credit_applied
+    outstanding = Decimal(invoice.total) - Decimal(invoice.paid_amount or 0) - invoice_applied
+    if payload.amount > remaining_credit:
+        raise CreditNoteApplicationConflict(
+            "Application exceeds the credit note's remaining amount."
+        )
+    if payload.amount > outstanding:
+        raise CreditNoteApplicationConflict(
+            "Application exceeds the invoice's outstanding amount."
+        )
+
+    payload_hash = _application_payload_hash(
+        credit_note_id=credit_note_id,
+        invoice_id=payload.invoice_id,
+        amount=payload.amount,
+        application_date=payload.application_date,
+    )
+    existing_key = session.get(CreditNoteApplicationIdempotencyKey, idempotency_key)
+    if existing_key is not None:
+        application = session.get(CreditNoteApplication, existing_key.application_id)
+        if application is None:
+            raise CreditNoteApplicationConflict(
+                "Idempotency-Key points to a missing credit application."
+            )
+        if existing_key.payload_hash != payload_hash:
+            raise CreditNoteApplicationConflict(
+                "Idempotency-Key has already been used with a different payload."
+            )
+        return application
+
+    application = CreditNoteApplication(
+        credit_note_id=credit_note_id,
+        invoice_id=payload.invoice_id,
+        amount=payload.amount,
+        application_date=payload.application_date,
+        status=CreditNoteApplicationStatus.ACTIVE,
+    )
+    session.add(application)
+    session.flush()
+    session.add(
+        CreditNoteApplicationIdempotencyKey(
+            key=idempotency_key,
+            payload_hash=payload_hash,
+            application_id=application.id,
+        )
+    )
+    session.flush()
+    return application
+
+
+def reverse_credit_note_application(
+    session: Session,
+    application_id: int,
+    payload,
+    *,
+    company,
+) -> CreditNoteApplication:
+    application = session.get(CreditNoteApplication, application_id)
+    if application is None:
+        raise CreditNoteApplicationNotFound("Credit application not found.")
+    if application.status != CreditNoteApplicationStatus.ACTIVE:
+        if application.reversal is not None:
+            return application
+        raise CreditNoteApplicationConflict(
+            "Only an active credit application can be reversed."
+        )
+    from .period_lock import require_open_date
+
+    require_open_date(
+        company,
+        payload.reversal_date,
+        operation="reverse a credit application",
+    )
+    reversal = CreditNoteApplicationReversal(
+        application_id=application.id,
+        reversal_date=payload.reversal_date,
+    )
+    application.status = CreditNoteApplicationStatus.REVERSED
+    application.reversed_at = datetime.now(timezone.utc)
+    application.reversal = reversal
+    session.add(reversal)
+    session.flush()
+    return application

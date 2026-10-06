@@ -130,6 +130,11 @@ class CreditNoteStatus(str, Enum):
     VOID = "void"
 
 
+class CreditNoteApplicationStatus(str, Enum):
+    ACTIVE = "active"
+    REVERSED = "reversed"
+
+
 # Decimal precision used throughout: 2 decimal places, up to 14 integer digits.
 MONEY = Numeric(16, 2)
 
@@ -184,6 +189,9 @@ class Invoice(CompanyBase):
     )
     attachments: Mapped[list["Attachment"]] = relationship(back_populates="invoice")
     payment_allocations: Mapped[list["InvoicePaymentAllocation"]] = relationship(
+        back_populates="invoice"
+    )
+    credit_applications: Mapped[list["CreditNoteApplication"]] = relationship(
         back_populates="invoice"
     )
 
@@ -266,6 +274,9 @@ class CreditNote(CompanyBase):
     lines: Mapped[list["CreditNoteLine"]] = relationship(
         back_populates="credit_note", cascade="all, delete-orphan"
     )
+    applications: Mapped[list["CreditNoteApplication"]] = relationship(
+        back_populates="credit_note", cascade="all, delete-orphan"
+    )
 
 
 class CreditNoteLine(CompanyBase):
@@ -312,6 +323,100 @@ class CreditNoteLine(CompanyBase):
     credit_note: Mapped[CreditNote] = relationship(back_populates="lines")
     source_invoice_line: Mapped[InvoiceLine] = relationship()
     account: Mapped[Account] = relationship()
+
+
+class CreditNoteApplication(CompanyBase):
+    __tablename__ = "credit_note_applications"
+    __table_args__ = (
+        Index(
+            "ix_credit_note_application_active_pair",
+            "credit_note_id",
+            "invoice_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
+        CheckConstraint("amount > 0", name="ck_credit_note_application_amount_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    credit_note_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_notes.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("invoices.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    application_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    status: Mapped[CreditNoteApplicationStatus] = mapped_column(
+        String(10), nullable=False, default=CreditNoteApplicationStatus.ACTIVE, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    credit_note: Mapped[CreditNote] = relationship(back_populates="applications")
+    invoice: Mapped[Invoice] = relationship(back_populates="credit_applications")
+    reversal: Mapped["CreditNoteApplicationReversal | None"] = relationship(
+        back_populates="application",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class CreditNoteApplicationReversal(CompanyBase):
+    __tablename__ = "credit_note_application_reversals"
+    __table_args__ = (
+        UniqueConstraint(
+            "application_id",
+            name="uq_credit_note_application_reversal_application",
+        ),
+        CheckConstraint("reversal_date IS NOT NULL", name="ck_credit_note_application_reversal_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "credit_note_applications.id", ondelete="RESTRICT"
+        ),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    reversal_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    application: Mapped[CreditNoteApplication] = relationship(
+        back_populates="reversal"
+    )
+
+
+class CreditNoteApplicationIdempotencyKey(CompanyBase):
+    __tablename__ = "credit_note_application_idempotency_keys"
+    __table_args__ = (
+        UniqueConstraint(
+            "application_id",
+            name="uq_credit_note_application_idempotency_application",
+        ),
+    )
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "credit_note_applications.id", ondelete="CASCADE"
+        ),
+        nullable=False,
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 # ---------------------------------------------------------------------------

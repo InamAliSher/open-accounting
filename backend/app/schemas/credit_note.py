@@ -91,6 +91,18 @@ class CreditNoteLineOut(BaseModel):
     tax_code: str
 
 
+class CreditNoteApplicationOut(BaseModel):
+    id: int
+    invoice_id: int
+    amount: Money
+    application_date: date
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    reversed_at: datetime | None
+    reversal_date: date | None
+
+
 class CreditNoteOut(BaseModel):
     id: int
     source_invoice_id: int
@@ -109,7 +121,29 @@ class CreditNoteOut(BaseModel):
     notes: str | None
     created_at: datetime
     updated_at: datetime
+    applied_amount: Money
+    remaining_amount: Money
+    applications: list[CreditNoteApplicationOut]
     lines: list[CreditNoteLineOut]
+
+
+class CreditNoteApplicationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    invoice_id: int = Field(ge=1, le=SQLITE_INT_MAX)
+    amount: Decimal = Field(
+        gt=0,
+        le=Decimal("999999.9999"),
+        max_digits=16,
+        decimal_places=2,
+    )
+    application_date: date
+
+
+class CreditNoteApplicationReverse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reversal_date: date
 
 
 class CreditNoteSourceLineOut(BaseModel):
