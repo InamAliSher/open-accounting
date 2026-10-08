@@ -114,6 +114,15 @@ test("PDF invoice confirmation requires a selected active accounting contact", a
   await pdfDialog.getByRole("button", { name: "Upload PDF" }).click();
   expect((await uploadResponse).ok()).toBeTruthy();
 
+  const directionGroup = pdfDialog.getByRole("group", { name: "Direction" });
+  const apDirection = directionGroup.getByRole("button", { name: "AP · Bill from supplier" });
+  const arDirection = directionGroup.getByRole("button", { name: "AR · Invoice to customer" });
+  await expect(apDirection).toBeVisible();
+  await expect(arDirection).toBeVisible();
+  await arDirection.click();
+  await expect(pdfDialog.getByLabel("Search customer contacts")).toBeVisible();
+  await apDirection.click();
+
   const confirm = pdfDialog.getByRole("button", { name: "Confirm & save" });
   await expect(pdfDialog.getByLabel("Invoice #")).toBeVisible();
   await expect(confirm).toBeDisabled();
@@ -148,6 +157,91 @@ test("PDF invoice confirmation requires a selected active accounting contact", a
   await selectedContact.getByRole("button", { name: "Clear" }).click();
   await expect(selectedContact).toHaveCount(0);
   await expect(confirm).toBeDisabled();
+});
+
+test("Customer Invoices PDF upload and reset keep the saved direction AR", async ({
+  page,
+  request,
+}) => {
+  await ensureCompanyById(request, COMPANY_ID, "Fictional Contact-First Pty Ltd");
+  const customerName = `Fictional Customer PDF ${Date.now()}`;
+  const customer = await createContact(request, customerName, "customer");
+  const accounts = await getJson<Array<{ id: number; type: string; active: boolean }>>(
+    request,
+    "/accounts",
+  );
+  const income = accounts.find((account) => account.active && account.type === "INCOME");
+  expect(income).toBeTruthy();
+
+  await page.goto("/customer-invoices");
+  await selectCompany(page);
+  await page.getByRole("button", { name: "Attach PDF", exact: true }).click();
+  const pdfDialog = page.getByRole("heading", { name: "Attach PDF invoice" }).locator("../..");
+  const pdfInput = pdfDialog.locator('input[type="file"]');
+  await pdfInput.setInputFiles({
+    name: "fictional-customer-first.pdf",
+    mimeType: "application/pdf",
+    buffer: fictionalPdfBuffer(),
+  });
+  const firstUpload = page.waitForResponse((response) =>
+    response.url().includes("/api/v1/invoices/upload-pdf") &&
+    response.request().method() === "POST",
+  );
+  await pdfDialog.getByRole("button", { name: "Upload PDF" }).click();
+  expect((await firstUpload).ok()).toBeTruthy();
+  await expect(pdfDialog.getByLabel("Search customer contacts")).toBeVisible();
+  await expect(pdfDialog.getByLabel("Search supplier contacts")).toHaveCount(0);
+  await expect(pdfDialog.getByRole("button", { name: /^(AP|AR) ·/ })).toHaveCount(0);
+
+  await pdfDialog.getByRole("button", { name: "Pick a different file" }).click();
+  await pdfInput.setInputFiles({
+    name: "fictional-customer-after-reset.pdf",
+    mimeType: "application/pdf",
+    buffer: fictionalPdfBuffer(),
+  });
+  const resetUpload = page.waitForResponse((response) =>
+    response.url().includes("/api/v1/invoices/upload-pdf") &&
+    response.request().method() === "POST",
+  );
+  await pdfDialog.getByRole("button", { name: "Upload PDF" }).click();
+  expect((await resetUpload).ok()).toBeTruthy();
+  await expect(pdfDialog.getByLabel("Search customer contacts")).toBeVisible();
+
+  const invoiceNumber = `FICTIONAL-CUSTOMER-PDF-${Date.now()}`;
+  await pdfDialog.getByLabel("Invoice #").fill(invoiceNumber);
+  await pdfDialog.getByLabel(/Issue date/).fill("01/08/2026");
+  await pdfDialog.getByLabel("Description").first().fill("Fictional customer consulting");
+  await pdfDialog.getByLabel("Qty").first().fill("1");
+  await pdfDialog.getByLabel("Unit price").first().fill("100.00");
+  await pdfDialog.getByLabel("Account").first().selectOption(String(income!.id));
+  await pdfDialog.getByLabel("Tax rate").first().selectOption("standard");
+  const customerSearch = pdfDialog.getByLabel("Search customer contacts");
+  await customerSearch.fill(customerName);
+  const customerOption = pdfDialog.getByRole("listbox", { name: "Customer contact results" })
+    .getByRole("option", { name: `Select ${customerName}` });
+  await expect(customerOption).toBeVisible();
+  await customerOption.click();
+
+  const createRequest = page.waitForRequest((observed) =>
+    observed.method() === "POST" && observed.url().includes("/api/v1/invoices"),
+  );
+  const createResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/v1/invoices") && response.request().method() === "POST",
+  );
+  await pdfDialog.getByRole("button", { name: "Confirm & save" }).click();
+  const payload = (await createRequest).postDataJSON() as Record<string, unknown>;
+  expect(payload).toMatchObject({ direction: "AR", contact_id: customer.id });
+  const savedInvoice = (await (await createResponse).json()) as {
+    id: number;
+    direction: string;
+    contact_id: number;
+  };
+  expect(savedInvoice).toMatchObject({ direction: "AR", contact_id: customer.id });
+  const persistedInvoice = await getJson<{ direction: string; contact_id: number }>(
+    request,
+    `/invoices/${savedInvoice.id}`,
+  );
+  expect(persistedInvoice).toMatchObject({ direction: "AR", contact_id: customer.id });
 });
 
 test("Supplier Bills keeps manual, PDF, and Excel/CSV entry AP-only", async ({
@@ -331,7 +425,55 @@ test("Supplier Bills keeps manual, PDF, and Excel/CSV entry AP-only", async ({
   await expect(pdfDialog.getByLabel("Search customer contacts")).toHaveCount(0);
   await expect(pdfDialog.getByRole("button", { name: /^(AP|AR) ·/ })).toHaveCount(0);
 
-  await pdfDialog.getByRole("button", { name: "×" }).click();
+  await pdfDialog.getByRole("button", { name: "Pick a different file" }).click();
+  await pdfDialog.locator('input[type="file"]').setInputFiles({
+    name: "fictional-supplier-bill-after-reset.pdf",
+    mimeType: "application/pdf",
+    buffer: fictionalPdfBuffer(),
+  });
+  const resetPdfUpload = page.waitForResponse((response) =>
+    response.url().includes("/api/v1/invoices/upload-pdf") &&
+    response.request().method() === "POST",
+  );
+  await pdfDialog.getByRole("button", { name: "Upload PDF" }).click();
+  expect((await resetPdfUpload).ok()).toBeTruthy();
+  await expect(pdfDialog.getByLabel("Search supplier contacts")).toBeVisible();
+
+  const pdfInvoiceNumber = `FICTIONAL-SUPPLIER-PDF-${Date.now()}`;
+  await pdfDialog.getByLabel("Invoice #").fill(pdfInvoiceNumber);
+  await pdfDialog.getByLabel(/Issue date/).fill("01/08/2026");
+  await pdfDialog.getByLabel("Description").first().fill("Fictional supplier PDF bill");
+  await pdfDialog.getByLabel("Qty").first().fill("1");
+  await pdfDialog.getByLabel("Unit price").first().fill("25.00");
+  await pdfDialog.getByLabel("Account").first().selectOption(String(expense!.id));
+  await pdfDialog.getByLabel("Tax rate").first().selectOption("standard");
+  const pdfSupplierSearch = pdfDialog.getByLabel("Search supplier contacts");
+  await pdfSupplierSearch.fill(supplierName);
+  const pdfSupplierOption = pdfDialog.getByRole("listbox", { name: "Supplier contact results" })
+    .getByRole("option", { name: `Select ${supplierName}` });
+  await expect(pdfSupplierOption).toBeVisible();
+  await pdfSupplierOption.click();
+  const pdfCreateRequest = page.waitForRequest((observed) =>
+    observed.method() === "POST" && observed.url().includes("/api/v1/invoices"),
+  );
+  const pdfCreateResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/v1/invoices") && response.request().method() === "POST",
+  );
+  await pdfDialog.getByRole("button", { name: "Confirm & save" }).click();
+  const pdfPayload = (await pdfCreateRequest).postDataJSON() as Record<string, unknown>;
+  expect(pdfPayload).toMatchObject({ direction: "AP", contact_id: supplier.id });
+  const pdfInvoice = (await (await pdfCreateResponse).json()) as {
+    id: number;
+    direction: string;
+    contact_id: number;
+  };
+  expect(pdfInvoice).toMatchObject({ direction: "AP", contact_id: supplier.id });
+  const persistedPdfInvoice = await getJson<{ direction: string; contact_id: number }>(
+    request,
+    `/invoices/${pdfInvoice.id}`,
+  );
+  expect(persistedPdfInvoice).toMatchObject({ direction: "AP", contact_id: supplier.id });
+
   await page.getByRole("button", { name: "Import Excel/CSV", exact: true }).click();
   const excelDialog = page.getByRole("heading", {
     name: "Import invoices from Excel / CSV",
