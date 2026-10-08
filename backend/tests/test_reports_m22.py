@@ -729,8 +729,10 @@ def test_unapplied_credit_totals_reconcile_controls_and_reclassify_balance_sheet
     assets = [line for group in bs["assets"] for line in group["lines"]]
     liabilities = [line for group in bs["liabilities"] for line in group["lines"]]
     assert next(line["balance"] for line in assets if line["name"] == "Accounts Receivable (open invoices)") == "220.00"
-    assert next(line["balance"] for line in assets if line["name"] == "Supplier credits (unapplied)") == "55.00"
-    assert next(line["balance"] for line in liabilities if line["name"] == "Accounts Payable (open invoices)") == "220.00"
+    assert not any(line["name"] == "Supplier credits (unapplied)" for line in assets)
+    ap_control = next(line for line in liabilities if line["code"] == "2000")
+    assert Decimal(ap_control["balance"]) == Decimal("165.00")
+    assert not any(line["name"] == "Accounts Payable (open invoices)" for line in liabilities)
     assert next(line["balance"] for line in liabilities if line["name"] == "Customer credits (unapplied)") == "110.00"
 
 

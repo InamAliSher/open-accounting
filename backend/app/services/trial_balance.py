@@ -94,6 +94,9 @@ from .transaction_classification import bank_event_is_sale
 # resolves). Bank txns categorised here are invoice settlements, not primary
 # income/expense events — their GST is carried by the invoice journal.
 INVOICE_CONTROL_ACCOUNT_CODES = ("1100", "2000")
+# The balance sheet keeps the AP control account as the liability rollup.
+# The AR control is projected separately as receivables and customer credits.
+BALANCE_SHEET_CONTROL_ACCOUNT_CODES = ("2000",)
 GST_PAID_ACCOUNT_CODE = "1200"
 GST_COLLECTED_ACCOUNT_CODE = "2100"
 
@@ -413,7 +416,10 @@ def balance_sheet(db: Session, *, as_of: date | None = None) -> dict:
             })
             continue
 
-        if row["code"] in INVOICE_CONTROL_ACCOUNT_CODES:
+        if (
+            row["code"] in INVOICE_CONTROL_ACCOUNT_CODES
+            and row["code"] not in BALANCE_SHEET_CONTROL_ACCOUNT_CODES
+        ):
             continue
 
         atype = row["account_type"]
@@ -458,26 +464,12 @@ def balance_sheet(db: Session, *, as_of: date | None = None) -> dict:
             "name": "Accounts Receivable (open invoices)",
             "balance": supp["ar_open_total"],
         })
-    if supp["ap_open_total"] > 0:
-        groups_liabs["Payables"].append({
-            "account_id": None,
-            "code": None,
-            "name": "Accounts Payable (open invoices)",
-            "balance": supp["ap_open_total"],
-        })
     if supp["ar_open_credit_total"] > 0:
         groups_liabs["Payables"].append({
             "account_id": None,
             "code": None,
             "name": "Customer credits (unapplied)",
             "balance": supp["ar_open_credit_total"],
-        })
-    if supp["ap_open_credit_total"] > 0:
-        groups_assets["Receivables"].append({
-            "account_id": None,
-            "code": None,
-            "name": "Supplier credits (unapplied)",
-            "balance": supp["ap_open_credit_total"],
         })
 
     pnl_to_date = profit_and_loss(db, period_start=date.min, period_end=as_of)
