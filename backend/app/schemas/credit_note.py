@@ -141,11 +141,21 @@ class CreditNoteApplicationCreate(BaseModel):
     )
     application_date: date
 
+    @field_validator("application_date")
+    @classmethod
+    def _reportable_application_date(cls, value: date) -> date:
+        return check_reportable_date(value, field_name="application_date")
+
 
 class CreditNoteApplicationReverse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reversal_date: date
+
+    @field_validator("reversal_date")
+    @classmethod
+    def _reportable_reversal_date(cls, value: date) -> date:
+        return check_reportable_date(value, field_name="reversal_date")
 
 
 class CreditNoteRefundCreate(BaseModel):
@@ -160,11 +170,21 @@ class CreditNoteRefundCreate(BaseModel):
     )
     refund_date: date
 
+    @field_validator("refund_date")
+    @classmethod
+    def _reportable_refund_date(cls, value: date) -> date:
+        return check_reportable_date(value, field_name="refund_date")
+
 
 class CreditNoteRefundReverse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reversal_date: date
+
+    @field_validator("reversal_date")
+    @classmethod
+    def _reportable_reversal_date(cls, value: date) -> date:
+        return check_reportable_date(value, field_name="reversal_date")
 
 
 class CreditNoteVoid(BaseModel):

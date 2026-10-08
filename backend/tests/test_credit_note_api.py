@@ -199,6 +199,194 @@ def test_credit_note_application_and_reversal_are_reconciled(client, accounts):
     assert Decimal(invoice["outstanding_amount"]) == Decimal("220.00")
 
 
+def test_concurrent_applications_to_different_invoices_are_atomic(client, accounts):
+    from app.db.company import company_session
+    from app.services import credit_notes as credit_note_service
+
+    first_source = _create_source(client, accounts, number="CONCURRENT-DIFFERENT-1")
+    second_source = _create_source(client, accounts, number="CONCURRENT-DIFFERENT-2")
+    credit_note = _create_credit_note(
+        client, first_source, number="CONCURRENT-DIFFERENT-CN"
+    )
+    assert credit_note.status_code == 201, credit_note.text
+    posted_credit = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/post", headers=HEAD
+    )
+    assert posted_credit.status_code == 200, posted_credit.text
+    credit_note_id = credit_note.json()["id"]
+    amount = min(Decimal("60.00"), Decimal(credit_note.json()["remaining_amount"]))
+
+    def apply(key, invoice_id):
+        response = client.post(
+            f"/api/v1/credit-notes/{credit_note_id}/applications",
+            headers={**HEAD, "Idempotency-Key": key},
+            json={
+                "invoice_id": invoice_id,
+                "amount": f"{amount:.2f}",
+                "application_date": "2026-06-30",
+            },
+        )
+        return response.status_code, response.json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                apply,
+                ("concurrent-different-a", "concurrent-different-b"),
+                (first_source["id"], second_source["id"]),
+            )
+        )
+
+    assert sorted(status for status, _ in results) == [201, 201]
+    with company_session("tc") as session:
+        assert session.query(credit_note_service.CreditNoteApplication).filter_by(
+            credit_note_id=credit_note_id
+        ).count() == 2
+
+
+def test_concurrent_applications_to_same_invoice_are_atomic(client, accounts):
+    from app.db.company import company_session
+    from app.services import credit_notes as credit_note_service
+
+    source = _create_source(client, accounts, number="CONCURRENT-SAME-SOURCE")
+    credit_note = _create_credit_note(client, source, number="CONCURRENT-SAME-CN")
+    assert credit_note.status_code == 201, credit_note.text
+    posted_credit = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/post", headers=HEAD
+    )
+    assert posted_credit.status_code == 200, posted_credit.text
+    credit_note_id = credit_note.json()["id"]
+    amount = min(Decimal("60.00"), Decimal(credit_note.json()["remaining_amount"]))
+
+    def apply(key):
+        response = client.post(
+            f"/api/v1/credit-notes/{credit_note_id}/applications",
+            headers={**HEAD, "Idempotency-Key": key},
+            json={
+                "invoice_id": source["id"],
+                "amount": f"{amount:.2f}",
+                "application_date": "2026-06-30",
+            },
+        )
+        return response.status_code, response.json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(apply, ("concurrent-same-a", "concurrent-same-b")))
+
+    assert sorted(status for status, _ in results) == [201, 409]
+    with company_session("tc") as session:
+        assert session.query(credit_note_service.CreditNoteApplication).filter_by(
+            credit_note_id=credit_note_id
+        ).count() == 1
+
+
+def test_exact_boundary_application_and_no_partial_state(client, accounts):
+    from app.db.company import company_session
+    from app.services import credit_notes as credit_note_service
+
+    source = _create_source(client, accounts, number="BOUNDARY-SOURCE")
+    credit_note = _create_credit_note(client, source, number="BOUNDARY-CN")
+    assert credit_note.status_code == 201, credit_note.text
+    posted_credit = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/post", headers=HEAD
+    )
+    assert posted_credit.status_code == 200, posted_credit.text
+    remaining = Decimal(credit_note.json()["remaining_amount"])
+
+    boundary = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/applications",
+        headers={**HEAD, "Idempotency-Key": "boundary-exact"},
+        json={
+            "invoice_id": source["id"],
+            "amount": f"{remaining:.2f}",
+            "application_date": "2026-06-30",
+        },
+    )
+    assert boundary.status_code == 201, boundary.text
+    rejected = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/applications",
+        headers={**HEAD, "Idempotency-Key": "boundary-rejected"},
+        json={
+            "invoice_id": source["id"],
+            "amount": "0.01",
+            "application_date": "2026-06-30",
+        },
+    )
+    assert rejected.status_code == 409, rejected.text
+    with company_session("tc") as session:
+        assert session.query(credit_note_service.CreditNoteApplication).filter_by(
+            credit_note_id=credit_note.json()["id"]
+        ).count() == 1
+
+
+def test_application_rejects_target_without_verified_invoice_journal(client, accounts):
+    from app.db.company import company_session
+    from app.models.company import JournalEntry, JournalEntrySource
+
+    source = _create_source(client, accounts, number="PROVENANCE-SOURCE")
+    credit_note = _create_credit_note(client, source, number="PROVENANCE-CN")
+    assert credit_note.status_code == 201, credit_note.text
+    posted_credit = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/post", headers=HEAD
+    )
+    assert posted_credit.status_code == 200, posted_credit.text
+    with company_session("tc") as session:
+        entry = (
+            session.query(JournalEntry)
+            .filter_by(source_id=source["id"], source_type=JournalEntrySource.INVOICE_AR)
+            .one()
+        )
+        session.delete(entry)
+        session.commit()
+
+    response = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/applications",
+        headers={**HEAD, "Idempotency-Key": "missing-provenance"},
+        json={
+            "invoice_id": source["id"],
+            "amount": "10.00",
+            "application_date": "2026-06-30",
+        },
+    )
+    assert response.status_code == 409, response.text
+
+
+def test_application_and_refund_dates_are_reportable(client, accounts):
+    source = _create_source(client, accounts, number="DATE-SOURCE")
+    credit_note = _create_credit_note(client, source, number="DATE-CN")
+    assert credit_note.status_code == 201, credit_note.text
+    posted_credit = client.post(
+        f"/api/v1/credit-notes/{credit_note.json()['id']}/post", headers=HEAD
+    )
+    assert posted_credit.status_code == 200, posted_credit.text
+
+    for field, value in (
+        ("application_date", "1999-06-30"),
+        ("refund_date", "2100-07-01"),
+        ("reversal_date", "1999-06-30"),
+    ):
+        endpoint = (
+            f"/api/v1/credit-notes/{credit_note.json()['id']}/applications"
+            if field == "application_date"
+            else f"/api/v1/credit-notes/{credit_note.json()['id']}/refunds"
+            if field == "refund_date"
+            else f"/api/v1/credit-note-applications/999/reverse"
+        )
+        body = {
+            "invoice_id": source["id"],
+            "amount": "10.00",
+            field: value,
+        }
+        if field == "reversal_date":
+            body = {field: value}
+        response = client.post(
+            endpoint,
+            headers={**HEAD, "Idempotency-Key": f"invalid-date-{field}"},
+            json=body,
+        )
+        assert response.status_code == 422, (field, response.text)
+
+
 def test_source_snapshot_lifecycle_and_ar_ap_sources(client, accounts):
     missing = client.get("/api/v1/credit-notes/source-invoices/999", headers=HEAD)
     assert missing.status_code == 404

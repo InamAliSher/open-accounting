@@ -47,6 +47,7 @@ from . import invoice_posting
 from .invoice_math import GstMathError, check_gst_math, check_invoice_lines
 from .journal import _validate_lines
 from .period_lock import require_open_date
+from ..db.company import begin_sqlite_immediate
 
 
 CENT = Decimal("0.01")
@@ -957,6 +958,7 @@ def apply_credit_note(
     company,
     idempotency_key: str,
 ) -> CreditNoteApplication:
+    begin_sqlite_immediate(session)
     credit_note = get_credit_note(session, credit_note_id)
     if _value(credit_note.status) != CreditNoteStatus.AUTHORISED.value:
         raise CreditNoteApplicationConflict(
@@ -984,6 +986,7 @@ def apply_credit_note(
         raise CreditNoteApplicationConflict(
             "Credit note and invoice must match by Contact, direction, and currency."
         )
+    _verify_posting(session, invoice)
 
     credit_applied, invoice_applied = _application_energy(
         session, credit_note, invoice

@@ -552,26 +552,43 @@ def _open_credit_totals(db: Session, *, as_of: date | None) -> tuple[Decimal, De
     ap_total = ZERO
     ar_total = ZERO
     for note in query.all():
-        active_applied = (
-            db.query(func.coalesce(func.sum(CreditNoteApplication.amount), 0))
-            .filter(
-                CreditNoteApplication.credit_note_id == note.id,
-                CreditNoteApplication.status
-                == CreditNoteApplicationStatus.ACTIVE,
-            )
-            .scalar()
-            or 0
-        )
-        active_refunded = (
-            db.query(func.coalesce(func.sum(CreditNoteRefund.amount), 0))
-            .filter(
-                CreditNoteRefund.credit_note_id == note.id,
-                CreditNoteRefund.status == CreditNoteRefundStatus.ACTIVE,
-            )
-            .scalar()
-            or 0
-        )
-        remaining = Decimal(note.total or ZERO) - Decimal(active_applied) - Decimal(active_refunded)
+        applied = ZERO
+        refunded = ZERO
+        if as_of is None:
+            active_applications = note.applications
+            active_refunds = note.refunds
+        else:
+            active_applications = [
+                application
+                for application in note.applications
+                if application.application_date <= as_of
+                and (
+                    application.status == CreditNoteApplicationStatus.ACTIVE
+                    or application.reversal is not None
+                    and application.reversal.reversal_date > as_of
+                )
+            ]
+            active_refunds = [
+                refund
+                for refund in note.refunds
+                if refund.refund_date <= as_of
+                and (
+                    refund.status == CreditNoteRefundStatus.ACTIVE
+                    or refund.reversal_date is not None
+                    and refund.reversal_date > as_of
+                )
+            ]
+        for application in active_applications:
+            if application.status == CreditNoteApplicationStatus.ACTIVE:
+                applied += Decimal(application.amount)
+            elif application.reversal is not None and application.reversal.reversal_date > as_of:
+                applied += Decimal(application.amount)
+        for refund in active_refunds:
+            if refund.status == CreditNoteRefundStatus.ACTIVE:
+                refunded += Decimal(refund.amount)
+            elif refund.reversal_date is not None and refund.reversal_date > as_of:
+                refunded += Decimal(refund.amount)
+        remaining = Decimal(note.total or ZERO) - applied - refunded
         if remaining <= 0:
             continue
         if note.direction == InvoiceDirection.AP.value:
