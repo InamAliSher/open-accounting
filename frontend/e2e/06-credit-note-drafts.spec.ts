@@ -550,7 +550,7 @@ test("AR and AP credit notes authorise to unapplied credits with immutable journ
     await expect(authorisedDialog.getByText("Credit balances", { exact: true })).toBeVisible();
     await expect(authorisedDialog.getByText(/Applied credit/)).toBeVisible();
     await expect(authorisedDialog.getByText("Applied credit $0.00 · Remaining credit $55.00.")).toBeVisible();
-    await expect(authorisedDialog.getByText(/Journal entry #\d+/)).toBeVisible();
+    await expect(authorisedDialog.getByText(/Original journal entry #\d+/)).toBeVisible();
     await expect(authorisedDialog.getByRole("columnheader", { name: "Debit" })).toBeVisible();
     await expect(authorisedDialog.getByRole("columnheader", { name: "Credit", exact: true })).toBeVisible();
     await expect(authorisedDialog.getByLabel("Credit-note number")).toHaveCount(0);
@@ -558,21 +558,79 @@ test("AR and AP credit notes authorise to unapplied credits with immutable journ
     await expect(authorisedDialog.getByLabel(/Credited quantity/)).toHaveCount(0);
     await expect(authorisedDialog.getByRole("button", { name: "Apply", exact: true })).toBeVisible();
     await expect(authorisedDialog.getByRole("button", { name: /refund/i })).toBeVisible();
-    for (const forbidden of [/authorise/i, /payment/i, /void/i, /delete/i]) {
+    await expect(authorisedDialog.getByRole("button", { name: "Void", exact: true })).toBeVisible();
+    for (const forbidden of [/authorise/i, /payment/i, /delete/i]) {
       await expect(authorisedDialog.getByRole("button", { name: forbidden })).toHaveCount(0);
     }
 
+    const voidDate = "2026-08-20";
+    await authorisedDialog.getByLabel("Void date").fill(voidDate);
+    await authorisedDialog.getByRole("button", { name: "Void", exact: true }).click();
+    const voidConfirmation = page.getByRole("heading", { name: "Void this credit note?" }).locator("..");
+    await expect(voidConfirmation).toContainText("original ledger posting will be reversed");
+    await expect(voidConfirmation).toContainText("Restoration is unavailable");
+    const voidResponsePromise = page.waitForResponse((response) =>
+      response.url().includes(`/api/v1/credit-notes/${createdNotes[0].id}/void`) &&
+      response.request().method() === "POST",
+    );
+    await voidConfirmation.getByRole("button", { name: "Void credit note" }).click();
+    const voidResponse = await voidResponsePromise;
+    expect(voidResponse.ok(), await voidResponse.text()).toBeTruthy();
+    const voidPayload = voidResponse.request().postDataJSON() as { void_date: string };
+    expect(voidPayload).toEqual({ void_date: voidDate });
+    expect((await voidResponse.json()) as { status: string }).toMatchObject({ status: "void" });
+    await expect(authorisedDialog.getByText("Status void", { exact: true })).toBeVisible();
+    await expect(authorisedDialog.getByText("Reversal journal", { exact: true })).toBeVisible();
+    await expect(authorisedDialog.getByText(/Reverses entry ID \d+/)).toBeVisible();
+    await expect(authorisedDialog.getByText(/Source type credit_note_void_(ar|ap)/)).toBeVisible();
+    await expect(authorisedDialog.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
+    await expect(authorisedDialog.getByRole("button", { name: /refund/i })).toHaveCount(0);
+    await expect(authorisedDialog.getByRole("button", { name: "Void", exact: true })).toHaveCount(0);
+    await expect(authorisedDialog.getByLabel("Void date")).toHaveCount(0);
+
+    const originalJournalResponse = await request.get(`${BACKEND_URL}/api/v1/journal`, {
+      headers,
+      params: { source_type: scenario.direction === "AR" ? "credit_note_ar" : "credit_note_ap" },
+    });
+    expect(originalJournalResponse.ok()).toBeTruthy();
+    const originalJournal = (await originalJournalResponse.json()) as Array<{
+      source_id: number | null;
+      reverses_entry_id: number | null;
+      lines: unknown[];
+    }>;
+    const originalEntry = originalJournal.find((entry) => entry.source_id === createdNotes[0].id);
+    expect(originalEntry).toMatchObject({ reverses_entry_id: null, lines: expect.any(Array) });
+    const reversalJournalResponse = await request.get(`${BACKEND_URL}/api/v1/journal`, {
+      headers,
+      params: { source_type: scenario.direction === "AR" ? "credit_note_void_ar" : "credit_note_void_ap" },
+    });
+    expect(reversalJournalResponse.ok()).toBeTruthy();
+    const reversalJournal = (await reversalJournalResponse.json()) as Array<{
+      source_id: number | null;
+      entry_date: string;
+      reverses_entry_id: number | null;
+      lines: unknown[];
+    }>;
+    const reversalEntry = reversalJournal.find((entry) => entry.source_id === createdNotes[0].id);
+    expect(reversalEntry).toMatchObject({
+      entry_date: voidDate,
+      reverses_entry_id: originalEntry?.id,
+      lines: expect.any(Array),
+    });
+
     await authorisedDialog.getByRole("button", { name: "Close" }).click();
     const authorisedRow = sourceSection.getByRole("row").filter({ hasText: scenario.creditNote });
-    await expect(authorisedRow).toContainText("authorised · unapplied");
+    await expect(authorisedRow).toContainText("void");
     await expect(authorisedRow.getByRole("button", { name: "View" })).toBeVisible();
     await expect(authorisedRow.getByRole("button", { name: "View/Edit" })).toHaveCount(0);
     await expect(authorisedRow.getByRole("button", { name: "Delete draft" })).toHaveCount(0);
     await authorisedRow.getByRole("button", { name: "View" }).click();
-    await expect(authorisedDialog.getByText("Status authorised", { exact: true })).toBeVisible();
+    await expect(authorisedDialog.getByText("Status void", { exact: true })).toBeVisible();
     await expect(authorisedDialog.getByText("Credit balances", { exact: true })).toBeVisible();
-    await expect(authorisedDialog.getByRole("button", { name: "Apply", exact: true })).toBeVisible();
-    await expect(authorisedDialog.getByRole("button", { name: /refund/i })).toBeVisible();
+    await expect(authorisedDialog.getByText(/Original journal entry #\d+/)).toBeVisible();
+    await expect(authorisedDialog.getByText("Reversal journal", { exact: true })).toBeVisible();
+    await expect(authorisedDialog.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
+    await expect(authorisedDialog.getByRole("button", { name: /refund/i })).toHaveCount(0);
     await expect(authorisedDialog.getByRole("button", { name: /authorise|payment|void|delete/i })).toHaveCount(0);
     await authorisedDialog.getByRole("button", { name: "Close" }).click();
     await closeInvoice(page);
@@ -586,8 +644,8 @@ test("AR and AP credit notes authorise to unapplied credits with immutable journ
       lines: Array<{ quantity_reserved: string; remaining_creditable_quantity: string }>;
     };
     expect(sourceSnapshot.lines[0]).toMatchObject({
-      quantity_reserved: "1.0000",
-      remaining_creditable_quantity: "0.0000",
+      quantity_reserved: "0",
+      remaining_creditable_quantity: "1.0000",
     });
     const invoiceAfter = await request.get(`${BACKEND_URL}/api/v1/invoices/${invoiceId}`, { headers });
     expect(invoiceAfter.ok()).toBeTruthy();

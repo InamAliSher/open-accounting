@@ -244,6 +244,9 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(arDrawer.getByText("Outstanding").locator("..")).toContainText("$110.00");
   await openAuthorisedCreditNote(page, "FICTIONAL-APP-AR-CREDIT");
 
+  const arCreditNoteDialog = page
+    .getByRole("heading", { name: "View authorised credit note" })
+    .locator("xpath=ancestor::div[contains(@class,'fixed inset-0 z-50')]");
   const arCreditNote = page.getByRole("region", { name: "Credit note applications" });
   await arCreditNote.getByLabel("Invoice to apply").selectOption({ label: "FICTIONAL-APP-AR-001 · $110.00" });
   await arCreditNote.getByLabel("Application amount").fill("40.00");
@@ -260,7 +263,8 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(arCreditNote.getByRole("button", { name: "Reverse" })).toBeVisible();
   await expect(arCreditNote.getByRole("button", { name: "Refund" })).toBeVisible();
   await expect(arCreditNote.getByRole("button", { name: "Payment" })).toHaveCount(0);
-  await expect(arCreditNote.getByRole("button", { name: "Void" })).toHaveCount(0);
+  await expect(arCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toBeDisabled();
+  await expect(arCreditNoteDialog.getByText(/cannot be voided while it has active applications or refunds/i)).toBeVisible();
 
   await arCreditNote.getByLabel("Refund bank account").selectOption(String(selectedBankAccount.id));
   await arCreditNote.getByLabel("Refund amount").fill("30.00");
@@ -287,6 +291,8 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(arApplicationRow.getByText("16/08/2026", { exact: true })).toBeVisible();
   await expect(arApplicationRow.getByText("active", { exact: true })).toHaveCount(0);
   await expect(arRefundRow.getByText("active", { exact: true })).toBeVisible();
+  await expect(arCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toBeDisabled();
+  await expect(arCreditNoteDialog.getByText(/cannot be voided while it has active applications or refunds/i)).toBeVisible();
   await arRefundRow.getByRole("button", { name: "Reverse", exact: true }).click();
   const arRefundReverseConfirmation = page.getByRole("heading", { name: "Reverse this refund?" }).locator("..");
   await expect(arRefundReverseConfirmation).toContainText("original selected account will be reused");
@@ -295,6 +301,31 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(arCreditNote.getByText("reversed", { exact: true })).toHaveCount(2);
   await expect(arRefundRow.getByText("18/08/2026", { exact: true })).toBeVisible();
   await expect(arRefundRow.getByText("$30.00", { exact: true })).toBeVisible();
+  await expect(arCreditNoteDialog.getByText(/cannot be voided while it has active applications or refunds/i)).toHaveCount(0);
+
+  const arVoidDate = "2026-08-21";
+  await arCreditNoteDialog.getByLabel("Void date").fill(arVoidDate);
+  await expect(arCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toBeEnabled();
+  await arCreditNoteDialog.getByRole("button", { name: "Void", exact: true }).click();
+  const arVoidConfirmation = page.getByRole("heading", { name: "Void this credit note?" }).locator("..");
+  await expect(arVoidConfirmation).toContainText("The original ledger posting will be reversed");
+  await expect(arVoidConfirmation).toContainText("Restoration is unavailable");
+  const arVoidResponsePromise = page.waitForResponse((response) =>
+    response.url().includes(`/api/v1/credit-notes/${arCreditNoteId}/void`) &&
+    response.request().method() === "POST",
+  );
+  await arVoidConfirmation.getByRole("button", { name: "Void credit note" }).click();
+  const arVoidResponse = await arVoidResponsePromise;
+  expect(arVoidResponse.ok(), await arVoidResponse.text()).toBeTruthy();
+  expect(arVoidResponse.request().postDataJSON()).toEqual({ void_date: arVoidDate });
+  await expect(arCreditNoteDialog.getByText("Status void", { exact: true })).toBeVisible();
+  await expect(arCreditNoteDialog.getByText("Reversal journal", { exact: true })).toBeVisible();
+  await expect(arCreditNoteDialog.getByText(/Source type credit_note_void_ar/)).toBeVisible();
+  await expect(arCreditNoteDialog.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
+  await expect(arCreditNoteDialog.getByRole("button", { name: "Refund", exact: true })).toHaveCount(0);
+  await expect(arCreditNoteDialog.getByRole("button", { name: "Reverse", exact: true })).toHaveCount(0);
+  await expect(arCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toHaveCount(0);
+  await expect(arCreditNoteDialog.getByLabel("Void date")).toHaveCount(0);
   await page.getByRole("button", { name: "Close" }).click();
 
   await page.goto("/invoices");
@@ -307,6 +338,9 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(apDrawer.getByText("Credit applied").locator("..")).toContainText("$0.00");
   await expect(apDrawer.getByText("Outstanding").locator("..")).toContainText("$110.00");
   await openAuthorisedCreditNote(page, "FICTIONAL-APP-AP-CREDIT");
+  const apCreditNoteDialog = page
+    .getByRole("heading", { name: "View authorised credit note" })
+    .locator("xpath=ancestor::div[contains(@class,'fixed inset-0 z-50')]");
   const apCreditNote = page.getByRole("region", { name: "Credit note applications" });
   await apCreditNote.getByLabel("Invoice to apply").selectOption({ label: "FICTIONAL-APP-AP-001 · $110.00" });
   await apCreditNote.getByLabel("Application amount").fill("25.00");
@@ -316,6 +350,8 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await apConfirmation.getByRole("button", { name: "Apply credit" }).click();
   await expect(apCreditNote.getByText("$25.00", { exact: true })).toBeVisible();
   await expect(apCreditNote.getByText("active", { exact: true })).toBeVisible();
+  await expect(apCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toBeDisabled();
+  await expect(apCreditNoteDialog.getByText(/cannot be voided while it has active applications or refunds/i)).toBeVisible();
   await apCreditNote.getByLabel("Refund bank account").selectOption(String(selectedBankAccount.id));
   await apCreditNote.getByLabel("Refund amount").fill("15.00");
   await apCreditNote.getByLabel("Refund date").fill("2026-08-19");
@@ -325,17 +361,52 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await apRefundConfirmation.getByRole("button", { name: "Refund credit" }).click();
   await expect(apCreditNote.getByText("Supplier refund received", { exact: true })).toBeVisible();
   await expect(apCreditNote.getByText("Inbound cash movement", { exact: true })).toBeVisible();
+  const apApplicationRow = apCreditNote.getByRole("row").filter({ hasText: "FICTIONAL-APP-AP-001" });
   const apRefundRow = apCreditNote.getByRole("row").filter({ hasText: "Credit Note Refund Bank" });
   await expect(apRefundRow.getByText("$15.00", { exact: true })).toBeVisible();
   await expect(apRefundRow.getByText("19/08/2026", { exact: true })).toBeVisible();
   await expect(apRefundRow.getByText("active", { exact: true })).toBeVisible();
+  await apApplicationRow.getByRole("button", { name: "Reverse", exact: true }).click();
+  const apApplicationReverseConfirmation = page.getByRole("heading", { name: "Reverse this credit application?" }).locator("..");
+  await apApplicationReverseConfirmation.getByLabel("Reversal date").fill("2026-08-20");
+  await apApplicationReverseConfirmation.getByRole("button", { name: "Reverse application" }).click();
+  await expect(apApplicationRow.getByText("reversed", { exact: true })).toBeVisible();
+  await expect(apApplicationRow.getByText("20/08/2026", { exact: true })).toBeVisible();
+  await expect(apApplicationRow.getByText("active", { exact: true })).toHaveCount(0);
+  await expect(apCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toBeDisabled();
+  await expect(apCreditNoteDialog.getByText(/cannot be voided while it has active applications or refunds/i)).toBeVisible();
   await apRefundRow.getByRole("button", { name: "Reverse", exact: true }).click();
   const apRefundReverseConfirmation = page.getByRole("heading", { name: "Reverse this refund?" }).locator("..");
-  await apRefundReverseConfirmation.getByLabel("Refund reversal date").fill("2026-08-20");
+  await apRefundReverseConfirmation.getByLabel("Refund reversal date").fill("2026-08-21");
   await apRefundReverseConfirmation.getByRole("button", { name: "Reverse refund" }).click();
   await expect(apRefundRow.getByText("reversed", { exact: true })).toBeVisible();
-  await expect(apRefundRow.getByText("20/08/2026", { exact: true })).toBeVisible();
+  await expect(apRefundRow.getByText("21/08/2026", { exact: true })).toBeVisible();
   await expect(apRefundRow.getByText("$15.00", { exact: true })).toBeVisible();
+  await expect(apCreditNoteDialog.getByText(/cannot be voided while it has active applications or refunds/i)).toHaveCount(0);
+
+  const apVoidDate = "2026-08-22";
+  await apCreditNoteDialog.getByLabel("Void date").fill(apVoidDate);
+  await expect(apCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toBeEnabled();
+  await apCreditNoteDialog.getByRole("button", { name: "Void", exact: true }).click();
+  const apVoidConfirmation = page.getByRole("heading", { name: "Void this credit note?" }).locator("..");
+  await expect(apVoidConfirmation).toContainText("The original ledger posting will be reversed");
+  await expect(apVoidConfirmation).toContainText("Restoration is unavailable");
+  const apVoidResponsePromise = page.waitForResponse((response) =>
+    response.url().includes(`/api/v1/credit-notes/${apCreditNoteId}/void`) &&
+    response.request().method() === "POST",
+  );
+  await apVoidConfirmation.getByRole("button", { name: "Void credit note" }).click();
+  const apVoidResponse = await apVoidResponsePromise;
+  expect(apVoidResponse.ok(), await apVoidResponse.text()).toBeTruthy();
+  expect(apVoidResponse.request().postDataJSON()).toEqual({ void_date: apVoidDate });
+  await expect(apCreditNoteDialog.getByText("Status void", { exact: true })).toBeVisible();
+  await expect(apCreditNoteDialog.getByText("Reversal journal", { exact: true })).toBeVisible();
+  await expect(apCreditNoteDialog.getByText(/Source type credit_note_void_ap/)).toBeVisible();
+  await expect(apCreditNoteDialog.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
+  await expect(apCreditNoteDialog.getByRole("button", { name: "Refund", exact: true })).toHaveCount(0);
+  await expect(apCreditNoteDialog.getByRole("button", { name: "Reverse", exact: true })).toHaveCount(0);
+  await expect(apCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toHaveCount(0);
+  await expect(apCreditNoteDialog.getByLabel("Void date")).toHaveCount(0);
   await page
     .getByRole("heading", { name: "View authorised credit note" })
     .locator("xpath=ancestor::div[contains(@class,'fixed inset-0 z-50')]")
@@ -347,8 +418,8 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
     .getByRole("heading", { name: /FICTIONAL-APP-AP-001/ })
     .locator("xpath=ancestor::div[contains(@class,'w-[640px]')]");
   await expect(refreshedApDrawer.getByText("Cash paid").locator("..")).toContainText("$0.00");
-  await expect(refreshedApDrawer.getByText("Credit applied").locator("..")).toContainText("$25.00");
-  await expect(refreshedApDrawer.getByText("Outstanding").locator("..")).toContainText("$85.00");
+  await expect(refreshedApDrawer.getByText("Credit applied").locator("..")).toContainText("$0.00");
+  await expect(refreshedApDrawer.getByText("Outstanding").locator("..")).toContainText("$110.00");
   await expect(apCreditNote.getByRole("button", { name: "Refund" })).toHaveCount(0);
   await expect(apCreditNote.getByRole("button", { name: "Payment" })).toHaveCount(0);
   await expect(apCreditNote.getByRole("button", { name: "Void" })).toHaveCount(0);
@@ -367,8 +438,8 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   });
   expect(apInvoice.ok()).toBeTruthy();
   expect(await apInvoice.json()).toMatchObject({
-    credit_applied_amount: "25.00",
-    outstanding_amount: "85.00",
+    credit_applied_amount: "0.00",
+    outstanding_amount: "110.00",
   });
   const arCreditNoteResponse = await request.get(`${BACKEND_URL}/api/v1/credit-notes/${arCreditNoteId}`, {
     headers,
@@ -400,14 +471,14 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
     }>;
   };
   expect(apCreditNoteApi).toMatchObject({
-    applied_amount: "25.00",
-    remaining_amount: "85.00",
+    applied_amount: "0.00",
+    remaining_amount: "110.00",
   });
   expect(apCreditNoteApi.refunds).toHaveLength(1);
   expect(apCreditNoteApi.refunds[0]).toMatchObject({
     amount: "15.00",
     bank_account_id: selectedBankAccount.id,
     status: "reversed",
-    reversal_date: "2026-08-20",
+    reversal_date: "2026-08-21",
   });
 });

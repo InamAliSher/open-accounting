@@ -87,6 +87,8 @@ export default function CreditNoteDraftDialog({
   const [quantities, setQuantities] = useState<Record<number, string>>({});
   const [savedDraft, setSavedDraft] = useState<CreditNote | null>(null);
   const [confirmAuthorise, setConfirmAuthorise] = useState(false);
+  const [voidDate, setVoidDate] = useState("");
+  const [confirmVoid, setConfirmVoid] = useState(false);
   const editing = creditNoteId !== undefined;
 
   const snapshotQuery = useQuery({
@@ -105,11 +107,14 @@ export default function CreditNoteDraftDialog({
     retry: false,
   });
   const draft = detailQuery.data;
-  const displayedCreditNote = savedDraft ?? draft;
+  const displayedCreditNote = draft ?? savedDraft;
   const journalSourceType = displayedCreditNote?.direction === "AR"
     ? "credit_note_ar"
     : "credit_note_ap";
-  const journalQuery = useQuery({
+  const reversalJournalSourceType = displayedCreditNote?.direction === "AR"
+    ? "credit_note_void_ar"
+    : "credit_note_void_ap";
+  const originalJournalQuery = useQuery({
     queryKey: ["journal", "credit-note", currentId, displayedCreditNote?.id],
     queryFn: async () => {
       const response = await api.get<JournalEntry[]>("/journal", {
@@ -121,7 +126,23 @@ export default function CreditNoteDraftDialog({
       });
       return response.data.find((entry) => entry.source_id === displayedCreditNote?.id) ?? null;
     },
-    enabled: !!currentId && displayedCreditNote?.status === "authorised",
+    enabled: !!currentId &&
+      (displayedCreditNote?.status === "authorised" || displayedCreditNote?.status === "void"),
+    retry: false,
+  });
+  const reversalJournalQuery = useQuery({
+    queryKey: ["journal", "credit-note-void", currentId, displayedCreditNote?.id],
+    queryFn: async () => {
+      const response = await api.get<JournalEntry[]>("/journal", {
+        params: {
+          source_type: reversalJournalSourceType,
+          q: displayedCreditNote!.credit_note_number,
+          limit: 500,
+        },
+      });
+      return response.data.find((entry) => entry.source_id === displayedCreditNote?.id) ?? null;
+    },
+    enabled: !!currentId && displayedCreditNote?.status === "void",
     retry: false,
   });
 
@@ -140,6 +161,10 @@ export default function CreditNoteDraftDialog({
     }
     setQuantities(nextQuantities);
   }, [detailQuery.data, snapshotQuery.data]);
+
+  useEffect(() => {
+    if (detailQuery.data) setSavedDraft(detailQuery.data);
+  }, [detailQuery.data]);
 
   const saveMutation = useMutation<CreditNote, unknown, SaveInput>({
     mutationFn: async (input) => {
@@ -187,9 +212,48 @@ export default function CreditNoteDraftDialog({
     },
   });
 
+  const voidMutation = useMutation({
+    mutationFn: async () =>
+      (await api.post<CreditNote>(`/credit-notes/${displayedCreditNote!.id}/void`, {
+        void_date: voidDate,
+      })).data,
+    onSuccess: (voided) => {
+      setSavedDraft(voided);
+      setConfirmVoid(false);
+      setVoidDate("");
+      void queryClient.invalidateQueries({
+        queryKey: ["credit-notes", "source-list", currentId, sourceInvoiceId],
+        exact: true,
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["credit-notes", "source-snapshot", currentId, sourceInvoiceId],
+        exact: true,
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["credit-notes", "detail", currentId, voided.id],
+        exact: true,
+      });
+      void queryClient.invalidateQueries({ queryKey: ["journal"] });
+      void queryClient.invalidateQueries({ queryKey: ["invoices", currentId] });
+    },
+  });
+
   const snapshot = snapshotQuery.data;
   const readOnly = !!displayedCreditNote && displayedCreditNote.status !== "draft";
   const isDraftNote = displayedCreditNote?.status === "draft";
+  const isAuthorisedNote = displayedCreditNote?.status === "authorised";
+  const hasActiveApplications = displayedCreditNote?.applications.some(
+    (application) => application.status === "active",
+  ) ?? false;
+  const hasActiveRefunds = displayedCreditNote?.refunds.some(
+    (refund) => refund.status === "active",
+  ) ?? false;
+  const voidDateError = !voidDate
+    ? "Choose a void date."
+    : !validDate(voidDate)
+      ? "Enter a valid void date."
+      : null;
+  const voidBlocked = hasActiveApplications || hasActiveRefunds;
   const lineErrors: Record<number, string> = {};
   const payloadLines: CreditNoteLineDraftIn[] = [];
   let positiveLineCount = 0;
@@ -303,9 +367,19 @@ export default function CreditNoteDraftDialog({
             {apiErrorMessage(authoriseMutation.error)}
           </p>
         )}
-        {journalQuery.isError && (
+        {voidMutation.isError && (
           <p className="mx-5 mt-3 text-sm text-rose-700" role="alert">
-            {apiErrorMessage(journalQuery.error)}
+            {apiErrorMessage(voidMutation.error)}
+          </p>
+        )}
+        {originalJournalQuery.isError && (
+          <p className="mx-5 mt-3 text-sm text-rose-700" role="alert">
+            {apiErrorMessage(originalJournalQuery.error)}
+          </p>
+        )}
+        {reversalJournalQuery.isError && (
+          <p className="mx-5 mt-3 text-sm text-rose-700" role="alert">
+            {apiErrorMessage(reversalJournalQuery.error)}
           </p>
         )}
 
@@ -479,52 +553,81 @@ export default function CreditNoteDraftDialog({
                 A draft reserves source quantity only. It does not change the source invoice, journal, invoice balance, payment allocation, or GST report.
               </p>
             )}
-            {displayedCreditNote?.status === "authorised" && (
+            {(isAuthorisedNote || displayedCreditNote?.status === "void") && (
               <section className="border-t border-slate-200 pt-3 space-y-2" aria-label="Credit note journal entry">
                 <div>
                   <h3 className="font-medium">Credit balances</h3>
                   <p className="text-xs text-slate-600">
-                    Applied credit {formatMoney(displayedCreditNote.applied_amount, displayedCreditNote.currency)} ·
-                    Remaining credit {formatMoney(displayedCreditNote.remaining_amount, displayedCreditNote.currency)}.
+                    Applied credit {formatMoney(displayedCreditNote!.applied_amount, displayedCreditNote!.currency)} ·
+                    Remaining credit {formatMoney(displayedCreditNote!.remaining_amount, displayedCreditNote!.currency)}.
                     The credit has not been refunded or paid.
                   </p>
                 </div>
-                {journalQuery.isLoading ? (
+                {originalJournalQuery.isLoading ? (
                   <p className="text-xs text-slate-500">Loading journal entry…</p>
-                ) : journalQuery.data ? (
-                  <div>
-                    <div className="text-xs text-slate-600">
-                      Journal entry #{journalQuery.data.id} · {formatDate(journalQuery.data.entry_date)} · {journalQuery.data.memo}
-                    </div>
-                    <table className="w-full text-xs mt-2">
-                      <thead className="text-left text-slate-500 border-b">
-                        <tr>
-                          <th className="py-1 pr-2">Account ID</th>
-                          <th className="py-1 pr-2">Description</th>
-                          <th className="py-1 pr-2 text-right">Debit</th>
-                          <th className="py-1 text-right">Credit</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {journalQuery.data.lines.map((line) => (
-                          <tr key={line.id} className="border-b last:border-b-0">
-                            <td className="py-1 pr-2">{line.account_id}</td>
-                            <td className="py-1 pr-2">{line.description ?? ""}</td>
-                            <td className="py-1 pr-2 text-right">{formatMoney(line.debit_amount, displayedCreditNote.currency)}</td>
-                            <td className="py-1 text-right">{formatMoney(line.credit_amount, displayedCreditNote.currency)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                ) : originalJournalQuery.data ? (
+                  <JournalEntryLines
+                    journalEntry={originalJournalQuery.data}
+                    currency={displayedCreditNote!.currency}
+                    label="Original journal entry"
+                  />
                 ) : (
-                  <p className="text-xs text-rose-700" role="status">No journal entry was found for this authorised credit note.</p>
+                  <p className="text-xs text-rose-700" role="status">No journal entry was found for this credit note.</p>
+                )}
+                {displayedCreditNote?.status === "void" && (
+                  <div className="border-t border-slate-200 pt-2" aria-label="Reversal journal entry">
+                    <h4 className="text-xs font-medium text-slate-700">Reversal journal</h4>
+                    {reversalJournalQuery.isLoading ? (
+                      <p className="text-xs text-slate-500">Loading reversal journal entry…</p>
+                    ) : reversalJournalQuery.data ? (
+                      <JournalEntryLines
+                        journalEntry={reversalJournalQuery.data}
+                        currency={displayedCreditNote.currency}
+                        label="Reversal journal entry"
+                      />
+                    ) : (
+                      <p className="text-xs text-rose-700" role="status">No reversal journal entry was found.</p>
+                    )}
+                  </div>
                 )}
               </section>
             )}
-            {displayedCreditNote?.status === "authorised" && displayedCreditNote && (
-              <CreditNoteApplications creditNote={displayedCreditNote} />
+            {isAuthorisedNote && (
+              <section className="border-t border-slate-200 pt-3 space-y-2" aria-label="Void credit note">
+              <div>
+                <h3 className="font-medium">Void credit note</h3>
+                <p className="text-xs text-slate-600">
+                  The original ledger posting will be reversed and restoration is unavailable.
+                </p>
+              </div>
+              <label className="block text-xs text-slate-600">
+                <span className="block mb-1">Void date</span>
+                <input
+                  className="input w-full"
+                  type="date"
+                  aria-label="Void date"
+                  value={voidDate}
+                  onChange={(event) => setVoidDate(event.target.value)}
+                  disabled={voidMutation.isPending}
+                />
+              </label>
+              {voidBlocked && (
+                <p className="text-xs text-rose-700" role="alert">
+                  This credit note cannot be voided while it has active applications or refunds. Reverse all active applications and refunds first, then void the credit note.
+                </p>
+              )}
+              {voidDateError && <p className="text-xs text-rose-700" role="alert">{voidDateError}</p>}
+              <button
+                type="button"
+                className="btn-danger text-xs"
+                disabled={voidBlocked || !!voidDateError || voidMutation.isPending}
+                onClick={() => setConfirmVoid(true)}
+              >
+                {voidMutation.isPending ? "Voiding…" : "Void"}
+              </button>
+            </section>
             )}
+            {isAuthorisedNote && <CreditNoteApplications creditNote={displayedCreditNote} />}
           </div>
         )}
 
@@ -574,6 +677,60 @@ export default function CreditNoteDraftDialog({
           if (isDraftNote) authoriseMutation.mutate();
         }}
       />
+      <ConfirmDialog
+        open={confirmVoid}
+        destructive
+        title="Void this credit note?"
+        message="The original ledger posting will be reversed. Restoration is unavailable after the credit note is voided."
+        confirmLabel="Void credit note"
+        busy={voidMutation.isPending}
+        onCancel={() => setConfirmVoid(false)}
+        onConfirm={() => {
+          if (isAuthorisedNote && !voidBlocked && !voidDateError) voidMutation.mutate();
+        }}
+      />
+    </div>
+  );
+}
+
+function JournalEntryLines({
+  journalEntry,
+  currency,
+  label,
+}: {
+  journalEntry: JournalEntry;
+  currency: string;
+  label: string;
+}) {
+  return (
+    <div>
+      <div className="text-xs text-slate-600">
+        {label} #{journalEntry.id} · {formatDate(journalEntry.entry_date)} · {journalEntry.memo}
+        <div className="mt-1">Source type {journalEntry.source_type} · Source ID {journalEntry.source_id}</div>
+        {journalEntry.reverses_entry_id !== null && (
+          <div>Reverses entry ID {journalEntry.reverses_entry_id}</div>
+        )}
+      </div>
+      <table className="w-full text-xs mt-2">
+        <thead className="text-left text-slate-500 border-b">
+          <tr>
+            <th className="py-1 pr-2">Account ID</th>
+            <th className="py-1 pr-2">Description</th>
+            <th className="py-1 pr-2 text-right">Debit</th>
+            <th className="py-1 text-right">Credit</th>
+          </tr>
+        </thead>
+        <tbody>
+          {journalEntry.lines.map((line) => (
+            <tr key={line.id} className="border-b last:border-b-0">
+              <td className="py-1 pr-2">{line.account_id}</td>
+              <td className="py-1 pr-2">{line.description ?? ""}</td>
+              <td className="py-1 pr-2 text-right">{formatMoney(line.debit_amount, currency)}</td>
+              <td className="py-1 text-right">{formatMoney(line.credit_amount, currency)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
