@@ -1050,12 +1050,27 @@ def test_commit_applies_account_and_tax_code(client, accounts, biz_bank):
     assert Decimal(txn["gst_amount"]) == Decimal("136.36")
 
 
+def test_default_bank_account_maps_to_operating_cash_ledger(client, biz_bank):
+    accounts = client.get("/api/v1/accounts", headers=HEAD).json()
+    ledger = next(account for account in accounts if account["code"] == "1000")
+    assert ledger["active"] is True
+    assert ledger["type"] == "ASSET"
+    assert ledger["is_gst"] is False
+    assert biz_bank["ledger_account_id"] == ledger["id"]
+
+
 def test_create_bank_account_happy_path_and_list(client):
+    ledger = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1010", "name": "Savings cash", "type": "ASSET"},
+    ).json()
     r = client.post(
         "/api/v1/bank-accounts",
         headers=HEAD,
         json={
             "name": "NAB savings",
+            "ledger_account_id": ledger["id"],
             "opening_balance": "20000.00",
             "bsb": "082-001",
             "account_number": "123456789",
@@ -1065,18 +1080,123 @@ def test_create_bank_account_happy_path_and_list(client):
     created = r.json()
     assert created["name"] == "NAB savings"
     assert Decimal(created["opening_balance"]) == Decimal("20000.00")
+    assert created["ledger_account_id"] == ledger["id"]
 
     listed = client.get("/api/v1/bank-accounts", headers=HEAD).json()
     assert any(a["id"] == created["id"] for a in listed)
 
 
 def test_create_bank_account_duplicate_name_returns_409(client):
-    payload = {"name": "ANZ receivables"}
+    ledger = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1010", "name": "Savings cash", "type": "ASSET"},
+    ).json()
+    payload = {"name": "ANZ receivables", "ledger_account_id": ledger["id"]}
     first = client.post("/api/v1/bank-accounts", headers=HEAD, json=payload)
     assert first.status_code == 201, first.text
 
     duplicate = client.post("/api/v1/bank-accounts", headers=HEAD, json=payload)
     assert duplicate.status_code == 409, duplicate.text
+
+
+def test_bank_account_requires_a_valid_unique_ledger_mapping(client, biz_bank):
+    missing = client.post(
+        "/api/v1/bank-accounts", headers=HEAD, json={"name": "Missing mapping"}
+    )
+    assert missing.status_code == 422
+
+    accounts = {
+        account["code"]: account
+        for account in client.get("/api/v1/accounts", headers=HEAD).json()
+    }
+    invalid = client.post(
+        "/api/v1/bank-accounts",
+        headers=HEAD,
+        json={"name": "Protected mapping", "ledger_account_id": accounts["1100"]["id"]},
+    )
+    assert invalid.status_code == 400
+
+    reused = client.post(
+        "/api/v1/bank-accounts",
+        headers=HEAD,
+        json={
+            "name": "Reused mapping",
+            "ledger_account_id": biz_bank["ledger_account_id"],
+        },
+    )
+    assert reused.status_code == 409
+
+
+def test_bank_account_rejects_inactive_non_asset_and_gst_ledgers(client):
+    inactive = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1010", "name": "Inactive cash", "type": "ASSET"},
+    ).json()
+    client.patch(
+        f"/api/v1/accounts/{inactive['id']}",
+        headers=HEAD,
+        json={"active": False},
+    )
+    expense = next(
+        account
+        for account in client.get("/api/v1/accounts", headers=HEAD).json()
+        if account["code"] == "6100"
+    )
+    gst = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={
+            "code": "1020",
+            "name": "GST cash",
+            "type": "ASSET",
+            "is_gst": True,
+        },
+    ).json()
+
+    for name, ledger_id in (
+        ("Inactive mapping", inactive["id"]),
+        ("Non-asset mapping", expense["id"]),
+        ("GST mapping", gst["id"]),
+        ("Missing ledger", 999999),
+    ):
+        response = client.post(
+            "/api/v1/bank-accounts",
+            headers=HEAD,
+            json={"name": name, "ledger_account_id": ledger_id},
+        )
+        assert response.status_code == 400, (name, response.text)
+
+
+def test_legacy_unresolved_bank_can_be_assigned_but_not_cleared(client, biz_bank):
+    from app.db.company import company_session
+    from app.models.company import BankAccount
+
+    ledger = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1010", "name": "Savings cash", "type": "ASSET"},
+    ).json()
+    with company_session("tc") as db:
+        bank = db.get(BankAccount, biz_bank["id"])
+        bank.ledger_account_id = None
+        db.commit()
+
+    assigned = client.patch(
+        f"/api/v1/bank-accounts/{biz_bank['id']}",
+        headers=HEAD,
+        json={"ledger_account_id": ledger["id"]},
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["ledger_account_id"] == ledger["id"]
+
+    cleared = client.patch(
+        f"/api/v1/bank-accounts/{biz_bank['id']}",
+        headers=HEAD,
+        json={"ledger_account_id": None},
+    )
+    assert cleared.status_code == 422
 
 
 def test_patch_bank_account_renames_and_updates_details(client, biz_bank):

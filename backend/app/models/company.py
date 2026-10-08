@@ -504,6 +504,9 @@ class BankAccount(CompanyBase):
     bsb: Mapped[str | None] = mapped_column(String(20))
     account_number: Mapped[str | None] = mapped_column(String(50))
     opening_balance: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal("0"))
+    ledger_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT"), unique=True
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     notes: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(

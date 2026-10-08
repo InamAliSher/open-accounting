@@ -121,6 +121,7 @@ def create_bank_account(
             bsb=payload.bsb,
             account_number=payload.account_number,
             is_active=payload.is_active,
+            ledger_account_id=payload.ledger_account_id,
         )
     except bank_accounts_svc.BankTxnError as e:
         raise _map_bank_error(e)

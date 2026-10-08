@@ -440,6 +440,7 @@ export interface BankAccount {
   bsb: string | null;
   account_number: string | null;
   opening_balance: string;
+  ledger_account_id: number | null;
   is_active: boolean;
   notes: string | null;
   created_at: string;
