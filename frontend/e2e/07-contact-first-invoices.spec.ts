@@ -156,10 +156,14 @@ test("Supplier Bills keeps manual, PDF, and Excel/CSV entry AP-only", async ({
 }) => {
   await ensureCompanyById(request, COMPANY_ID, "Fictional Contact-First Pty Ltd");
   const supplierName = `Fictional Supplier Bills ${Date.now()}`;
-  const supplier = await createContact(request, supplierName, "supplier");
-  const accounts = await getJson<Array<{ id: number; code: string }>>(request, "/accounts");
+  const accounts = await getJson<Array<{ id: number; code: string; name: string }>>(request, "/accounts");
   const expense = accounts.find((account) => account.code === "6100");
+  const gstPaid = accounts.find((account) => account.code === "1200");
+  const payable = accounts.find((account) => account.code === "2000");
   expect(expense).toBeTruthy();
+  expect(gstPaid).toBeTruthy();
+  expect(payable).toBeTruthy();
+  const invoiceNumber = `FICTIONAL-SUPPLIER-MANUAL-${Date.now()}`;
 
   await page.goto("/supplier-bills");
   const apListRequest = page.waitForRequest((observed) =>
@@ -179,7 +183,7 @@ test("Supplier Bills keeps manual, PDF, and Excel/CSV entry AP-only", async ({
   await expect(manualDialog.getByLabel("Search supplier contacts")).toBeVisible();
   await expect(manualDialog.getByLabel("Search customer contacts")).toHaveCount(0);
   await expect(manualDialog.getByRole("button", { name: /^(AP|AR) ·/ })).toHaveCount(0);
-  await manualDialog.getByLabel("Invoice #").fill(`FICTIONAL-SUPPLIER-MANUAL-${Date.now()}`);
+  await manualDialog.getByLabel("Invoice #").fill(invoiceNumber);
   await manualDialog.getByLabel(/Issue date/).fill("01/08/2026");
   await manualDialog.getByLabel("Description").first().fill("Fictional supplier bill");
   await manualDialog.getByLabel("Qty").first().fill("1");
@@ -189,15 +193,126 @@ test("Supplier Bills keeps manual, PDF, and Excel/CSV entry AP-only", async ({
   const saveDraft = manualDialog.getByRole("button", { name: "Save Draft" });
   await expect(saveDraft).toBeDisabled();
   const contactSearch = manualDialog.getByLabel("Search supplier contacts");
-  await contactSearch.fill(supplierName);
-  await manualDialog.getByRole("option", { name: `Select ${supplierName}` }).click();
+  await manualDialog.getByRole("button", { name: "+ New supplier" }).click();
+  const newSupplierDialog = page.getByRole("dialog", { name: "New supplier" });
+  await newSupplierDialog.getByLabel("Name").fill(supplierName);
+  await newSupplierDialog.getByLabel("ABN").fill("99 123 456 789");
+  const createSupplierResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/v1/contacts") && response.request().method() === "POST",
+  );
+  await newSupplierDialog.getByRole("button", { name: "Create supplier" }).click();
+  const supplier = (await (await createSupplierResponse).json()) as ContactRecord;
+  expect(supplier.kind).toBe("supplier");
+  await expect(manualDialog.getByLabel("Selected accounting contact")).toContainText(supplierName);
   const manualRequest = page.waitForRequest((observed) =>
     observed.method() === "POST" && observed.url().includes("/api/v1/invoices"),
+  );
+  const manualResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/v1/invoices") && response.request().method() === "POST",
   );
   await saveDraft.click();
   const manualPayload = (await manualRequest).postDataJSON() as Record<string, unknown>;
   expect(manualPayload.direction).toBe("AP");
   expect(manualPayload.contact_id).toBe(supplier.id);
+  const draft = (await (await manualResponse).json()) as {
+    id: number;
+    direction: string;
+    contact_id: number;
+    status: string;
+    paid_amount: string;
+  };
+  expect(draft).toMatchObject({
+    direction: "AP",
+    contact_id: supplier.id,
+    status: "draft",
+    paid_amount: "0.00",
+  });
+
+  await openInvoice(page, invoiceNumber);
+  const authoriseResponse = page.waitForResponse((response) =>
+    response.url().includes(`/api/v1/invoices/${draft.id}/post`) &&
+    response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Authorise (post to ledger)" }).click();
+  const authorised = (await (await authoriseResponse).json()) as {
+    invoice: { direction: string; contact_id: number; status: string; paid_amount: string };
+    journal_entry: { id: number; source_type: string; source_id: number };
+  };
+  expect(authorised.invoice).toMatchObject({
+    direction: "AP",
+    contact_id: supplier.id,
+    status: "authorised",
+    paid_amount: "0.00",
+  });
+  expect(authorised.journal_entry).toMatchObject({
+    source_type: "invoice_ap",
+    source_id: draft.id,
+  });
+  const accountCodeById = new Map(accounts.map((account) => [account.id, account.code]));
+  const journalAmounts = (journal: { lines: Array<{ account_id: number; debit_amount: string; credit_amount: string }> }) =>
+    (code: string, side: "debit_amount" | "credit_amount") =>
+      journal.lines
+        .filter((line) => accountCodeById.get(line.account_id) === code)
+        .reduce((sum, line) => sum + moneyToCents(line[side]), 0n);
+  const billJournal = await getJson<{
+    source_type: string;
+    source_id: number;
+    lines: Array<{ account_id: number; debit_amount: string; credit_amount: string }>;
+  }>(request, `/journal/${authorised.journal_entry.id}`);
+  expect(billJournal).toMatchObject({ source_type: "invoice_ap", source_id: draft.id });
+  const billAmount = journalAmounts(billJournal);
+  expect(billAmount("6100", "debit_amount")).toBe(5000n);
+  expect(billAmount("1200", "debit_amount")).toBe(500n);
+  expect(billAmount("2000", "credit_amount")).toBe(5500n);
+
+  await openInvoice(page, invoiceNumber);
+  const sourceSection = page.getByRole("region", { name: "Credit notes for source invoice" });
+  await sourceSection.getByRole("button", { name: "Create credit note" }).click();
+  const creditDraftDialog = page.getByRole("heading", { name: "Create draft credit note" }).locator("../..");
+  await creditDraftDialog.getByLabel("Credit-note number").fill(`FICTIONAL-SUPPLIER-CREDIT-${Date.now()}`);
+  await creditDraftDialog.getByLabel("Issue date").fill("2026-08-15");
+  await creditDraftDialog.getByLabel(/Credited quantity/).fill("1");
+  const creditCreateResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/v1/credit-notes") && response.request().method() === "POST",
+  );
+  await creditDraftDialog.getByRole("button", { name: "Create draft" }).click();
+  const creditNote = (await (await creditCreateResponse).json()) as { id: number; total: string };
+  expect(creditNote.total).toBe("55.00");
+  await creditDraftDialog.getByRole("button", { name: "Close" }).click();
+  const creditRow = sourceSection.getByRole("row").filter({ hasText: "FICTIONAL-SUPPLIER-CREDIT-" });
+  await creditRow.getByRole("button", { name: "View/Edit" }).click();
+  const creditEditDialog = page.getByRole("heading", { name: "Edit draft credit note" }).locator("../..");
+  await creditEditDialog.getByRole("button", { name: "Authorise" }).click();
+  const creditConfirmation = page.getByRole("heading", { name: "Authorise this credit note?" }).locator("..");
+  const creditPostResponse = page.waitForResponse((response) =>
+    response.url().includes(`/api/v1/credit-notes/${creditNote.id}/post`) &&
+    response.request().method() === "POST",
+  );
+  await creditConfirmation.getByRole("button", { name: "Authorise credit note" }).click();
+  expect((await creditPostResponse).ok()).toBeTruthy();
+  const creditJournalsResponse = await request.get(`${BACKEND_URL}/api/v1/journal`, {
+    headers: companyHeaders(COMPANY_ID),
+    params: { source_type: "credit_note_ap" },
+  });
+  expect(creditJournalsResponse.ok()).toBeTruthy();
+  const creditJournals = (await creditJournalsResponse.json()) as Array<{
+    id: number;
+    source_id: number | null;
+    lines: Array<{ account_id: number; debit_amount: string; credit_amount: string }>;
+  }>;
+  const creditJournal = creditJournals.find((entry) => entry.source_id === creditNote.id);
+  expect(creditJournal).toBeTruthy();
+  const creditAmount = journalAmounts(creditJournal!);
+  expect(creditAmount("2000", "debit_amount")).toBe(5500n);
+  expect(creditAmount("6100", "credit_amount")).toBe(5000n);
+  expect(creditAmount("1200", "credit_amount")).toBe(500n);
+  const authorisedCreditDialog = page.getByRole("heading", { name: "View authorised credit note" }).locator("../..");
+  await expect(authorisedCreditDialog.getByText("Status authorised", { exact: true })).toBeVisible();
+  await authorisedCreditDialog.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("heading", { name: new RegExp(invoiceNumber) })
+    .locator("xpath=ancestor::div[contains(@class,'w-[640px]')]")
+    .getByRole("button", { name: "×" })
+    .click();
 
   await page.getByRole("button", { name: "Attach PDF", exact: true }).click();
   const pdfDialog = page.getByRole("heading", { name: "Attach PDF invoice" }).locator("../..");
