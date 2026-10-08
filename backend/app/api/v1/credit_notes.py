@@ -21,6 +21,7 @@ from ...schemas.credit_note import (
     CreditNoteRefundReverse,
     CreditNoteSourceOut,
     CreditNoteUpdate,
+    CreditNoteVoid,
 )
 from ...services import credit_notes as credit_note_service
 from ...services import doc_numbering
@@ -186,6 +187,34 @@ def post_credit_note(
     except JournalError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        _raise_integrity_conflict(db, exc)
+
+
+@router.post("/{credit_note_id}/void", response_model=CreditNoteOut)
+def void_credit_note(
+    credit_note_id: PathId,
+    payload: CreditNoteVoid,
+    company: Company = Depends(get_current_company),
+    db: Session = Depends(get_company_db),
+):
+    doc_numbering._begin_sqlite_immediate(db)
+    try:
+        credit_note_service.void_credit_note(
+            db,
+            credit_note_id,
+            payload,
+            company=company,
+        )
+        note = credit_note_service.get_credit_note(db, credit_note_id)
+        db.commit()
+        return _with_source_contact_snapshot(db, credit_note_service.credit_note_output(note))
+    except credit_note_service.CreditNoteError as exc:
+        db.rollback()
+        _raise_domain_error(exc)
+    except AccountingPeriodLockedError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except IntegrityError as exc:
         _raise_integrity_conflict(db, exc)
 

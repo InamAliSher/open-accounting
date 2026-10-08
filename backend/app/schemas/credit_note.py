@@ -167,6 +167,12 @@ class CreditNoteRefundReverse(BaseModel):
     reversal_date: date
 
 
+class CreditNoteVoid(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    void_date: date
+
+
 class CreditNoteRefundOut(BaseModel):
     id: int
     credit_note_id: int

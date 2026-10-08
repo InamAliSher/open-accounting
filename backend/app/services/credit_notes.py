@@ -41,6 +41,7 @@ from ..schemas.credit_note import (
     CreditNoteRefundCreate,
     CreditNoteRefundReverse,
     CreditNoteUpdate,
+    CreditNoteVoid,
 )
 from . import invoice_posting
 from .invoice_math import GstMathError, check_gst_math, check_invoice_lines
@@ -100,6 +101,10 @@ class CreditNoteRefundNotFound(CreditNoteError):
 
 
 class CreditNoteRefundConflict(CreditNoteError):
+    http_status = 409
+
+
+class CreditNoteVoidConflict(CreditNoteError):
     http_status = 409
 
 
@@ -625,6 +630,109 @@ def _control_account(session: Session, code: str, expected_type: AccountType) ->
             f"Control account {code} must have type {expected_type.value}."
         )
     return account
+
+
+def void_credit_note(
+    session: Session,
+    credit_note_id: int,
+    payload: CreditNoteVoid,
+    *,
+    company,
+) -> JournalEntry:
+    note = get_credit_note(session, credit_note_id)
+    if _value(note.status) == CreditNoteStatus.DRAFT.value:
+        raise CreditNoteVoidConflict("Only an authorised credit note may be voided.")
+    if _value(note.status) == CreditNoteStatus.VOID.value:
+        raise CreditNoteVoidConflict("Credit note is already void.")
+
+    require_open_date(company, payload.void_date, operation="void a credit note")
+
+    active_applications = (
+        session.query(CreditNoteApplication)
+        .filter(
+            CreditNoteApplication.credit_note_id == credit_note_id,
+            CreditNoteApplication.status == CreditNoteApplicationStatus.ACTIVE,
+        )
+        .first()
+    )
+    if active_applications is not None:
+        raise CreditNoteVoidConflict("Credit note has an active credit application.")
+
+    active_refunds = (
+        session.query(CreditNoteRefund)
+        .filter(
+            CreditNoteRefund.credit_note_id == credit_note_id,
+            CreditNoteRefund.status == CreditNoteRefundStatus.ACTIVE,
+        )
+        .first()
+    )
+    if active_refunds is not None:
+        raise CreditNoteVoidConflict("Credit note has an active refund.")
+
+    source_type = (
+        JournalEntrySource.CREDIT_NOTE_AR
+        if _value(note.direction) == "AR"
+        else JournalEntrySource.CREDIT_NOTE_AP
+    )
+    original = (
+        session.query(JournalEntry)
+        .options(joinedload(JournalEntry.lines))
+        .filter(
+            JournalEntry.source_type == source_type,
+            JournalEntry.source_id == credit_note_id,
+        )
+        .one_or_none()
+    )
+    if original is None:
+        raise CreditNoteVoidConflict("Original credit-note posting journal was not found.")
+
+    reversal = (
+        session.query(JournalEntry)
+        .filter(JournalEntry.reverses_entry_id == original.id)
+        .first()
+    )
+    if reversal is not None:
+        raise CreditNoteVoidConflict("Credit note is already voided by journal entry.")
+
+    reversal_source_type = (
+        JournalEntrySource.CREDIT_NOTE_VOID_AR
+        if _value(note.direction) == "AR"
+        else JournalEntrySource.CREDIT_NOTE_VOID_AP
+    )
+    lines = [
+        JournalLineCreate(
+            account_id=line.account_id,
+            debit_amount=line.credit_amount or Decimal("0"),
+            credit_amount=line.debit_amount or Decimal("0"),
+            description=line.description,
+        )
+        for line in original.lines
+    ]
+    _validate_lines(session, lines)
+
+    entry = JournalEntry(
+        entry_date=payload.void_date,
+        memo=f"Void credit note {note.credit_note_number}",
+        reference=note.credit_note_number,
+        source_type=reversal_source_type,
+        source_id=note.id,
+        reverses_entry_id=original.id,
+    )
+    for line in lines:
+        entry.lines.append(
+            JournalLine(
+                account_id=line.account_id,
+                debit_amount=line.debit_amount or Decimal("0"),
+                credit_amount=line.credit_amount or Decimal("0"),
+                description=line.description,
+            )
+        )
+    session.add(entry)
+    session.flush()
+
+    note.status = CreditNoteStatus.VOID
+    session.flush()
+    return entry
 
 
 def post_credit_note(

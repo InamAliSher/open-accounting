@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
@@ -869,6 +870,293 @@ def test_locked_period_and_failed_post_leave_note_draft_without_journal(client, 
         assert db.query(JournalEntry).filter_by(
             source_type="credit_note_ar", source_id=note["id"]
         ).count() == 0
+
+
+def _posted_credit_note(client, accounts, *, direction, number, account_code, tax_code="standard"):
+    source = _create_source(
+        client,
+        accounts,
+        number=f"{number}-SOURCE",
+        direction=direction,
+        contact_name=f"Fictional {direction} Void Contact",
+        lines=[_source_line(accounts, account_code=account_code, tax_code=tax_code)],
+    )
+    note = _create_credit_note(
+        client,
+        source,
+        number=number,
+        lines=[
+            {
+                "source_invoice_line_id": source["lines"][0]["source_invoice_line_id"],
+                "quantity": "1.0000",
+            }
+        ],
+    )
+    assert note.status_code == 201, note.text
+    posted = client.post(f"/api/v1/credit-notes/{note.json()['id']}/post", headers=HEAD)
+    assert posted.status_code == 200, posted.text
+    return note.json(), source
+
+
+def _journal_snapshot(client, note_id, source_type):
+    entries = _journal_entries(client)
+    return [entry for entry in entries if entry["source_type"] == source_type and entry["source_id"] == note_id]
+
+
+def test_void_ar_and_ap_reverse_original_journals_and_gst_controls(client, accounts):
+    ar_note, ar_source = _posted_credit_note(
+        client, accounts, direction="AR", number="VOID-AR", account_code="4000"
+    )
+    ap_note, ap_source = _posted_credit_note(
+        client, accounts, direction="AP", number="VOID-AP", account_code="6100"
+    )
+
+    ar_original = _journal_snapshot(client, ar_note["id"], "credit_note_ar")[0]
+    ap_original = _journal_snapshot(client, ap_note["id"], "credit_note_ap")[0]
+    assert ar_original["entry_date"] == "2026-06-01"
+    assert ap_original["entry_date"] == "2026-06-01"
+    original_ar_lines = {line["account_id"]: line for line in ar_original["lines"]}
+    original_ap_lines = {line["account_id"]: line for line in ap_original["lines"]}
+
+    ar_response = client.post(
+        f"/api/v1/credit-notes/{ar_note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-15"},
+    )
+    assert ar_response.status_code == 200, ar_response.text
+    ar_reversal = _journal_snapshot(client, ar_note["id"], "credit_note_void_ar")[0]
+    assert ar_reversal["entry_date"] == "2026-07-15"
+    assert ar_reversal["reverses_entry_id"] == ar_original["id"]
+    assert ar_reversal["source_id"] == ar_note["id"]
+    assert [
+        {
+            "account_id": line["account_id"],
+            "debit_amount": line["debit_amount"],
+            "credit_amount": line["credit_amount"],
+            "description": line["description"],
+        }
+        for line in ar_reversal["lines"]
+    ] == [
+        {
+            "account_id": line["account_id"],
+            "debit_amount": line["credit_amount"],
+            "credit_amount": line["debit_amount"],
+            "description": line["description"],
+        }
+        for line in ar_original["lines"]
+    ]
+    assert ar_response.json()["status"] == "void"
+    assert ar_response.json()["updated_at"]
+    assert client.get(f"/api/v1/credit-notes/{ar_note['id']}", headers=HEAD).json()["status"] == "void"
+    assert client.get(f"/api/v1/credit-notes/source-invoices/{ar_source['id']}", headers=HEAD).json()["lines"][0]["remaining_creditable_quantity"] == "2.0000"
+    assert ar_original["lines"] == list(original_ar_lines.values())
+
+    ap_response = client.post(
+        f"/api/v1/credit-notes/{ap_note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-16"},
+    )
+    assert ap_response.status_code == 200, ap_response.text
+    ap_reversal = _journal_snapshot(client, ap_note["id"], "credit_note_void_ap")[0]
+    assert ap_reversal["entry_date"] == "2026-07-16"
+    assert ap_reversal["reverses_entry_id"] == ap_original["id"]
+    assert ap_reversal["source_id"] == ap_note["id"]
+    assert [
+        {
+            "account_id": line["account_id"],
+            "debit_amount": line["debit_amount"],
+            "credit_amount": line["credit_amount"],
+            "description": line["description"],
+        }
+        for line in ap_reversal["lines"]
+    ] == [
+        {
+            "account_id": line["account_id"],
+            "debit_amount": line["credit_amount"],
+            "credit_amount": line["debit_amount"],
+            "description": line["description"],
+        }
+        for line in ap_original["lines"]
+    ]
+    assert ap_response.json()["status"] == "void"
+    assert ap_original["lines"] == list(original_ap_lines.values())
+    assert client.get(f"/api/v1/credit-notes/source-invoices/{ap_source['id']}", headers=HEAD).json()["lines"][0]["remaining_creditable_quantity"] == "2.0000"
+
+
+def test_void_rejects_active_application_and_refund_but_allows_reversed_history(client, accounts):
+    source = _create_source(client, accounts, number="VOID-HISTORY-SOURCE")
+    note = _create_credit_note(client, source, number="VOID-HISTORY").json()
+    posted = client.post(f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD)
+    assert posted.status_code == 200, posted.text
+    application = client.post(
+        f"/api/v1/credit-notes/{note['id']}/applications",
+        headers={**HEAD, "Idempotency-Key": "void-active-application"},
+        json={"invoice_id": source["id"], "amount": "100.00", "application_date": "2026-06-30"},
+    )
+    assert application.status_code == 201, application.text
+    assert client.post(
+        f"/api/v1/credit-notes/{note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-01"},
+    ).status_code == 409
+
+    reversed_application = client.post(
+        f"/api/v1/credit-note-applications/{application.json()['id']}/reverse",
+        headers=HEAD,
+        json={"reversal_date": "2026-07-01"},
+    )
+    assert reversed_application.status_code == 200, reversed_application.text
+    assert client.post(
+        f"/api/v1/credit-notes/{note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-02"},
+    ).status_code == 200
+
+    refund_source = _create_source(client, accounts, number="VOID-REFUND-SOURCE")
+    refund_note = _create_credit_note(client, refund_source, number="VOID-REFUND").json()
+    assert client.post(f"/api/v1/credit-notes/{refund_note['id']}/post", headers=HEAD).status_code == 200
+    bank_account_id = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0]["id"]
+    refund = client.post(
+        f"/api/v1/credit-notes/{refund_note['id']}/refunds",
+        headers={**HEAD, "Idempotency-Key": "void-active-refund"},
+        json={
+            "bank_account_id": bank_account_id,
+            "amount": "100.00",
+            "refund_date": "2026-06-30",
+        },
+    )
+    assert refund.status_code == 201, refund.text
+    assert client.post(
+        f"/api/v1/credit-notes/{refund_note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-01"},
+    ).status_code == 409
+    reversed_refund = client.post(
+        f"/api/v1/credit-notes/{refund_note['id']}/refunds/{refund.json()['id']}/reverse",
+        headers=HEAD,
+        json={"reversal_date": "2026-07-01"},
+    )
+    assert reversed_refund.status_code == 200, reversed_refund.text
+    assert client.post(
+        f"/api/v1/credit-notes/{refund_note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-02"},
+    ).status_code == 200
+
+
+def test_void_rejects_draft_duplicate_locked_date_and_missing_payload(client, accounts):
+    source = _create_source(client, accounts, number="VOID-STATE-SOURCE")
+    note = _create_credit_note(client, source, number="VOID-STATE").json()
+    assert client.post(
+        f"/api/v1/credit-notes/{note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-01"},
+    ).status_code == 409
+    assert client.post(
+        f"/api/v1/credit-notes/{note['id']}/void",
+        headers=HEAD,
+        json={},
+    ).status_code == 422
+
+    posted_note = _posted_credit_note(
+        client, accounts, direction="AR", number="VOID-DUPLICATE", account_code="4000"
+    )[0]
+    first = client.post(
+        f"/api/v1/credit-notes/{posted_note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-01"},
+    )
+    assert first.status_code == 200, first.text
+    assert client.post(
+        f"/api/v1/credit-notes/{posted_note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-02"},
+    ).status_code == 409
+
+    locked_source = _create_source(client, accounts, number="VOID-LOCK-SOURCE")
+    locked_note = _create_credit_note(client, locked_source, number="VOID-LOCK").json()
+    assert client.post(f"/api/v1/credit-notes/{locked_note['id']}/post", headers=HEAD).status_code == 200
+    locked = client.patch(
+        "/api/v1/companies/tc", headers=HEAD, json={"books_locked_through": "2026-07-01"}
+    )
+    assert locked.status_code == 200, locked.text
+    blocked = client.post(
+        f"/api/v1/credit-notes/{locked_note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-01"},
+    )
+    assert blocked.status_code == 409
+    assert "locked" in blocked.json()["detail"].lower()
+
+
+def test_concurrent_void_requests_create_one_reversal(client, accounts):
+    note, _ = _posted_credit_note(
+        client, accounts, direction="AR", number="VOID-CONCURRENT", account_code="4000"
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(
+            lambda _: client.post(
+                f"/api/v1/credit-notes/{note['id']}/void",
+                headers=HEAD,
+                json={"void_date": "2026-07-20"},
+            ),
+            range(2),
+        ))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    reversals = _journal_snapshot(client, note["id"], "credit_note_void_ar")
+    assert len(reversals) == 1
+    assert reversals[0]["entry_date"] == "2026-07-20"
+    assert reversals[0]["reverses_entry_id"] is not None
+
+
+def test_void_releases_source_quantity_and_excludes_open_credit_report(client, accounts):
+    source = _create_source(client, accounts, number="VOID-REPORT-SOURCE")
+    note = _create_credit_note(client, source, number="VOID-REPORT").json()
+    assert client.post(f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD).status_code == 200
+    before = client.get(
+        "/api/v1/reports/trial-balance",
+        headers=HEAD,
+        params={"as_of": "2026-06-30"},
+    )
+    assert before.status_code == 200, before.text
+    assert Decimal(before.json()["supplementary"]["ar_open_credit_total"]) == Decimal("110.00")
+    assert client.post(
+        f"/api/v1/credit-notes/{note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-01"},
+    ).status_code == 200
+    after = client.get(
+        "/api/v1/reports/trial-balance",
+        headers=HEAD,
+        params={"as_of": "2026-07-31"},
+    )
+    assert after.status_code == 200, after.text
+    assert Decimal(after.json()["supplementary"]["ar_open_credit_total"]) == Decimal("0.00")
+    source_after = client.get(
+        f"/api/v1/credit-notes/source-invoices/{source['id']}", headers=HEAD
+    ).json()
+    assert source_after["lines"][0]["remaining_creditable_quantity"] == "2.0000"
+
+
+def test_void_journal_provenance_preserves_original(client, accounts):
+    note, _ = _posted_credit_note(
+        client, accounts, direction="AR", number="VOID-PROVENANCE", account_code="4000"
+    )
+    original = _journal_snapshot(client, note["id"], "credit_note_ar")[0]
+    original_lines = [dict(line) for line in original["lines"]]
+    original_date = original["entry_date"]
+    assert client.post(
+        f"/api/v1/credit-notes/{note['id']}/void",
+        headers=HEAD,
+        json={"void_date": "2026-07-01"},
+    ).status_code == 200
+    original_after = _journal_snapshot(client, note["id"], "credit_note_ar")[0]
+    assert original_after["entry_date"] == original_date
+    assert original_after["lines"] == original_lines
+    reversal = _journal_snapshot(client, note["id"], "credit_note_void_ar")[0]
+    assert reversal["source_type"] == "credit_note_void_ar"
+    assert reversal["source_id"] == note["id"]
+    assert reversal["reverses_entry_id"] == original["id"]
 
 
 def test_post_rechecks_settlement_added_after_draft_creation(client, accounts):
