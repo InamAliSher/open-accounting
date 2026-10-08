@@ -122,8 +122,10 @@ class CreditNoteOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     applied_amount: Money
+    refunded_amount: Money
     remaining_amount: Money
     applications: list[CreditNoteApplicationOut]
+    refunds: list[CreditNoteRefundOut]
     lines: list[CreditNoteLineOut]
 
 
@@ -144,6 +146,40 @@ class CreditNoteApplicationReverse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reversal_date: date
+
+
+class CreditNoteRefundCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    amount: Decimal = Field(
+        gt=0,
+        le=Decimal("999999.9999"),
+        max_digits=16,
+        decimal_places=2,
+    )
+    refund_date: date
+
+
+class CreditNoteRefundReverse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reversal_date: date
+
+
+class CreditNoteRefundOut(BaseModel):
+    id: int
+    credit_note_id: int
+    bank_transaction_id: int
+    journal_entry_id: int
+    amount: Money
+    refund_date: date
+    status: str
+    reversed_at: datetime | None
+    reversal_date: date | None
+    reversal_bank_transaction_id: int | None
+    reversal_journal_entry_id: int | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class CreditNoteSourceLineOut(BaseModel):

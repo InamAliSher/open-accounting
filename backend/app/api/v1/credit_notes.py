@@ -16,6 +16,9 @@ from ...schemas.credit_note import (
     CreditNoteApplicationReverse,
     CreditNoteCreate,
     CreditNoteOut,
+    CreditNoteRefundCreate,
+    CreditNoteRefundOut,
+    CreditNoteRefundReverse,
     CreditNoteSourceOut,
     CreditNoteUpdate,
 )
@@ -218,6 +221,80 @@ def apply_credit_note(
     except credit_note_service.CreditNoteError as exc:
         db.rollback()
         _raise_domain_error(exc)
+    except AccountingPeriodLockedError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        _raise_integrity_conflict(db, exc)
+
+
+@router.post(
+    "/{credit_note_id}/refunds",
+    response_model=CreditNoteRefundOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_credit_note_refund(
+    credit_note_id: PathId,
+    payload: CreditNoteRefundCreate,
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    ),
+    company: Company = Depends(get_current_company),
+    db: Session = Depends(get_company_db),
+):
+    doc_numbering._begin_sqlite_immediate(db)
+    try:
+        refund = credit_note_service.create_credit_note_refund(
+            db,
+            credit_note_id,
+            payload,
+            company=company,
+            idempotency_key=idempotency_key,
+        )
+        db.commit()
+        return credit_note_service.credit_note_refund_output(refund)
+    except credit_note_service.CreditNoteError as exc:
+        db.rollback()
+        _raise_domain_error(exc)
+    except AccountingPeriodLockedError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        _raise_integrity_conflict(db, exc)
+
+
+@router.post(
+    "/{credit_note_id}/refunds/{credit_note_refund_id}/reverse",
+    response_model=CreditNoteRefundOut,
+)
+def reverse_credit_note_refund(
+    credit_note_id: PathId,
+    credit_note_refund_id: PathId,
+    payload: CreditNoteRefundReverse,
+    company: Company = Depends(get_current_company),
+    db: Session = Depends(get_company_db),
+):
+    doc_numbering._begin_sqlite_immediate(db)
+    try:
+        refund = credit_note_service.reverse_credit_note_refund(
+            db,
+            credit_note_id,
+            credit_note_refund_id,
+            payload,
+            company=company,
+        )
+        db.commit()
+        return credit_note_service.credit_note_refund_output(refund)
+    except credit_note_service.CreditNoteError as exc:
+        db.rollback()
+        _raise_domain_error(exc)
+    except AccountingPeriodLockedError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except IntegrityError as exc:
         _raise_integrity_conflict(db, exc)
 

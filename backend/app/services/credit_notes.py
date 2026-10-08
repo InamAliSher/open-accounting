@@ -11,12 +11,18 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from ..models.company import (
     Account,
     AccountType,
+    BankAccount,
+    BankTransaction,
+    BankTxnDirection,
     CreditNote,
     CreditNoteApplication,
     CreditNoteApplicationIdempotencyKey,
     CreditNoteApplicationReversal,
     CreditNoteApplicationStatus,
     CreditNoteLine,
+    CreditNoteRefund,
+    CreditNoteRefundIdempotencyKey,
+    CreditNoteRefundStatus,
     CreditNoteStatus,
     Invoice,
     InvoiceDirection,
@@ -29,10 +35,17 @@ from ..models.company import (
 )
 from ..schemas.journal import JournalLineCreate
 from ..schemas._limits import SQLITE_EXACT_MONEY_MAX
-from ..schemas.credit_note import CreditNoteCreate, CreditNoteLineDraftIn, CreditNoteUpdate
+from ..schemas.credit_note import (
+    CreditNoteCreate,
+    CreditNoteLineDraftIn,
+    CreditNoteRefundCreate,
+    CreditNoteRefundReverse,
+    CreditNoteUpdate,
+)
 from . import invoice_posting
 from .invoice_math import GstMathError, check_gst_math, check_invoice_lines
 from .journal import _validate_lines
+from .period_lock import require_open_date
 
 
 CENT = Decimal("0.01")
@@ -79,6 +92,14 @@ class CreditNoteApplicationNotFound(CreditNoteError):
 
 
 class CreditNoteApplicationConflict(CreditNoteError):
+    http_status = 409
+
+
+class CreditNoteRefundNotFound(CreditNoteError):
+    http_status = 404
+
+
+class CreditNoteRefundConflict(CreditNoteError):
     http_status = 409
 
 
@@ -398,6 +419,7 @@ def get_credit_note(session: Session, credit_note_id: int) -> CreditNote:
             selectinload(CreditNote.applications).selectinload(
                 CreditNoteApplication.reversal
             ),
+            selectinload(CreditNote.refunds),
         )
         .filter(CreditNote.id == credit_note_id)
         .one_or_none()
@@ -420,6 +442,7 @@ def list_credit_notes(
         selectinload(CreditNote.applications).selectinload(
             CreditNoteApplication.reversal
         ),
+        selectinload(CreditNote.refunds),
     )
     if direction is not None:
         query = query.filter(CreditNote.direction == direction)
@@ -438,6 +461,14 @@ def credit_note_output(note: CreditNote) -> dict:
             application.amount
             for application in note.applications
             if application.status == CreditNoteApplicationStatus.ACTIVE
+        ),
+        Decimal("0"),
+    )
+    refunded_amount = sum(
+        (
+            refund.amount
+            for refund in note.refunds
+            if refund.status == CreditNoteRefundStatus.ACTIVE
         ),
         Decimal("0"),
     )
@@ -460,8 +491,10 @@ def credit_note_output(note: CreditNote) -> dict:
         "created_at": note.created_at,
         "updated_at": note.updated_at,
         "applied_amount": applied_amount,
-        "remaining_amount": Decimal(note.total) - applied_amount,
+        "refunded_amount": refunded_amount,
+        "remaining_amount": Decimal(note.total) - applied_amount - refunded_amount,
         "applications": applications,
+        "refunds": [credit_note_refund_output(refund) for refund in note.refunds],
         "lines": [
             {
                 "id": line.id,
@@ -930,3 +963,340 @@ def reverse_credit_note_application(
     session.add(reversal)
     session.flush()
     return application
+
+
+def _credit_note_refund_payload_hash(
+    *, credit_note_id: int, amount: Decimal, refund_date: date
+) -> str:
+    payload = {
+        "credit_note_id": credit_note_id,
+        "amount": str(amount),
+        "refund_date": refund_date.isoformat(),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def credit_note_refund_output(refund: CreditNoteRefund) -> dict:
+    return {
+        "id": refund.id,
+        "credit_note_id": refund.credit_note_id,
+        "bank_transaction_id": refund.bank_transaction_id,
+        "journal_entry_id": refund.journal_entry_id,
+        "amount": refund.amount,
+        "refund_date": refund.refund_date,
+        "status": _value(refund.status),
+        "reversed_at": refund.reversed_at,
+        "reversal_date": refund.reversal_date,
+        "reversal_bank_transaction_id": refund.reversal_bank_transaction_id,
+        "reversal_journal_entry_id": refund.reversal_journal_entry_id,
+        "created_at": refund.created_at,
+        "updated_at": refund.updated_at,
+    }
+
+
+def _credit_note_refund_balance(session: Session, credit_note: CreditNote) -> Decimal:
+    applied = Decimal(
+        session.query(func.coalesce(func.sum(CreditNoteApplication.amount), 0))
+        .filter(
+            CreditNoteApplication.credit_note_id == credit_note.id,
+            CreditNoteApplication.status == CreditNoteApplicationStatus.ACTIVE,
+        )
+        .scalar()
+        or 0
+    )
+    refunded = Decimal(
+        session.query(func.coalesce(func.sum(CreditNoteRefund.amount), 0))
+        .filter(
+            CreditNoteRefund.credit_note_id == credit_note.id,
+            CreditNoteRefund.status == CreditNoteRefundStatus.ACTIVE,
+        )
+        .scalar()
+        or 0
+    )
+    return Decimal(credit_note.total) - applied - refunded
+
+
+def _credit_note_refund_bank_transaction(
+    session: Session,
+    *,
+    bank_account: BankAccount,
+    direction: BankTxnDirection,
+    amount: Decimal,
+    refund_date: date,
+    credit_note: CreditNote,
+) -> BankTransaction:
+    transaction = BankTransaction(
+        bank_account_id=bank_account.id,
+        direction=direction,
+        amount=amount,
+        occurred_at=refund_date,
+        memo=f"Credit note refund {credit_note.credit_note_number}",
+        counter_party_name=credit_note.contact.name,
+        account_id=None,
+        gst_amount=Decimal("0.00"),
+        tax_code="none",
+        unapplied_account_id=None,
+        unapplied_amount=Decimal("0.00"),
+    )
+    session.add(transaction)
+    session.flush()
+    return transaction
+
+
+def _credit_note_refund_journal(
+    session: Session,
+    *,
+    credit_note: CreditNote,
+    bank_account: BankAccount,
+    amount: Decimal,
+    refund_date: date,
+    source_type: JournalEntrySource,
+    source_id: int,
+    reverses_entry_id: int | None,
+    is_reversal: bool,
+) -> JournalEntry:
+    if credit_note.direction == "AR":
+        receivables = session.query(Account).filter(Account.code == "1100").one_or_none()
+        if receivables is None or not receivables.active:
+            raise CreditNoteValidationError("Required active AR control account 1100 is missing.")
+        if is_reversal:
+            lines = [
+                JournalLineCreate(
+                    account_id=bank_account.ledger_account_id,
+                    debit_amount=amount,
+                    description=f"Credit note refund reversal {credit_note.credit_note_number}",
+                ),
+                JournalLineCreate(
+                    account_id=receivables.id,
+                    credit_amount=amount,
+                    description=f"Credit note refund reversal {credit_note.credit_note_number}",
+                ),
+            ]
+        else:
+            lines = [
+                JournalLineCreate(
+                    account_id=receivables.id,
+                    debit_amount=amount,
+                    description=f"Credit note refund {credit_note.credit_note_number}",
+                ),
+                JournalLineCreate(
+                    account_id=bank_account.ledger_account_id,
+                    credit_amount=amount,
+                    description=f"Credit note refund {credit_note.credit_note_number}",
+                ),
+            ]
+    else:
+        payables = session.query(Account).filter(Account.code == "2000").one_or_none()
+        if payables is None or not payables.active:
+            raise CreditNoteValidationError("Required active AP control account 2000 is missing.")
+        if is_reversal:
+            lines = [
+                JournalLineCreate(
+                    account_id=payables.id,
+                    debit_amount=amount,
+                    description=f"Credit note refund reversal {credit_note.credit_note_number}",
+                ),
+                JournalLineCreate(
+                    account_id=bank_account.ledger_account_id,
+                    credit_amount=amount,
+                    description=f"Credit note refund reversal {credit_note.credit_note_number}",
+                ),
+            ]
+        else:
+            lines = [
+                JournalLineCreate(
+                    account_id=bank_account.ledger_account_id,
+                    debit_amount=amount,
+                    description=f"Credit note refund {credit_note.credit_note_number}",
+                ),
+                JournalLineCreate(
+                    account_id=payables.id,
+                    credit_amount=amount,
+                    description=f"Credit note refund {credit_note.credit_note_number}",
+                ),
+            ]
+    _validate_lines(session, lines)
+    entry = JournalEntry(
+        entry_date=refund_date,
+        memo=f"Credit note refund {credit_note.credit_note_number}",
+        reference=f"REFUND-{credit_note.credit_note_number}",
+        source_type=source_type,
+        source_id=source_id,
+        reverses_entry_id=reverses_entry_id,
+    )
+    for line in lines:
+        entry.lines.append(
+            JournalLine(
+                account_id=line.account_id,
+                debit_amount=line.debit_amount or Decimal("0"),
+                credit_amount=line.credit_amount or Decimal("0"),
+                description=line.description,
+            )
+        )
+    session.add(entry)
+    session.flush()
+    return entry
+
+
+def create_credit_note_refund(
+    session: Session,
+    credit_note_id: int,
+    payload: CreditNoteRefundCreate,
+    *,
+    company,
+    idempotency_key: str,
+) -> CreditNoteRefund:
+    credit_note = get_credit_note(session, credit_note_id)
+    if _value(credit_note.status) != CreditNoteStatus.AUTHORISED.value:
+        raise CreditNoteRefundConflict("Only an authorised credit note may be refunded.")
+    if credit_note.currency != "AUD":
+        raise CreditNoteRefundConflict("Credit notes can only be refunded in AUD.")
+    if credit_note.direction not in {"AR", "AP"}:
+        raise CreditNoteRefundConflict("Credit note direction is invalid.")
+    if credit_note.contact is None or not credit_note.contact.active:
+        raise CreditNoteRefundConflict("Credit note Contact is unavailable.")
+
+    amount = _money(payload.amount)
+    require_open_date(company, payload.refund_date, operation="refund a credit note")
+    bank_account = (
+        session.query(BankAccount)
+        .filter(BankAccount.is_active.is_(True), BankAccount.ledger_account_id.isnot(None))
+        .order_by(BankAccount.id.asc())
+        .first()
+    )
+    if bank_account is None:
+        raise CreditNoteRefundConflict("An active BankAccount with a ledger account is required.")
+
+    payload_hash = _credit_note_refund_payload_hash(
+        credit_note_id=credit_note_id,
+        amount=amount,
+        refund_date=payload.refund_date,
+    )
+    owner = session.get(CreditNoteRefundIdempotencyKey, idempotency_key)
+    if owner is not None:
+        refund = session.get(CreditNoteRefund, owner.refund_id)
+        if refund is None:
+            raise CreditNoteRefundConflict("Idempotency-Key points to a missing refund.")
+        if owner.payload_hash != payload_hash:
+            raise CreditNoteRefundConflict(
+                "Idempotency-Key has already been used with a different refund payload."
+            )
+        return refund
+
+    remaining = _credit_note_refund_balance(session, credit_note)
+    if amount > remaining:
+        raise CreditNoteRefundConflict("Refund exceeds the credit note's remaining amount.")
+
+    source_type = (
+        JournalEntrySource.REFUND_AR
+        if credit_note.direction == "AR"
+        else JournalEntrySource.REFUND_AP
+    )
+    transaction = _credit_note_refund_bank_transaction(
+        session,
+        bank_account=bank_account,
+        direction=(
+            BankTxnDirection.OUT
+            if credit_note.direction == "AR"
+            else BankTxnDirection.IN
+        ),
+        amount=amount,
+        refund_date=payload.refund_date,
+        credit_note=credit_note,
+    )
+    entry = _credit_note_refund_journal(
+        session,
+        credit_note=credit_note,
+        bank_account=bank_account,
+        amount=amount,
+        refund_date=payload.refund_date,
+        source_type=source_type,
+        source_id=transaction.id,
+        reverses_entry_id=None,
+        is_reversal=False,
+    )
+    refund = CreditNoteRefund(
+        credit_note_id=credit_note.id,
+        bank_transaction_id=transaction.id,
+        journal_entry_id=entry.id,
+        amount=amount,
+        refund_date=payload.refund_date,
+        status=CreditNoteRefundStatus.ACTIVE,
+    )
+    session.add(refund)
+    session.flush()
+    session.add(
+        CreditNoteRefundIdempotencyKey(
+            key=idempotency_key,
+            payload_hash=payload_hash,
+            refund_id=refund.id,
+        )
+    )
+    session.flush()
+    return refund
+
+
+def reverse_credit_note_refund(
+    session: Session,
+    credit_note_id: int,
+    refund_id: int,
+    payload: CreditNoteRefundReverse,
+    *,
+    company,
+) -> CreditNoteRefund:
+    credit_note = get_credit_note(session, credit_note_id)
+    refund = session.get(CreditNoteRefund, refund_id)
+    if refund is None or refund.credit_note_id != credit_note_id:
+        raise CreditNoteRefundNotFound("Credit note refund not found.")
+    if refund.status != CreditNoteRefundStatus.ACTIVE:
+        raise CreditNoteRefundConflict("Only an active refund may be reversed.")
+    if credit_note.currency != "AUD":
+        raise CreditNoteRefundConflict("Credit note refund currency is invalid.")
+
+    require_open_date(company, payload.reversal_date, operation="reverse a credit note refund")
+    bank_account = (
+        session.query(BankAccount)
+        .filter(BankAccount.is_active.is_(True), BankAccount.ledger_account_id.isnot(None))
+        .order_by(BankAccount.id.asc())
+        .first()
+    )
+    if bank_account is None:
+        raise CreditNoteRefundConflict("An active BankAccount with a ledger account is required.")
+
+    source_type = (
+        JournalEntrySource.REFUND_REVERSAL_AR
+        if credit_note.direction == "AR"
+        else JournalEntrySource.REFUND_REVERSAL_AP
+    )
+    transaction = _credit_note_refund_bank_transaction(
+        session,
+        bank_account=bank_account,
+        direction=(
+            BankTxnDirection.IN
+            if credit_note.direction == "AR"
+            else BankTxnDirection.OUT
+        ),
+        amount=refund.amount,
+        refund_date=payload.reversal_date,
+        credit_note=credit_note,
+    )
+    entry = _credit_note_refund_journal(
+        session,
+        credit_note=credit_note,
+        bank_account=bank_account,
+        amount=refund.amount,
+        refund_date=payload.reversal_date,
+        source_type=source_type,
+        source_id=refund.id,
+        reverses_entry_id=refund.journal_entry_id,
+        is_reversal=True,
+    )
+    refund.status = CreditNoteRefundStatus.REVERSED
+    refund.reversed_at = datetime.now(timezone.utc)
+    refund.reversal_date = payload.reversal_date
+    refund.reversal_bank_transaction_id = transaction.id
+    refund.reversal_journal_entry_id = entry.id
+    session.flush()
+    return refund

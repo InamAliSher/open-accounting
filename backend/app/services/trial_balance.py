@@ -76,6 +76,8 @@ from ..models.company import (
     CreditNote,
     CreditNoteApplication,
     CreditNoteApplicationStatus,
+    CreditNoteRefund,
+    CreditNoteRefundStatus,
     CreditNoteStatus,
     Invoice,
     InvoiceDirection,
@@ -568,7 +570,16 @@ def _open_credit_totals(db: Session, *, as_of: date | None) -> tuple[Decimal, De
             .scalar()
             or 0
         )
-        remaining = Decimal(note.total or ZERO) - Decimal(active_applied)
+        active_refunded = (
+            db.query(func.coalesce(func.sum(CreditNoteRefund.amount), 0))
+            .filter(
+                CreditNoteRefund.credit_note_id == note.id,
+                CreditNoteRefund.status == CreditNoteRefundStatus.ACTIVE,
+            )
+            .scalar()
+            or 0
+        )
+        remaining = Decimal(note.total or ZERO) - Decimal(active_applied) - Decimal(active_refunded)
         if remaining <= 0:
             continue
         if note.direction == InvoiceDirection.AP.value:

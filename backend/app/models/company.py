@@ -135,6 +135,11 @@ class CreditNoteApplicationStatus(str, Enum):
     REVERSED = "reversed"
 
 
+class CreditNoteRefundStatus(str, Enum):
+    ACTIVE = "active"
+    REVERSED = "reversed"
+
+
 # Decimal precision used throughout: 2 decimal places, up to 14 integer digits.
 MONEY = Numeric(16, 2)
 
@@ -277,6 +282,9 @@ class CreditNote(CompanyBase):
     applications: Mapped[list["CreditNoteApplication"]] = relationship(
         back_populates="credit_note", cascade="all, delete-orphan"
     )
+    refunds: Mapped[list["CreditNoteRefund"]] = relationship(
+        back_populates="credit_note", cascade="all, delete-orphan"
+    )
 
 
 class CreditNoteLine(CompanyBase):
@@ -417,6 +425,85 @@ class CreditNoteApplicationIdempotencyKey(CompanyBase):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class CreditNoteRefund(CompanyBase):
+    __tablename__ = "credit_note_refunds"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_credit_note_refund_amount_positive"),
+        CheckConstraint(
+            "status IN ('active', 'reversed')",
+            name="ck_credit_note_refund_status",
+        ),
+        UniqueConstraint(
+            "credit_note_id",
+            "bank_transaction_id",
+            name="uq_credit_note_refund_txn",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    credit_note_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_notes.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    bank_transaction_id: Mapped[int] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="RESTRICT"), nullable=False
+    )
+    journal_entry_id: Mapped[int] = mapped_column(
+        ForeignKey("journal_entries.id", ondelete="RESTRICT"), nullable=False
+    )
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    refund_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    status: Mapped[CreditNoteRefundStatus] = mapped_column(
+        String(10), nullable=False, default=CreditNoteRefundStatus.ACTIVE, index=True
+    )
+    reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reversal_date: Mapped[date | None] = mapped_column(Date)
+    reversal_bank_transaction_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="RESTRICT"),
+        unique=True,
+    )
+    reversal_journal_entry_id: Mapped[int | None] = mapped_column(
+        ForeignKey("journal_entries.id", ondelete="RESTRICT"),
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    credit_note: Mapped[CreditNote] = relationship(back_populates="refunds")
+    bank_transaction: Mapped[BankTransaction] = relationship(
+        foreign_keys=[bank_transaction_id]
+    )
+    journal_entry: Mapped[JournalEntry] = relationship(
+        foreign_keys=[journal_entry_id]
+    )
+    reversal_bank_transaction: Mapped[BankTransaction | None] = relationship(
+        foreign_keys=[reversal_bank_transaction_id]
+    )
+    reversal_journal_entry: Mapped[JournalEntry | None] = relationship(
+        foreign_keys=[reversal_journal_entry_id]
+    )
+
+
+class CreditNoteRefundIdempotencyKey(CompanyBase):
+    __tablename__ = "credit_note_refund_idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    refund_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_note_refunds.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    refund: Mapped[CreditNoteRefund] = relationship()
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +866,10 @@ class JournalEntrySource(str, Enum):
     INVOICE_REVERSAL = "invoice_reversal"
     CREDIT_NOTE_AR = "credit_note_ar"
     CREDIT_NOTE_AP = "credit_note_ap"
+    REFUND_AR = "refund_ar"
+    REFUND_AP = "refund_ap"
+    REFUND_REVERSAL_AR = "refund_reversal_ar"
+    REFUND_REVERSAL_AP = "refund_reversal_ap"
 
 
 class JournalEntry(CompanyBase):
