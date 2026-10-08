@@ -249,7 +249,7 @@ export default function Dashboard() {
         <Card
           title="Unpaid supplier invoices"
           action={
-            <Link to="/invoices" className="text-xs underline">
+            <Link to="/supplier-bills" className="text-xs underline">
               View all →
             </Link>
           }

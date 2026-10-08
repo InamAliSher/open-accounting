@@ -4,6 +4,44 @@ import { BACKEND_URL, companyHeaders, ensureCompanyById } from "./helpers";
 const COMPANY_ID = "creditnoteapplicationsui";
 const ISSUE_DATE = "2026-08-01";
 
+interface JournalEntryRecord {
+  id: number;
+  source_id: number | null;
+  source_type: string;
+  reverses_entry_id: number | null;
+  lines: Array<{ account_id: number; debit_amount: string; credit_amount: string }>;
+}
+
+async function findJournalEntry(
+  request: APIRequestContext,
+  sourceType: string,
+  sourceId: number,
+): Promise<JournalEntryRecord> {
+  const response = await request.get(`${BACKEND_URL}/api/v1/journal`, {
+    headers: companyHeaders(COMPANY_ID),
+    params: { source_type: sourceType },
+  });
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const entries = (await response.json()) as JournalEntryRecord[];
+  const entry = entries.find((item) => item.source_id === sourceId);
+  expect(entry, `Expected ${sourceType} journal for source ${sourceId}`).toBeTruthy();
+  return entry!;
+}
+
+function amountForAccount(
+  entry: JournalEntryRecord,
+  accountId: number,
+  side: "debit_amount" | "credit_amount",
+): bigint {
+  return entry.lines
+    .filter((line) => line.account_id === accountId)
+    .reduce((sum, line) => {
+      const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(line[side]);
+      if (!match) throw new Error(`Invalid decimal money value: ${line[side]}`);
+      return sum + BigInt(match[1]) * 100n + BigInt((match[2] ?? "").padEnd(2, "0") || "0");
+    }, 0n);
+}
+
 async function accountId(request: APIRequestContext, code: string): Promise<number> {
   const response = await request.get(`${BACKEND_URL}/api/v1/accounts`, {
     headers: companyHeaders(COMPANY_ID),
@@ -185,6 +223,7 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   const headers = companyHeaders(COMPANY_ID);
   const arAccountId = await accountId(request, "4000");
   const apAccountId = await accountId(request, "6100");
+  const payableAccountId = await accountId(request, "2000");
   const selectedBankAccount = await createMappedBankAccount(
     request,
     "1001",
@@ -219,6 +258,9 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   );
   await postInvoice(request, arInvoiceId);
   await postInvoice(request, apInvoiceId);
+  const apInvoiceJournal = await findJournalEntry(request, "invoice_ap", apInvoiceId);
+  expect(amountForAccount(apInvoiceJournal, apAccountId, "debit_amount")).toBe(11000n);
+  expect(amountForAccount(apInvoiceJournal, payableAccountId, "credit_amount")).toBe(11000n);
   const arCreditNoteId = await createAuthorisedCreditNote(
     request,
     arInvoiceId,
@@ -229,6 +271,9 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
     apInvoiceId,
     "FICTIONAL-APP-AP-CREDIT",
   );
+  const apCreditNoteJournal = await findJournalEntry(request, "credit_note_ap", apCreditNoteId);
+  expect(amountForAccount(apCreditNoteJournal, payableAccountId, "debit_amount")).toBe(11000n);
+  expect(amountForAccount(apCreditNoteJournal, apAccountId, "credit_amount")).toBe(11000n);
 
   await page.goto("/invoices");
   await selectCompany(page);
@@ -328,8 +373,9 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(arCreditNoteDialog.getByLabel("Void date")).toHaveCount(0);
   await page.getByRole("button", { name: "Close" }).click();
 
-  await page.goto("/invoices");
+  await page.goto("/supplier-bills");
   await selectCompany(page);
+  await expect(page.getByRole("heading", { name: "Supplier Bills", exact: true })).toBeVisible();
   await openInvoice(page, "FICTIONAL-APP-AP-001");
   const apDrawer = page
     .getByRole("heading", { name: /FICTIONAL-APP-AP-001/ })
@@ -348,6 +394,13 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await apCreditNote.getByRole("button", { name: "Apply", exact: true }).click();
   const apConfirmation = page.getByRole("heading", { name: "Apply this credit to the invoice?" }).locator("..");
   await apConfirmation.getByRole("button", { name: "Apply credit" }).click();
+  const appliedInvoiceResponse = await request.get(`${BACKEND_URL}/api/v1/invoices/${apInvoiceId}`, { headers });
+  expect(appliedInvoiceResponse.ok()).toBeTruthy();
+  expect(await appliedInvoiceResponse.json()).toMatchObject({
+    paid_amount: "0.00",
+    credit_applied_amount: "25.00",
+    outstanding_amount: "85.00",
+  });
   await expect(apCreditNote.getByText("$25.00", { exact: true })).toBeVisible();
   await expect(apCreditNote.getByText("active", { exact: true })).toBeVisible();
   await expect(apCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toBeDisabled();
@@ -366,10 +419,45 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(apRefundRow.getByText("$15.00", { exact: true })).toBeVisible();
   await expect(apRefundRow.getByText("19/08/2026", { exact: true })).toBeVisible();
   await expect(apRefundRow.getByText("active", { exact: true })).toBeVisible();
+  const activeApCreditResponse = await request.get(`${BACKEND_URL}/api/v1/credit-notes/${apCreditNoteId}`, { headers });
+  expect(activeApCreditResponse.ok()).toBeTruthy();
+  const activeApCredit = (await activeApCreditResponse.json()) as {
+    refunds: Array<{ id: number; amount: string; bank_account_id: number; bank_transaction_id: number; journal_entry_id: number; status: string }>;
+  };
+  const activeApRefund = activeApCredit.refunds[0];
+  expect(activeApRefund).toMatchObject({
+    amount: "15.00",
+    bank_account_id: selectedBankAccount.id,
+    status: "active",
+  });
+  const selectedBankTransactionsResponse = await request.get(
+    `${BACKEND_URL}/api/v1/bank-accounts/${selectedBankAccount.id}/transactions`,
+    { headers },
+  );
+  expect(selectedBankTransactionsResponse.ok()).toBeTruthy();
+  const selectedBankTransactions = (await selectedBankTransactionsResponse.json()) as Array<{
+    id: number;
+    direction: string;
+    amount: string;
+    invoice_allocations: Array<{ invoice_id: number }>;
+  }>;
+  const inboundRefundMovement = selectedBankTransactions.find((item) => item.id === activeApRefund.bank_transaction_id);
+  expect(inboundRefundMovement).toMatchObject({ direction: "in", amount: "15.00", invoice_allocations: [] });
+  const refundJournal = await findJournalEntry(request, "refund_ap", activeApRefund.bank_transaction_id);
+  expect(refundJournal.id).toBe(activeApRefund.journal_entry_id);
+  expect(amountForAccount(refundJournal, selectedBankAccount.ledger_account_id!, "debit_amount")).toBe(1500n);
+  expect(amountForAccount(refundJournal, payableAccountId, "credit_amount")).toBe(1500n);
   await apApplicationRow.getByRole("button", { name: "Reverse", exact: true }).click();
   const apApplicationReverseConfirmation = page.getByRole("heading", { name: "Reverse this credit application?" }).locator("..");
   await apApplicationReverseConfirmation.getByLabel("Reversal date").fill("2026-08-20");
   await apApplicationReverseConfirmation.getByRole("button", { name: "Reverse application" }).click();
+  const reversedApplicationInvoiceResponse = await request.get(`${BACKEND_URL}/api/v1/invoices/${apInvoiceId}`, { headers });
+  expect(reversedApplicationInvoiceResponse.ok()).toBeTruthy();
+  expect(await reversedApplicationInvoiceResponse.json()).toMatchObject({
+    paid_amount: "0.00",
+    credit_applied_amount: "0.00",
+    outstanding_amount: "110.00",
+  });
   await expect(apApplicationRow.getByText("reversed", { exact: true })).toBeVisible();
   await expect(apApplicationRow.getByText("20/08/2026", { exact: true })).toBeVisible();
   await expect(apApplicationRow.getByText("active", { exact: true })).toHaveCount(0);
@@ -383,6 +471,33 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(apRefundRow.getByText("21/08/2026", { exact: true })).toBeVisible();
   await expect(apRefundRow.getByText("$15.00", { exact: true })).toBeVisible();
   await expect(apCreditNoteDialog.getByText(/cannot be voided while it has active applications or refunds/i)).toHaveCount(0);
+  const reversedApCreditResponse = await request.get(`${BACKEND_URL}/api/v1/credit-notes/${apCreditNoteId}`, { headers });
+  expect(reversedApCreditResponse.ok()).toBeTruthy();
+  const reversedApCredit = (await reversedApCreditResponse.json()) as {
+    refunds: Array<{ reversal_bank_transaction_id: number | null; reversal_journal_entry_id: number | null; status: string }>;
+  };
+  const reversedApRefund = reversedApCredit.refunds[0];
+  expect(reversedApRefund).toMatchObject({ status: "reversed" });
+  expect(reversedApRefund.reversal_bank_transaction_id).toBeTruthy();
+  expect(reversedApRefund.reversal_journal_entry_id).toBeTruthy();
+  const bankTransactionsAfterReversalResponse = await request.get(
+    `${BACKEND_URL}/api/v1/bank-accounts/${selectedBankAccount.id}/transactions`,
+    { headers },
+  );
+  expect(bankTransactionsAfterReversalResponse.ok()).toBeTruthy();
+  const bankTransactionsAfterReversal = (await bankTransactionsAfterReversalResponse.json()) as typeof selectedBankTransactions;
+  const refundReversalMovement = bankTransactionsAfterReversal.find(
+    (item) => item.id === reversedApRefund.reversal_bank_transaction_id,
+  );
+  expect(refundReversalMovement).toMatchObject({ direction: "out", amount: "15.00", invoice_allocations: [] });
+  const refundReversalJournal = await findJournalEntry(
+    request,
+    "refund_reversal_ap",
+    reversedApRefund.id,
+  );
+  expect(refundReversalJournal.id).toBe(reversedApRefund.reversal_journal_entry_id);
+  expect(amountForAccount(refundReversalJournal, payableAccountId, "debit_amount")).toBe(1500n);
+  expect(amountForAccount(refundReversalJournal, selectedBankAccount.ledger_account_id!, "credit_amount")).toBe(1500n);
 
   const apVoidDate = "2026-08-22";
   await apCreditNoteDialog.getByLabel("Void date").fill(apVoidDate);
@@ -407,6 +522,28 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(apCreditNoteDialog.getByRole("button", { name: "Reverse", exact: true })).toHaveCount(0);
   await expect(apCreditNoteDialog.getByRole("button", { name: "Void", exact: true })).toHaveCount(0);
   await expect(apCreditNoteDialog.getByLabel("Void date")).toHaveCount(0);
+  const apCreditNoteJournalAfterVoid = await findJournalEntry(request, "credit_note_ap", apCreditNoteId);
+  expect(apCreditNoteJournalAfterVoid).toEqual(apCreditNoteJournal);
+  const apInvoiceJournalAfterVoid = await findJournalEntry(request, "invoice_ap", apInvoiceId);
+  expect(apInvoiceJournalAfterVoid).toEqual(apInvoiceJournal);
+  const apVoidJournal = await findJournalEntry(request, "credit_note_void_ap", apCreditNoteId);
+  expect(apVoidJournal).toMatchObject({
+    reverses_entry_id: apCreditNoteJournal.id,
+  });
+  expect(amountForAccount(apVoidJournal, apAccountId, "debit_amount")).toBe(11000n);
+  expect(amountForAccount(apVoidJournal, payableAccountId, "credit_amount")).toBe(11000n);
+  const sourceAfterVoidResponse = await request.get(
+    `${BACKEND_URL}/api/v1/credit-notes/source-invoices/${apInvoiceId}`,
+    { headers },
+  );
+  expect(sourceAfterVoidResponse.ok()).toBeTruthy();
+  const sourceAfterVoid = (await sourceAfterVoidResponse.json()) as {
+    lines: Array<{ quantity_reserved: string; remaining_creditable_quantity: string }>;
+  };
+  expect(sourceAfterVoid.lines[0]).toMatchObject({
+    quantity_reserved: "0",
+    remaining_creditable_quantity: "1.0000",
+  });
   await page
     .getByRole("heading", { name: "View authorised credit note" })
     .locator("xpath=ancestor::div[contains(@class,'fixed inset-0 z-50')]")
