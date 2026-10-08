@@ -151,6 +151,7 @@ class CreditNoteApplicationReverse(BaseModel):
 class CreditNoteRefundCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    bank_account_id: int = Field(ge=1, le=SQLITE_INT_MAX)
     amount: Decimal = Field(
         gt=0,
         le=Decimal("999999.9999"),
@@ -169,6 +170,7 @@ class CreditNoteRefundReverse(BaseModel):
 class CreditNoteRefundOut(BaseModel):
     id: int
     credit_note_id: int
+    bank_account_id: int
     bank_transaction_id: int
     journal_entry_id: int
     amount: Money

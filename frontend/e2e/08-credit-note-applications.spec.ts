@@ -97,6 +97,62 @@ async function createAuthorisedCreditNote(
   return creditNote.id;
 }
 
+async function createMappedBankAccount(
+  request: APIRequestContext,
+  code: string,
+  name: string,
+): Promise<{ id: number; ledger_account_id: number }> {
+  const accountsResponse = await request.get(`${BACKEND_URL}/api/v1/accounts`, {
+    headers: companyHeaders(COMPANY_ID),
+  });
+  expect(accountsResponse.ok(), await accountsResponse.text()).toBeTruthy();
+  const accounts = (await accountsResponse.json()) as Array<{ id: number; code: string }>;
+  let ledgerAccount = accounts.find((account) => account.code === code);
+  if (!ledgerAccount) {
+    const response = await request.post(`${BACKEND_URL}/api/v1/accounts`, {
+      headers: companyHeaders(COMPANY_ID),
+      data: {
+        code,
+        name: `${name} ledger`,
+        type: "ASSET",
+        is_gst: false,
+      },
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
+    ledgerAccount = (await response.json()) as { id: number; code: string };
+  }
+
+  const bankAccountsResponse = await request.get(`${BACKEND_URL}/api/v1/bank-accounts`, {
+    headers: companyHeaders(COMPANY_ID),
+  });
+  expect(bankAccountsResponse.ok(), await bankAccountsResponse.text()).toBeTruthy();
+  const bankAccounts = (await bankAccountsResponse.json()) as Array<{
+    id: number;
+    name: string;
+    ledger_account_id: number | null;
+  }>;
+  let selected = bankAccounts.find(
+    (account) => account.name === name && account.ledger_account_id === ledgerAccount!.id,
+  );
+  if (!selected) {
+    const response = await request.post(`${BACKEND_URL}/api/v1/bank-accounts`, {
+      headers: companyHeaders(COMPANY_ID),
+      data: {
+        name,
+        ledger_account_id: ledgerAccount!.id,
+      },
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
+    selected = (await response.json()) as {
+      id: number;
+      name: string;
+      ledger_account_id: number | null;
+    };
+  }
+  expect(selected).toBeDefined();
+  return selected!;
+}
+
 async function openInvoice(page: Page, invoiceNumber: string): Promise<void> {
   await page.getByRole("row").filter({ hasText: invoiceNumber }).click();
   await expect(page.getByRole("heading", { name: new RegExp(invoiceNumber) })).toBeVisible();
@@ -129,6 +185,24 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   const headers = companyHeaders(COMPANY_ID);
   const arAccountId = await accountId(request, "4000");
   const apAccountId = await accountId(request, "6100");
+  const selectedBankAccount = await createMappedBankAccount(
+    request,
+    "1001",
+    "Credit Note Refund Bank",
+  );
+  const bankAccounts = await request.get(`${BACKEND_URL}/api/v1/bank-accounts`, {
+    headers,
+  });
+  expect(bankAccounts.ok(), await bankAccounts.text()).toBeTruthy();
+  const mappedAccounts = (await bankAccounts.json()) as Array<{
+    id: number;
+    ledger_account_id: number | null;
+  }>;
+  expect(mappedAccounts.length).toBeGreaterThan(1);
+  expect(mappedAccounts.some((account) => account.id === selectedBankAccount.id)).toBeTruthy();
+  expect(selectedBankAccount.ledger_account_id).not.toBeNull();
+  const lowestBankAccountId = Math.min(...mappedAccounts.map((account) => account.id));
+  expect(selectedBankAccount.id).not.toBe(lowestBankAccountId);
   const arInvoiceId = await createInvoice(
     request,
     "FICTIONAL-APP-AR-001",
@@ -184,18 +258,43 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await expect(arCreditNote.getByText("Invoice number")).toBeVisible();
   await expect(arCreditNote.getByRole("columnheader", { name: "Application date" })).toBeVisible();
   await expect(arCreditNote.getByRole("button", { name: "Reverse" })).toBeVisible();
-  await expect(arCreditNote.getByRole("button", { name: "Refund" })).toHaveCount(0);
+  await expect(arCreditNote.getByRole("button", { name: "Refund" })).toBeVisible();
   await expect(arCreditNote.getByRole("button", { name: "Payment" })).toHaveCount(0);
   await expect(arCreditNote.getByRole("button", { name: "Void" })).toHaveCount(0);
 
-  await arCreditNote.getByRole("button", { name: "Reverse" }).click();
+  await arCreditNote.getByLabel("Refund bank account").selectOption(String(selectedBankAccount.id));
+  await arCreditNote.getByLabel("Refund amount").fill("30.00");
+  await arCreditNote.getByLabel("Refund date").fill("2026-08-17");
+  await arCreditNote.getByRole("button", { name: "Refund", exact: true }).click();
+  const arRefundConfirmation = page.getByRole("heading", { name: "Refund this credit note?" }).locator("..");
+  await expect(arRefundConfirmation).toContainText("Outbound cash movement");
+  await expect(arRefundConfirmation).toContainText("Credit Note Refund Bank");
+  await arRefundConfirmation.getByRole("button", { name: "Refund credit" }).click();
+  await expect(arCreditNote.getByText("Customer refund", { exact: true })).toBeVisible();
+  await expect(arCreditNote.getByText("Outbound cash movement", { exact: true })).toBeVisible();
+  const arRefundRow = arCreditNote.getByRole("row").filter({ hasText: "Credit Note Refund Bank" });
+  await expect(arRefundRow.getByText("$30.00", { exact: true })).toBeVisible();
+  await expect(arRefundRow.getByText("17/08/2026", { exact: true })).toBeVisible();
+  await expect(arRefundRow.getByText("active", { exact: true })).toBeVisible();
+
+  const arApplicationRow = arCreditNote.getByRole("row").filter({ hasText: "FICTIONAL-APP-AR-001" });
+  await arApplicationRow.getByRole("button", { name: "Reverse" }).click();
   const reverseDialog = page.getByRole("heading", { name: "Reverse this credit application?" }).locator("..");
   await expect(reverseDialog).toContainText("Reverse this credit application?");
   await reverseDialog.getByLabel("Reversal date").fill("2026-08-16");
   await reverseDialog.getByRole("button", { name: "Reverse application" }).click();
-  await expect(arCreditNote.getByText("reversed", { exact: true })).toBeVisible();
-  await expect(arCreditNote.getByText("16/08/2026", { exact: true })).toBeVisible();
-  await expect(arCreditNote.getByText("active", { exact: true })).toHaveCount(0);
+  await expect(arApplicationRow.getByText("reversed", { exact: true })).toBeVisible();
+  await expect(arApplicationRow.getByText("16/08/2026", { exact: true })).toBeVisible();
+  await expect(arApplicationRow.getByText("active", { exact: true })).toHaveCount(0);
+  await expect(arRefundRow.getByText("active", { exact: true })).toBeVisible();
+  await arRefundRow.getByRole("button", { name: "Reverse", exact: true }).click();
+  const arRefundReverseConfirmation = page.getByRole("heading", { name: "Reverse this refund?" }).locator("..");
+  await expect(arRefundReverseConfirmation).toContainText("original selected account will be reused");
+  await arRefundReverseConfirmation.getByLabel("Refund reversal date").fill("2026-08-18");
+  await arRefundReverseConfirmation.getByRole("button", { name: "Reverse refund" }).click();
+  await expect(arCreditNote.getByText("reversed", { exact: true })).toHaveCount(2);
+  await expect(arRefundRow.getByText("18/08/2026", { exact: true })).toBeVisible();
+  await expect(arRefundRow.getByText("$30.00", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Close" }).click();
 
   await page.goto("/invoices");
@@ -217,6 +316,26 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   await apConfirmation.getByRole("button", { name: "Apply credit" }).click();
   await expect(apCreditNote.getByText("$25.00", { exact: true })).toBeVisible();
   await expect(apCreditNote.getByText("active", { exact: true })).toBeVisible();
+  await apCreditNote.getByLabel("Refund bank account").selectOption(String(selectedBankAccount.id));
+  await apCreditNote.getByLabel("Refund amount").fill("15.00");
+  await apCreditNote.getByLabel("Refund date").fill("2026-08-19");
+  await apCreditNote.getByRole("button", { name: "Refund", exact: true }).click();
+  const apRefundConfirmation = page.getByRole("heading", { name: "Refund this credit note?" }).locator("..");
+  await expect(apRefundConfirmation).toContainText("Inbound cash movement");
+  await apRefundConfirmation.getByRole("button", { name: "Refund credit" }).click();
+  await expect(apCreditNote.getByText("Supplier refund received", { exact: true })).toBeVisible();
+  await expect(apCreditNote.getByText("Inbound cash movement", { exact: true })).toBeVisible();
+  const apRefundRow = apCreditNote.getByRole("row").filter({ hasText: "Credit Note Refund Bank" });
+  await expect(apRefundRow.getByText("$15.00", { exact: true })).toBeVisible();
+  await expect(apRefundRow.getByText("19/08/2026", { exact: true })).toBeVisible();
+  await expect(apRefundRow.getByText("active", { exact: true })).toBeVisible();
+  await apRefundRow.getByRole("button", { name: "Reverse", exact: true }).click();
+  const apRefundReverseConfirmation = page.getByRole("heading", { name: "Reverse this refund?" }).locator("..");
+  await apRefundReverseConfirmation.getByLabel("Refund reversal date").fill("2026-08-20");
+  await apRefundReverseConfirmation.getByRole("button", { name: "Reverse refund" }).click();
+  await expect(apRefundRow.getByText("reversed", { exact: true })).toBeVisible();
+  await expect(apRefundRow.getByText("20/08/2026", { exact: true })).toBeVisible();
+  await expect(apRefundRow.getByText("$15.00", { exact: true })).toBeVisible();
   await page
     .getByRole("heading", { name: "View authorised credit note" })
     .locator("xpath=ancestor::div[contains(@class,'fixed inset-0 z-50')]")
@@ -273,9 +392,22 @@ test("authorised credit notes can partially apply and reverse for AR and AP", as
   const apCreditNoteApi = (await apCreditNoteResponse.json()) as {
     applied_amount: string;
     remaining_amount: string;
+    refunds: Array<{
+      amount: string;
+      bank_account_id: number;
+      status: string;
+      reversal_date: string | null;
+    }>;
   };
   expect(apCreditNoteApi).toMatchObject({
     applied_amount: "25.00",
     remaining_amount: "85.00",
+  });
+  expect(apCreditNoteApi.refunds).toHaveLength(1);
+  expect(apCreditNoteApi.refunds[0]).toMatchObject({
+    amount: "15.00",
+    bank_account_id: selectedBankAccount.id,
+    status: "reversed",
+    reversal_date: "2026-08-20",
   });
 });

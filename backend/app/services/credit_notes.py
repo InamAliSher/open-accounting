@@ -966,10 +966,15 @@ def reverse_credit_note_application(
 
 
 def _credit_note_refund_payload_hash(
-    *, credit_note_id: int, amount: Decimal, refund_date: date
+    *,
+    credit_note_id: int,
+    bank_account_id: int,
+    amount: Decimal,
+    refund_date: date,
 ) -> str:
     payload = {
         "credit_note_id": credit_note_id,
+        "bank_account_id": bank_account_id,
         "amount": str(amount),
         "refund_date": refund_date.isoformat(),
     }
@@ -982,6 +987,7 @@ def credit_note_refund_output(refund: CreditNoteRefund) -> dict:
     return {
         "id": refund.id,
         "credit_note_id": refund.credit_note_id,
+        "bank_account_id": refund.bank_transaction.bank_account_id,
         "bank_transaction_id": refund.bank_transaction_id,
         "journal_entry_id": refund.journal_entry_id,
         "amount": refund.amount,
@@ -1160,17 +1166,17 @@ def create_credit_note_refund(
 
     amount = _money(payload.amount)
     require_open_date(company, payload.refund_date, operation="refund a credit note")
-    bank_account = (
-        session.query(BankAccount)
-        .filter(BankAccount.is_active.is_(True), BankAccount.ledger_account_id.isnot(None))
-        .order_by(BankAccount.id.asc())
-        .first()
-    )
+    bank_account = session.get(BankAccount, payload.bank_account_id)
     if bank_account is None:
-        raise CreditNoteRefundConflict("An active BankAccount with a ledger account is required.")
+        raise CreditNoteRefundConflict("Selected bank account does not exist.")
+    if not bank_account.is_active:
+        raise CreditNoteRefundConflict("Selected bank account is inactive.")
+    if bank_account.ledger_account_id is None:
+        raise CreditNoteRefundConflict("Selected bank account has no ledger account mapping.")
 
     payload_hash = _credit_note_refund_payload_hash(
         credit_note_id=credit_note_id,
+        bank_account_id=bank_account.id,
         amount=amount,
         refund_date=payload.refund_date,
     )
@@ -1256,14 +1262,13 @@ def reverse_credit_note_refund(
         raise CreditNoteRefundConflict("Credit note refund currency is invalid.")
 
     require_open_date(company, payload.reversal_date, operation="reverse a credit note refund")
-    bank_account = (
-        session.query(BankAccount)
-        .filter(BankAccount.is_active.is_(True), BankAccount.ledger_account_id.isnot(None))
-        .order_by(BankAccount.id.asc())
-        .first()
-    )
+    bank_account = session.get(BankAccount, refund.bank_transaction.bank_account_id)
     if bank_account is None:
-        raise CreditNoteRefundConflict("An active BankAccount with a ledger account is required.")
+        raise CreditNoteRefundConflict("Original refund bank account does not exist.")
+    if not bank_account.is_active:
+        raise CreditNoteRefundConflict("Original refund bank account is inactive.")
+    if bank_account.ledger_account_id is None:
+        raise CreditNoteRefundConflict("Original refund bank account has no ledger account mapping.")
 
     source_type = (
         JournalEntrySource.REFUND_REVERSAL_AR

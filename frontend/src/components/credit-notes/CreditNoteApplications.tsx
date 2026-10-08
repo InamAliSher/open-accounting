@@ -5,8 +5,10 @@ import { apiErrorMessage } from "../../lib/errors";
 import { formatDate, formatMoney } from "../../lib/format";
 import { useCompanyStore } from "../../store/company";
 import type {
+  BankAccount,
   CreditNote,
   CreditNoteApplication,
+  CreditNoteRefund,
   Invoice,
 } from "../../types/api";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
@@ -31,6 +33,10 @@ function applicationStatusLabel(application: CreditNoteApplication): string {
   return application.status === "reversed" ? "reversed" : "active";
 }
 
+function refundStatusLabel(refund: CreditNoteRefund): string {
+  return refund.status === "reversed" ? "reversed" : "active";
+}
+
 export default function CreditNoteApplications({ creditNote }: { creditNote: CreditNote }) {
   const queryClient = useQueryClient();
   const currentId = useCompanyStore((state) => state.currentId);
@@ -41,7 +47,31 @@ export default function CreditNoteApplications({ creditNote }: { creditNote: Cre
   const [confirmApply, setConfirmApply] = useState(false);
   const [reverseApplication, setReverseApplication] = useState<CreditNoteApplication | null>(null);
   const [reversalDate, setReversalDate] = useState("");
+  const [refundAmount, setRefundAmount] = useState("");
+  const [refundDate, setRefundDate] = useState("");
+  const [refundBankAccountId, setRefundBankAccountId] = useState<number | null>(null);
+  const [confirmRefund, setConfirmRefund] = useState(false);
+  const [refundToReverse, setRefundToReverse] = useState<CreditNoteRefund | null>(null);
+  const [refundReversalDate, setRefundReversalDate] = useState("");
   const [error, setError] = useState<string | null>(null);
+
+  const bankAccountsQuery = useQuery({
+    queryKey: ["bank-accounts", currentId],
+    queryFn: async () => {
+      const response = await api.get<BankAccount[]>("/bank-accounts");
+      return response.data;
+    },
+    enabled: !!currentId,
+    retry: false,
+  });
+
+  const eligibleBankAccounts = useMemo(
+    () =>
+      (bankAccountsQuery.data ?? []).filter(
+        (account) => account.is_active && account.ledger_account_id !== null,
+      ),
+    [bankAccountsQuery.data],
+  );
 
   const invoicesQuery = useQuery({
     queryKey: ["invoices", currentId, "authorised", creditNote.contact_id, creditNote.direction],
@@ -88,6 +118,21 @@ export default function CreditNoteApplications({ creditNote }: { creditNote: Cre
   const applicationError = !applicationDate
     ? "Choose an application date."
     : amountError;
+  const refundRequestedCents = moneyToCents(refundAmount);
+  const refundAmountError =
+    !refundAmount.trim()
+      ? "Enter a refund amount."
+      : refundRequestedCents === null || refundRequestedCents <= 0n
+        ? "Enter a positive amount with up to two decimal places."
+        : remainingCents === null || refundRequestedCents > remainingCents
+          ? "Refund exceeds the credit note's remaining amount."
+          : null;
+  const refundError =
+    !refundBankAccountId
+      ? "Select a bank account."
+      : !refundDate
+        ? "Choose a refund date."
+        : refundAmountError;
 
   const applyMutation = useMutation({
     mutationFn: async () => {
@@ -116,6 +161,61 @@ export default function CreditNoteApplications({ creditNote }: { creditNote: Cre
           exact: true,
         }),
         queryClient.invalidateQueries({ queryKey: ["invoices", currentId] }),
+      ]);
+    },
+    onError: (caught) => setError(apiErrorMessage(caught)),
+  });
+
+  const refundMutation = useMutation({
+    mutationFn: async () => {
+      const response = await api.post<CreditNoteRefund>(
+        `/credit-notes/${creditNote.id}/refunds`,
+        {
+          bank_account_id: refundBankAccountId!,
+          amount: centsToMoney(refundRequestedCents!),
+          refund_date: refundDate,
+        },
+        {
+          headers: { "Idempotency-Key": crypto.randomUUID() },
+        },
+      );
+      return response.data;
+    },
+    onSuccess: async () => {
+      setConfirmRefund(false);
+      setRefundAmount("");
+      setRefundDate("");
+      setRefundBankAccountId(null);
+      setError(null);
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["credit-notes", "detail", currentId, creditNote.id],
+          exact: true,
+        }),
+        queryClient.invalidateQueries({ queryKey: ["bank-accounts", currentId] }),
+      ]);
+    },
+    onError: (caught) => setError(apiErrorMessage(caught)),
+  });
+
+  const reverseRefundMutation = useMutation({
+    mutationFn: async () => {
+      const response = await api.post<CreditNoteRefund>(
+        `/credit-notes/${creditNote.id}/refunds/${refundToReverse!.id}/reverse`,
+        { reversal_date: refundReversalDate },
+      );
+      return response.data;
+    },
+    onSuccess: async () => {
+      setRefundToReverse(null);
+      setRefundReversalDate("");
+      setError(null);
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["credit-notes", "detail", currentId, creditNote.id],
+          exact: true,
+        }),
+        queryClient.invalidateQueries({ queryKey: ["bank-accounts", currentId] }),
       ]);
     },
     onError: (caught) => setError(apiErrorMessage(caught)),
@@ -162,6 +262,29 @@ export default function CreditNoteApplications({ creditNote }: { creditNote: Cre
     if (!reverseApplication || !reversalDate) return;
     void reverseMutation.mutate();
   };
+
+  const submitRefund = () => {
+    if (!refundBankAccountId || !refundDate || !refundRequestedCents || refundAmountError) return;
+    setError(null);
+    setConfirmRefund(true);
+  };
+
+  const confirmRefundMutation = () => {
+    if (!refundBankAccountId || !refundRequestedCents) return;
+    void refundMutation.mutate();
+  };
+
+  const confirmRefundReversal = () => {
+    if (!refundToReverse || !refundReversalDate) return;
+    void reverseRefundMutation.mutate();
+  };
+
+  const selectedBankAccount = eligibleBankAccounts.find(
+    (account) => account.id === refundBankAccountId,
+  );
+  const bankAccountName = (bankAccountId: number) =>
+    eligibleBankAccounts.find((account) => account.id === bankAccountId)?.name ??
+    `Bank account ${bankAccountId}`;
 
   return (
     <section className="border border-slate-200 rounded p-3 space-y-3" aria-label="Credit note applications">
@@ -256,6 +379,82 @@ export default function CreditNoteApplications({ creditNote }: { creditNote: Cre
         </p>
       )}
 
+      <div className="border-t border-slate-200 pt-3 space-y-3">
+        <div>
+          <h3 className="text-sm font-medium text-slate-900">
+            {creditNote.direction === "AR" ? "Customer refund" : "Supplier refund received"}
+          </h3>
+          <p className="text-xs text-slate-500">
+            {creditNote.direction === "AR"
+              ? "Outbound cash movement"
+              : "Inbound cash movement"}
+          </p>
+        </div>
+        {bankAccountsQuery.isLoading && <p className="text-xs text-slate-500">Loading bank accounts…</p>}
+        {bankAccountsQuery.isError && (
+          <p className="text-sm text-rose-700" role="alert">
+            {apiErrorMessage(bankAccountsQuery.error)}
+          </p>
+        )}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+          <label className="text-xs text-slate-600">
+            <span className="block mb-1">Bank account</span>
+            <select
+              className="input w-full"
+              aria-label="Refund bank account"
+              value={refundBankAccountId ?? ""}
+              onChange={(event) => {
+                setRefundBankAccountId(event.target.value ? Number(event.target.value) : null);
+              }}
+            >
+              <option value="">Select bank account</option>
+              {eligibleBankAccounts.map((account) => (
+                <option key={account.id} value={account.id}>
+                  {account.name} · {account.account_number ?? account.bsb ?? account.id}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="text-xs text-slate-600">
+            <span className="block mb-1">Refund amount</span>
+            <input
+              className="input w-full"
+              type="number"
+              min="0.01"
+              step="0.01"
+              inputMode="decimal"
+              aria-label="Refund amount"
+              value={refundAmount}
+              onChange={(event) => setRefundAmount(event.target.value)}
+              placeholder="0.00"
+            />
+          </label>
+          <label className="text-xs text-slate-600">
+            <span className="block mb-1">Refund date</span>
+            <input
+              className="input w-full"
+              type="date"
+              aria-label="Refund date"
+              value={refundDate}
+              onChange={(event) => setRefundDate(event.target.value)}
+            />
+          </label>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-xs text-slate-500">
+            Remaining credit: {formatMoney(creditNote.remaining_amount, creditNote.currency)}
+          </span>
+          <button
+            type="button"
+            className="btn-primary text-xs"
+            disabled={!!refundError || refundMutation.isPending}
+            onClick={submitRefund}
+          >
+            {refundMutation.isPending ? "Refunding…" : "Refund"}
+          </button>
+        </div>
+      </div>
+
       <div>
         <h4 className="text-xs font-medium text-slate-700 mb-1">Application history</h4>
         {creditNote.applications.length === 0 ? (
@@ -310,6 +509,64 @@ export default function CreditNoteApplications({ creditNote }: { creditNote: Cre
         )}
       </div>
 
+      <div>
+        <h4 className="text-xs font-medium text-slate-700 mb-1">Refund history</h4>
+        {creditNote.refunds.length === 0 ? (
+          <p className="text-xs text-slate-500">No refunds yet.</p>
+        ) : (
+          <div className="overflow-auto border border-slate-200 rounded">
+            <table className="w-full text-xs min-w-[760px]">
+              <thead className="text-left text-slate-500 border-b bg-slate-50">
+                <tr>
+                  <th className="p-2 text-right">Amount</th>
+                  <th className="p-2">Refund date</th>
+                  <th className="p-2">Bank account</th>
+                  <th className="p-2">Direction</th>
+                  <th className="p-2">Status</th>
+                  <th className="p-2">Reversal date</th>
+                  <th className="p-2 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {creditNote.refunds.map((refund) => {
+                  const status = refundStatusLabel(refund);
+                  return (
+                    <tr key={refund.id} className="border-b last:border-b-0">
+                      <td className="p-2 text-right">{formatMoney(refund.amount, creditNote.currency)}</td>
+                      <td className="p-2">{formatDate(refund.refund_date)}</td>
+                      <td className="p-2 font-mono">{bankAccountName(refund.bank_account_id)}</td>
+                      <td className="p-2">
+                        {creditNote.direction === "AR" ? "Outbound" : "Inbound"}
+                      </td>
+                      <td className="p-2">
+                        <span className={status === "active" ? "text-emerald-700" : "text-slate-500"}>
+                          {status}
+                        </span>
+                      </td>
+                      <td className="p-2">{formatDate(refund.reversal_date)}</td>
+                      <td className="p-2 text-right">
+                        {status === "active" ? (
+                          <button
+                            type="button"
+                            className="text-rose-700 hover:underline"
+                            onClick={() => {
+                              setRefundToReverse(refund);
+                              setRefundReversalDate("");
+                            }}
+                          >
+                            Reverse
+                          </button>
+                        ) : null}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
       <ConfirmDialog
         open={confirmApply}
         title="Apply this credit to the invoice?"
@@ -328,6 +585,27 @@ export default function CreditNoteApplications({ creditNote }: { creditNote: Cre
         busy={applyMutation.isPending}
         onCancel={() => setConfirmApply(false)}
         onConfirm={confirmApplication}
+      />
+
+      <ConfirmDialog
+        open={confirmRefund}
+        title="Refund this credit note?"
+        message={
+          <div className="space-y-2">
+            <p>
+              Refund {formatMoney(refundRequestedCents ? centsToMoney(refundRequestedCents) : "0.00", creditNote.currency)}
+              {" "}
+              {creditNote.direction === "AR" ? "to the customer" : "to the supplier"} via {selectedBankAccount?.name ?? "the selected bank account"}.
+            </p>
+            <p>
+              {creditNote.direction === "AR" ? "Outbound cash movement" : "Inbound cash movement"} · Refund date: {refundDate}
+            </p>
+          </div>
+        }
+        confirmLabel="Refund credit"
+        busy={refundMutation.isPending}
+        onCancel={() => setConfirmRefund(false)}
+        onConfirm={confirmRefundMutation}
       />
 
       <ConfirmDialog
@@ -359,6 +637,36 @@ export default function CreditNoteApplications({ creditNote }: { creditNote: Cre
           setReversalDate("");
         }}
         onConfirm={confirmReverse}
+      />
+
+      <ConfirmDialog
+        open={refundToReverse !== null}
+        destructive
+        title="Reverse this refund?"
+        message={
+          <div className="space-y-2">
+            <p>
+              Reverse the {formatMoney(refundToReverse?.amount ?? "0", creditNote.currency)} refund through {selectedBankAccount?.name ?? `bank account ${refundToReverse?.bank_account_id ?? ""}`}. The original selected account will be reused.
+            </p>
+            <label className="block text-xs text-slate-600">
+              <span className="block mb-1">Reversal date</span>
+              <input
+                className="input w-full"
+                type="date"
+                aria-label="Refund reversal date"
+                value={refundReversalDate}
+                onChange={(event) => setRefundReversalDate(event.target.value)}
+              />
+            </label>
+          </div>
+        }
+        confirmLabel="Reverse refund"
+        busy={reverseRefundMutation.isPending}
+        onCancel={() => {
+          setRefundToReverse(null);
+          setRefundReversalDate("");
+        }}
+        onConfirm={confirmRefundReversal}
       />
     </section>
   );

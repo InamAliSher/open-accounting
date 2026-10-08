@@ -245,6 +245,29 @@ export interface CreditNoteApplication {
   reversal_date: string | null;
 }
 
+export interface CreditNoteRefund {
+  id: number;
+  credit_note_id: number;
+  bank_account_id: number;
+  bank_transaction_id: number;
+  journal_entry_id: number;
+  amount: string;
+  refund_date: string;
+  status: "active" | "reversed";
+  reversed_at: string | null;
+  reversal_date: string | null;
+  reversal_bank_transaction_id: number | null;
+  reversal_journal_entry_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreditNoteRefundCreate {
+  bank_account_id: number;
+  amount: string;
+  refund_date: string;
+}
+
 export interface CreditNote {
   id: number;
   source_invoice_id: number;
@@ -266,6 +289,7 @@ export interface CreditNote {
   applied_amount: string;
   remaining_amount: string;
   applications: CreditNoteApplication[];
+  refunds: CreditNoteRefund[];
   lines: CreditNoteLine[];
 }
 

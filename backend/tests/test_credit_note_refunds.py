@@ -140,10 +140,34 @@ def _create_credit_note(client, source, *, direction, number):
     return created.json(), posted.json()
 
 
-def _bank_account(client):
+def _bank_accounts(client):
     accounts = client.get("/api/v1/bank-accounts", headers=HEAD).json()
-    assert len(accounts) == 1
-    return accounts[0]
+    assert len(accounts) >= 1
+    return accounts
+
+
+def _create_second_bank_account(client, accounts):
+    ledger = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1001", "name": "Refund Cash", "type": "ASSET", "is_gst": False},
+    )
+    assert ledger.status_code == 201, ledger.text
+    bank = client.post(
+        "/api/v1/bank-accounts",
+        headers=HEAD,
+        json={"name": "Refund Bank Account", "ledger_account_id": ledger.json()["id"]},
+    )
+    assert bank.status_code == 201, bank.text
+    return bank.json()
+
+
+def _refund_payload(bank_account_id, amount, refund_date):
+    return {
+        "bank_account_id": bank_account_id,
+        "amount": amount,
+        "refund_date": refund_date,
+    }
 
 
 def _journal_lines(client, source_type, source_id):
@@ -162,50 +186,60 @@ def test_ar_and_ap_partial_refunds_and_reversals(client, accounts):
     ap_source = _create_source(client, accounts, direction="AP", number="REFUND-AP-SOURCE")
     ar_note, _ = _create_credit_note(client, ar_source, direction="AR", number="REFUND-AR-CN")
     ap_note, _ = _create_credit_note(client, ap_source, direction="AP", number="REFUND-AP-CN")
-    bank_account = _bank_account(client)
+    bank_accounts = _bank_accounts(client)
+    bank_account = _create_second_bank_account(client, bank_accounts)
+    assert bank_account["id"] != bank_accounts[0]["id"]
 
     ar_refund_one = client.post(
         f"/api/v1/credit-notes/{ar_note['id']}/refunds",
         headers={**HEAD, "Idempotency-Key": "ar-refund-100"},
-        json={"amount": "100.00", "refund_date": "2026-06-15"},
+        json=_refund_payload(bank_account["id"], "100.00", "2026-06-15"),
     )
     assert ar_refund_one.status_code == 201, ar_refund_one.text
     ar_refund_one_json = ar_refund_one.json()
     assert Decimal(ar_refund_one_json["amount"]) == Decimal("100.00")
+    assert ar_refund_one_json["bank_account_id"] == bank_account["id"]
 
     ar_refund_two = client.post(
         f"/api/v1/credit-notes/{ar_note['id']}/refunds",
         headers={**HEAD, "Idempotency-Key": "ar-refund-50"},
-        json={"amount": "50.00", "refund_date": "2026-06-16"},
+        json=_refund_payload(bank_account["id"], "50.00", "2026-06-16"),
     )
     assert ar_refund_two.status_code == 201, ar_refund_two.text
 
     replay = client.post(
         f"/api/v1/credit-notes/{ar_note['id']}/refunds",
         headers={**HEAD, "Idempotency-Key": "ar-refund-100"},
-        json={"amount": "100.00", "refund_date": "2026-06-15"},
+        json=_refund_payload(bank_account["id"], "100.00", "2026-06-15"),
     )
     assert replay.status_code == 201, replay.text
     assert replay.json()["id"] == ar_refund_one_json["id"]
 
+    different_bank = client.post(
+        f"/api/v1/credit-notes/{ar_note['id']}/refunds",
+        headers={**HEAD, "Idempotency-Key": "ar-refund-100"},
+        json=_refund_payload(bank_accounts[0]["id"], "100.00", "2026-06-15"),
+    )
+    assert different_bank.status_code == 409, different_bank.text
+
     conflict = client.post(
         f"/api/v1/credit-notes/{ar_note['id']}/refunds",
         headers={**HEAD, "Idempotency-Key": "ar-refund-100"},
-        json={"amount": "101.00", "refund_date": "2026-06-15"},
+        json=_refund_payload(bank_account["id"], "101.00", "2026-06-15"),
     )
     assert conflict.status_code == 409, conflict.text
 
     over_refund = client.post(
         f"/api/v1/credit-notes/{ar_note['id']}/refunds",
         headers={**HEAD, "Idempotency-Key": "ar-over-refund"},
-        json={"amount": "71.00", "refund_date": "2026-06-17"},
+        json=_refund_payload(bank_account["id"], "71.00", "2026-06-17"),
     )
     assert over_refund.status_code == 409, over_refund.text
 
     ap_refund = client.post(
         f"/api/v1/credit-notes/{ap_note['id']}/refunds",
         headers={**HEAD, "Idempotency-Key": "ap-refund-70"},
-        json={"amount": "70.00", "refund_date": "2026-06-18"},
+        json=_refund_payload(bank_account["id"], "70.00", "2026-06-18"),
     )
     assert ap_refund.status_code == 201, ap_refund.text
 
@@ -227,6 +261,8 @@ def test_ar_and_ap_partial_refunds_and_reversals(client, accounts):
     assert ar_reversal.status_code == 200, ar_reversal.text
     assert ar_reversal.json()["status"] == "reversed"
     assert ar_reversal.json()["reversal_date"] == "2026-06-20"
+    assert ar_reversal.json()["bank_account_id"] == bank_account["id"]
+    assert ar_reversal.json()["reversal_bank_transaction_id"] is not None
 
     duplicate_reversal = client.post(
         f"/api/v1/credit-notes/{ar_note['id']}/refunds/{ar_refund_two.json()['id']}/reverse",
@@ -247,8 +283,12 @@ def test_ar_and_ap_partial_refunds_and_reversals(client, accounts):
         assert original_refund.reversal_journal_entry_id is not None
         assert original_refund.bank_transaction_id is not None
         assert original_refund.journal_entry_id is not None
-        assert db.get(BankTransaction, original_refund.bank_transaction_id).direction == "out"
-        assert db.get(BankTransaction, original_refund.reversal_bank_transaction_id).direction == "in"
+        original_transaction = db.get(BankTransaction, original_refund.bank_transaction_id)
+        reversal_transaction = db.get(BankTransaction, original_refund.reversal_bank_transaction_id)
+        assert original_transaction.bank_account_id == bank_account["id"]
+        assert reversal_transaction.bank_account_id == bank_account["id"]
+        assert original_transaction.direction == "out"
+        assert reversal_transaction.direction == "in"
         assert db.get(JournalEntry, original_refund.journal_entry_id).source_type == "refund_ar"
         assert db.get(JournalEntry, original_refund.reversal_journal_entry_id).source_type == "refund_reversal_ar"
         assert db.get(JournalEntry, original_refund.reversal_journal_entry_id).reverses_entry_id == original_refund.journal_entry_id
@@ -320,7 +360,7 @@ def test_ar_and_ap_partial_refunds_and_reversals(client, accounts):
 def test_refund_application_coexistence_and_locked_dates(client, accounts):
     source = _create_source(client, accounts, direction="AR", number="COEXIST-SOURCE")
     note, _ = _create_credit_note(client, source, direction="AR", number="COEXIST-CN")
-    bank_account = _bank_account(client)
+    bank_account = _bank_accounts(client)[0]
 
     application = client.post(
         f"/api/v1/credit-notes/{note['id']}/applications",
@@ -331,7 +371,7 @@ def test_refund_application_coexistence_and_locked_dates(client, accounts):
     refund = client.post(
         f"/api/v1/credit-notes/{note['id']}/refunds",
         headers={**HEAD, "Idempotency-Key": "coexist-refund"},
-        json={"amount": "100.00", "refund_date": "2026-06-11"},
+        json=_refund_payload(bank_account["id"], "100.00", "2026-06-11"),
     )
     assert refund.status_code == 201, refund.text
 
@@ -368,7 +408,7 @@ def test_refund_application_coexistence_and_locked_dates(client, accounts):
     blocked_refund = client.post(
         f"/api/v1/credit-notes/{note['id']}/refunds",
         headers={**HEAD, "Idempotency-Key": "blocked-refund"},
-        json={"amount": "1.00", "refund_date": "2026-06-11"},
+        json=_refund_payload(bank_account["id"], "1.00", "2026-06-11"),
     )
     assert blocked_refund.status_code == 409
     blocked_reversal = client.post(
@@ -385,10 +425,11 @@ def test_refund_application_coexistence_and_locked_dates(client, accounts):
 def test_refund_schema_and_provenance_are_created_on_startup(client, accounts):
     source = _create_source(client, accounts, direction="AR", number="PROVENANCE-SOURCE")
     note, _ = _create_credit_note(client, source, direction="AR", number="PROVENANCE-CN")
+    bank_account = _bank_accounts(client)[0]
     refund = client.post(
         f"/api/v1/credit-notes/{note['id']}/refunds",
         headers={**HEAD, "Idempotency-Key": "provenance-refund"},
-        json={"amount": "25.00", "refund_date": "2026-06-25"},
+        json=_refund_payload(bank_account["id"], "25.00", "2026-06-25"),
     )
     assert refund.status_code == 201, refund.text
 
@@ -410,4 +451,49 @@ def test_refund_schema_and_provenance_are_created_on_startup(client, accounts):
         assert db.query(CreditNote).filter_by(id=note["id"]).one().currency == "AUD"
         assert db.query(JournalEntry).filter_by(id=refund_row.journal_entry_id).one().source_type == JournalEntrySource.REFUND_AR
         assert db.query(BankTransaction).filter_by(id=refund_row.bank_transaction_id).one().direction == "out"
-        assert db.query(BankAccount).filter_by(id=_bank_account(client)["id"]).one().ledger_account_id is not None
+        assert db.query(BankAccount).filter_by(id=bank_account["id"]).one().ledger_account_id is not None
+
+
+def test_refund_rejects_invalid_selected_bank_account(client, accounts):
+    source = _create_source(client, accounts, direction="AR", number="INVALID-BANK-SOURCE")
+    note, _ = _create_credit_note(client, source, direction="AR", number="INVALID-BANK-CN")
+    bank_account = _bank_accounts(client)[0]
+
+    missing = client.post(
+        f"/api/v1/credit-notes/{note['id']}/refunds",
+        headers={**HEAD, "Idempotency-Key": "missing-bank"},
+        json=_refund_payload(bank_account["id"] + 999999, "10.00", "2026-06-26"),
+    )
+    assert missing.status_code == 409
+    assert "does not exist" in missing.json()["detail"]
+
+    inactive = client.patch(
+        f"/api/v1/bank-accounts/{bank_account['id']}",
+        headers=HEAD,
+        json={"is_active": False},
+    )
+    assert inactive.status_code == 200
+    inactive_refund = client.post(
+        f"/api/v1/credit-notes/{note['id']}/refunds",
+        headers={**HEAD, "Idempotency-Key": "inactive-bank"},
+        json=_refund_payload(bank_account["id"], "10.00", "2026-06-27"),
+    )
+    assert inactive_refund.status_code == 409
+    assert "inactive" in inactive_refund.json()["detail"]
+
+    with company_session("tc") as db:
+        unlinked = BankAccount(
+            name="Unlinked Refund Bank",
+            ledger_account_id=None,
+            is_active=True,
+        )
+        db.add(unlinked)
+        db.commit()
+        unlinked_id = unlinked.id
+    unlinked_refund = client.post(
+        f"/api/v1/credit-notes/{note['id']}/refunds",
+        headers={**HEAD, "Idempotency-Key": "unlinked-bank"},
+        json=_refund_payload(unlinked_id, "10.00", "2026-06-28"),
+    )
+    assert unlinked_refund.status_code == 409
+    assert "no ledger account mapping" in unlinked_refund.json()["detail"]
