@@ -557,7 +557,8 @@ test("AR and AP credit notes authorise to unapplied credits with immutable journ
     await expect(authorisedDialog.getByLabel("Issue date")).toHaveCount(0);
     await expect(authorisedDialog.getByLabel(/Credited quantity/)).toHaveCount(0);
     await expect(authorisedDialog.getByRole("button", { name: "Apply", exact: true })).toBeVisible();
-    for (const forbidden of [/authorise/i, /refund/i, /payment/i, /void/i, /delete/i]) {
+    await expect(authorisedDialog.getByRole("button", { name: /refund/i })).toBeVisible();
+    for (const forbidden of [/authorise/i, /payment/i, /void/i, /delete/i]) {
       await expect(authorisedDialog.getByRole("button", { name: forbidden })).toHaveCount(0);
     }
 
@@ -571,7 +572,8 @@ test("AR and AP credit notes authorise to unapplied credits with immutable journ
     await expect(authorisedDialog.getByText("Status authorised", { exact: true })).toBeVisible();
     await expect(authorisedDialog.getByText("Credit balances", { exact: true })).toBeVisible();
     await expect(authorisedDialog.getByRole("button", { name: "Apply", exact: true })).toBeVisible();
-    await expect(authorisedDialog.getByRole("button", { name: /authorise|refund|payment|void|delete/i })).toHaveCount(0);
+    await expect(authorisedDialog.getByRole("button", { name: /refund/i })).toBeVisible();
+    await expect(authorisedDialog.getByRole("button", { name: /authorise|payment|void|delete/i })).toHaveCount(0);
     await authorisedDialog.getByRole("button", { name: "Close" }).click();
     await closeInvoice(page);
 
