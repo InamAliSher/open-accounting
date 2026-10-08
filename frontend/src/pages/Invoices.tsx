@@ -82,6 +82,7 @@ export default function InvoicesPage({
         <ImportExcelDialog
           onClose={() => setShowExcel(false)}
           defaultDirection={defaultDirection}
+          fixedDirection={fixedDirection === "AP" || fixedDirection === "AR" ? fixedDirection : undefined}
           showDirection={showDirection}
         />
       )}

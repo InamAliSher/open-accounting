@@ -33,12 +33,14 @@ async function importRows(payload: {
 interface Props {
   onClose: () => void;
   defaultDirection?: InvoiceDirection;
+  fixedDirection?: InvoiceDirection;
   showDirection?: boolean;
 }
 
 export default function ImportExcelDialog({
   onClose,
   defaultDirection = "AP",
+  fixedDirection,
   showDirection = true,
 }: Props) {
   const qc = useQueryClient();
@@ -72,19 +74,21 @@ export default function ImportExcelDialog({
   const missing = REQUIRED.filter((f) => mapping[f] == null);
   const canUpload = !preview && !result && !!file && !uploadMut.isPending;
   const canImport = !!preview && !result && missing.length === 0 && !importMut.isPending;
+  const startImport = () => {
+    if (!preview) return;
+    importMut.mutate({
+      mapping: fixedDirection ? { ...mapping, direction: null } : mapping,
+      rows: preview.rows,
+      direction_default: fixedDirection ?? direction,
+    });
+  };
 
   useModalKeys({
     open: true,
     onClose,
     onSubmit: () => {
       if (canUpload && file) uploadMut.mutate(file);
-      else if (canImport && preview) {
-        importMut.mutate({
-          mapping,
-          rows: preview.rows,
-          direction_default: direction,
-        });
-      }
+      else if (canImport) startImport();
     },
   });
 
@@ -158,7 +162,7 @@ export default function ImportExcelDialog({
                 )}
               </div>
 
-              {showDirection && (
+              {showDirection && !fixedDirection && (
                 <div className="mb-3 flex items-center gap-3 text-sm">
                   <span className="text-slate-600">Default direction when row has none:</span>
                   <select
@@ -170,6 +174,13 @@ export default function ImportExcelDialog({
                     <option value="AR">AR (sales)</option>
                   </select>
                 </div>
+              )}
+              {fixedDirection && (
+                <p className="mb-3 text-sm text-slate-600">
+                  Every imported row will be {fixedDirection} (
+                  {fixedDirection === "AP" ? "bills" : "sales"}); spreadsheet direction values
+                  are ignored.
+                </p>
               )}
 
               <h3 className="text-sm font-medium mb-2">
@@ -262,13 +273,7 @@ export default function ImportExcelDialog({
               <button
                 className="btn-primary"
                 disabled={!canImport}
-                onClick={() =>
-                  importMut.mutate({
-                    mapping,
-                    rows: preview.rows,
-                    direction_default: direction,
-                  })
-                }
+                onClick={startImport}
               >
                 {importMut.isPending
                   ? "Importing…"

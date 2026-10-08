@@ -359,6 +359,114 @@ test("Supplier Bills keeps manual, PDF, and Excel/CSV entry AP-only", async ({
   expect(importPayload.direction_default).toBe("AP");
 });
 
+test("Excel imports lock supplier/customer pages and honor mapped direction on generic invoices", async ({
+  page,
+  request,
+}) => {
+  await ensureCompanyById(request, COMPANY_ID, "Fictional Contact-First Pty Ltd");
+  const supplierName = `Fictional Import Supplier ${Date.now()}`;
+  const customerName = `Fictional Import Customer ${Date.now()}`;
+  await createContact(request, supplierName, "supplier");
+  await createContact(request, customerName, "customer");
+
+  const imports = [
+    {
+      path: "/supplier-bills",
+      contactName: supplierName,
+      spreadsheetDirection: "AR",
+      expectedDirection: "AP",
+      invoiceNumber: `FICTIONAL-IMPORT-AP-${Date.now()}`,
+      locked: true,
+    },
+    {
+      path: "/customer-invoices",
+      contactName: customerName,
+      spreadsheetDirection: "AP",
+      expectedDirection: "AR",
+      invoiceNumber: `FICTIONAL-IMPORT-AR-${Date.now()}`,
+      locked: true,
+    },
+    {
+      path: "/invoices",
+      contactName: customerName,
+      spreadsheetDirection: "AR",
+      expectedDirection: "AR",
+      invoiceNumber: `FICTIONAL-IMPORT-MAPPED-${Date.now()}`,
+      locked: false,
+    },
+  ] as const;
+
+  for (const invoiceImport of imports) {
+    await page.goto(invoiceImport.path);
+    await selectCompany(page);
+    await page.getByRole("button", { name: "Import Excel/CSV", exact: true }).click();
+    const dialog = page.getByRole("heading", {
+      name: "Import invoices from Excel / CSV",
+    }).locator("../..");
+    await dialog.locator('input[type="file"]').setInputFiles({
+      name: "fictional-direction-import.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from(
+        `contact_name,direction,invoice_number,issue_date,total\n${invoiceImport.contactName},${invoiceImport.spreadsheetDirection},${invoiceImport.invoiceNumber},2026-08-01,50.00\n`,
+        "utf8",
+      ),
+    });
+    await dialog.getByRole("button", { name: "Next: review mapping" }).click();
+    for (const [field, column] of Object.entries({
+      contact_name: 0,
+      direction: 1,
+      invoice_number: 2,
+      issue_date: 3,
+      total: 4,
+    })) {
+      await dialog.getByText(field, { exact: true })
+        .locator("..")
+        .getByRole("combobox")
+        .selectOption(String(column));
+    }
+
+    if (invoiceImport.locked) {
+      const directionName = invoiceImport.expectedDirection === "AP" ? "AP (bills)" : "AR (sales)";
+      await expect(dialog.getByText(
+        `Every imported row will be ${directionName}; spreadsheet direction values are ignored.`,
+        { exact: true },
+      )).toBeVisible();
+    } else {
+      await expect(dialog.getByText("Default direction when row has none:")).toBeVisible();
+    }
+
+    const importRequest = page.waitForRequest((observed) =>
+      observed.method() === "POST" && observed.url().includes("/api/v1/invoices/import-excel-rows"),
+    );
+    const importResponse = page.waitForResponse((response) =>
+      response.request().method() === "POST" && response.url().includes("/api/v1/invoices/import-excel-rows"),
+    );
+    await dialog.getByRole("button", { name: /Import 1 row/ }).click();
+    const payload = (await importRequest).postDataJSON() as {
+      direction_default: string;
+      mapping: Record<string, number | null>;
+    };
+    expect(payload.direction_default).toBe(invoiceImport.locked ? invoiceImport.expectedDirection : "AP");
+    expect(payload.mapping.direction).toBe(invoiceImport.locked ? null : 1);
+
+    const result = (await (await importResponse).json()) as {
+      created: number[];
+      skipped: { row: number; reason: string }[];
+    };
+    expect(result.created).toHaveLength(1);
+    expect(result.skipped).toEqual([]);
+    const invoices = await getJson<Array<{ id: number; invoice_number: string; direction: string }>>(
+      request,
+      "/invoices",
+    );
+    expect(invoices.find((invoice) => invoice.id === result.created[0])).toMatchObject({
+      invoice_number: invoiceImport.invoiceNumber,
+      direction: invoiceImport.expectedDirection,
+    });
+    await dialog.getByRole("button", { name: "Done" }).click();
+  }
+});
+
 test("contact-first AP entry posts correctly and keeps draft credit notes isolated", async ({
   page,
   request,
