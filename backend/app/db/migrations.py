@@ -727,20 +727,21 @@ def _rebuild_bank_accounts(conn) -> None:
     """Apply the mapping FK/unique constraint while preserving bank rows."""
     from ..models.company import BankAccount
 
-    duplicate = conn.execute(
-        text(
-            "SELECT ledger_account_id FROM bank_accounts "
-            "WHERE ledger_account_id IS NOT NULL GROUP BY ledger_account_id "
-            "HAVING COUNT(*) > 1 LIMIT 1"
-        )
-    ).first()
-    if duplicate is not None:
-        raise DataRecoveryRequiredError(
-            "Cannot add unique bank ledger mappings: multiple bank accounts already "
-            f"reference account {duplicate[0]}"
-        )
-
     old_columns = _existing_columns(conn, "bank_accounts")
+    if "ledger_account_id" in old_columns:
+        duplicate = conn.execute(
+            text(
+                "SELECT ledger_account_id FROM bank_accounts "
+                "WHERE ledger_account_id IS NOT NULL GROUP BY ledger_account_id "
+                "HAVING COUNT(*) > 1 LIMIT 1"
+            )
+        ).first()
+        if duplicate is not None:
+            raise DataRecoveryRequiredError(
+                "Cannot add unique bank ledger mappings: multiple bank accounts already "
+                f"reference account {duplicate[0]}"
+            )
+
     model_columns = [column.name for column in BankAccount.__table__.columns]
     copied_columns = [column for column in model_columns if column in old_columns]
     high_water_id = _autoincrement_high_water(conn, "bank_accounts")

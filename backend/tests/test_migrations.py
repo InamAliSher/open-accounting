@@ -150,10 +150,41 @@ def _outgoing_sequence(conn) -> int:
 def _populate_legacy_bank_graph(engine, *, stale_helper: bool = False):
     """Create a valid old bank table with a deleted-ID high-water mark."""
     with engine.begin() as conn:
-        conn.execute(text("CREATE TABLE accounts (id INTEGER PRIMARY KEY)"))
-        conn.execute(text("CREATE TABLE bank_accounts (id INTEGER PRIMARY KEY)"))
-        conn.execute(text("INSERT INTO accounts (id) VALUES (1)"))
-        conn.execute(text("INSERT INTO bank_accounts (id) VALUES (1)"))
+        conn.execute(
+            text(
+                "CREATE TABLE accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "code VARCHAR(20) NOT NULL, "
+                "name VARCHAR(200) NOT NULL, "
+                "type VARCHAR(20) NOT NULL, "
+                "parent_id INTEGER REFERENCES accounts(id) ON DELETE RESTRICT, "
+                "is_gst BOOLEAN NOT NULL DEFAULT 0, "
+                "active BOOLEAN NOT NULL DEFAULT 1, "
+                "description VARCHAR(500), "
+                "created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL"
+                ")"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE bank_accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "name VARCHAR(200) NOT NULL, "
+                "opening_balance NUMERIC(16, 2) NOT NULL DEFAULT 0, "
+                "is_active BOOLEAN NOT NULL DEFAULT 1, "
+                "created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL"
+                ")"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO accounts (id, code, name, type, is_gst, active) "
+                "VALUES (1, '1000', 'Operating cash', 'ASSET', 0, 1)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO bank_accounts (id, name) VALUES (1, 'Legacy Bank')")
+        )
         conn.execute(text(_OLD_BANK_TXN_DDL))
         conn.execute(
             text(
