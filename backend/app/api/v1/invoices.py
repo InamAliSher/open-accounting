@@ -30,6 +30,7 @@ from ...schemas.invoice import (
     ExcelImportPayload,
     InvoiceCreate,
     InvoiceOut,
+    InvoicePostOut,
     InvoiceUpdate,
     PdfUploadResult,
     SpreadsheetPreview,
@@ -236,7 +237,7 @@ def _serialize(inv: Invoice) -> dict:
         "id": inv.id,
         "direction": inv.direction,
         "contact_id": inv.contact_id,
-        "contact_name": inv.contact.name if inv.contact else None,
+        "contact_name": inv.contact_name_snapshot,
         "invoice_number": inv.invoice_number,
         "issue_date": inv.issue_date,
         "due_date": inv.due_date,
@@ -247,6 +248,27 @@ def _serialize(inv: Invoice) -> dict:
         "gst_inclusive": inv.gst_inclusive,
         "status": inv.status,
         "paid_amount": inv.paid_amount,
+        "credit_applied_amount": sum(
+            (
+                application.amount
+                for application in inv.credit_applications
+                if application.status == "active"
+            ),
+            Decimal("0"),
+        ),
+        "outstanding_amount": max(
+            Decimal("0"),
+            Decimal(inv.total)
+            - Decimal(inv.paid_amount or 0)
+            - sum(
+                (
+                    application.amount
+                    for application in inv.credit_applications
+                    if application.status == "active"
+                ),
+                Decimal("0"),
+            ),
+        ),
         "paid_date": inv.paid_date,
         "authorised_at": inv.authorised_at,
         "notes": inv.notes,
@@ -343,6 +365,16 @@ def _source_ref_collision_message(source, source_ref: str, existing: Invoice) ->
     )
 
 
+def _contact_snapshot_values(contact: Contact) -> dict[str, str | None]:
+    return {
+        "contact_name_snapshot": contact.name,
+        "contact_abn_snapshot": contact.abn,
+        "contact_address_snapshot": contact.address,
+        "contact_email_snapshot": contact.email,
+        "contact_phone_snapshot": contact.phone,
+    }
+
+
 @router.post("", response_model=InvoiceOut, status_code=201)
 def create_invoice(
     payload: InvoiceCreate,
@@ -410,6 +442,7 @@ def create_invoice(
     inv = Invoice(
         direction=payload.direction,
         contact_id=contact.id,
+        **_contact_snapshot_values(contact),
         invoice_number=payload.invoice_number,
         issue_date=payload.issue_date,
         due_date=payload.due_date,
@@ -476,15 +509,27 @@ def _is_void(inv: Invoice) -> bool:
 
 
 def _resolve_contact(db: Session, payload: InvoiceCreate) -> Contact:
-    if payload.contact_id:
+    if payload.contact_id is not None:
         c = db.get(Contact, payload.contact_id)
         if c is None:
-            raise HTTPException(404, f"Contact {payload.contact_id} not found")
+            raise HTTPException(422, f"Contact {payload.contact_id} not found")
+        _validate_contact_for_direction(c, payload.direction)
         return c
     if not payload.contact_name:
         raise HTTPException(422, "Either contact_id or contact_name must be provided")
     kind = "supplier" if payload.direction == "AP" else "customer"
     return get_or_create_contact(db=db, name=payload.contact_name, kind=kind, abn=payload.contact_abn)
+
+
+def _validate_contact_for_direction(contact: Contact, direction: str) -> None:
+    if not contact.active:
+        raise HTTPException(409, f"Contact {contact.id} is inactive")
+    required_kind = "supplier" if direction == "AP" else "customer"
+    if contact.kind not in {required_kind, "both"}:
+        raise HTTPException(
+            422,
+            f"Contact {contact.id} is not compatible with {direction} invoices",
+        )
 
 
 @router.patch("/{invoice_id}", response_model=InvoiceOut)
@@ -540,6 +585,12 @@ def update_invoice(
     # same PATCH.  Posting repeats the check to protect legacy/drifted rows.
     effective_direction = changes.get("direction", inv.direction)
     effective_lines = lines if lines is not None else inv.lines
+    effective_contact_id = changes.get("contact_id", inv.contact_id)
+    if _is_draft(inv):
+        contact = db.get(Contact, effective_contact_id)
+        if contact is None:
+            raise HTTPException(422, f"Contact {effective_contact_id} not found")
+        _validate_contact_for_direction(contact, effective_direction)
     if effective_lines:
         try:
             invoice_posting.validate_invoice_line_accounts(
@@ -550,6 +601,9 @@ def update_invoice(
 
     for field, value in changes.items():
         setattr(inv, field, value)
+    if _is_draft(inv) and "contact_id" in changes:
+        for field, value in _contact_snapshot_values(contact).items():
+            setattr(inv, field, value)
     if lines is not None:
         inv.lines.clear()
         db.flush()
@@ -570,7 +624,7 @@ def update_invoice(
     return _serialize(_attach_journal_entries(db, inv))
 
 
-@router.post("/{invoice_id}/post")
+@router.post("/{invoice_id}/post", response_model=InvoicePostOut)
 def post_invoice_endpoint(
     invoice_id: PathId,
     company: Company = Depends(get_current_company),
@@ -906,6 +960,7 @@ def import_excel_rows(
             inv = Invoice(
                 direction=direction,
                 contact_id=contact.id,
+                **_contact_snapshot_values(contact),
                 invoice_number=parsed["invoice_number"],
                 issue_date=date.fromisoformat(parsed["issue_date"]),
                 due_date=date.fromisoformat(parsed["due_date"]) if parsed.get("due_date") else None,

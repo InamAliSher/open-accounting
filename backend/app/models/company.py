@@ -124,6 +124,22 @@ class InvoiceSource(str, Enum):
     EXCEL = "excel"
 
 
+class CreditNoteStatus(str, Enum):
+    DRAFT = "draft"
+    AUTHORISED = "authorised"
+    VOID = "void"
+
+
+class CreditNoteApplicationStatus(str, Enum):
+    ACTIVE = "active"
+    REVERSED = "reversed"
+
+
+class CreditNoteRefundStatus(str, Enum):
+    ACTIVE = "active"
+    REVERSED = "reversed"
+
+
 # Decimal precision used throughout: 2 decimal places, up to 14 integer digits.
 MONEY = Numeric(16, 2)
 
@@ -139,6 +155,11 @@ class Invoice(CompanyBase):
     contact_id: Mapped[int] = mapped_column(
         ForeignKey("contacts.id", ondelete="RESTRICT"), nullable=False, index=True
     )
+    contact_name_snapshot: Mapped[str | None] = mapped_column(String(200))
+    contact_abn_snapshot: Mapped[str | None] = mapped_column(String(20))
+    contact_address_snapshot: Mapped[str | None] = mapped_column(String(500))
+    contact_email_snapshot: Mapped[str | None] = mapped_column(String(200))
+    contact_phone_snapshot: Mapped[str | None] = mapped_column(String(50))
     invoice_number: Mapped[str] = mapped_column(String(80), nullable=False)
     issue_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     due_date: Mapped[date | None] = mapped_column(Date)
@@ -175,6 +196,9 @@ class Invoice(CompanyBase):
     payment_allocations: Mapped[list["InvoicePaymentAllocation"]] = relationship(
         back_populates="invoice"
     )
+    credit_applications: Mapped[list["CreditNoteApplication"]] = relationship(
+        back_populates="invoice"
+    )
 
 
 class InvoiceLine(CompanyBase):
@@ -201,6 +225,285 @@ class InvoiceLine(CompanyBase):
 
     invoice: Mapped[Invoice] = relationship(back_populates="lines")
     account: Mapped[Account | None] = relationship()
+
+
+class CreditNote(CompanyBase):
+    __tablename__ = "credit_notes"
+    __table_args__ = (
+        UniqueConstraint(
+            "direction",
+            "contact_id",
+            "credit_note_number",
+            name="uq_credit_note_dir_contact_no",
+        ),
+        CheckConstraint("direction IN ('AR', 'AP')", name="ck_credit_note_direction"),
+        CheckConstraint("currency = 'AUD'", name="ck_credit_note_currency_aud"),
+        CheckConstraint(
+            "status IN ('draft', 'authorised', 'void')",
+            name="ck_credit_note_status_allowed",
+        ),
+        CheckConstraint("subtotal >= 0", name="ck_credit_note_subtotal_nonneg"),
+        CheckConstraint("gst_amount >= 0", name="ck_credit_note_gst_nonneg"),
+        CheckConstraint("total >= 0", name="ck_credit_note_total_nonneg"),
+        CheckConstraint("total > 0", name="ck_credit_note_total_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("invoices.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    direction: Mapped[str] = mapped_column(String(2), nullable=False, index=True)
+    contact_id: Mapped[int] = mapped_column(
+        ForeignKey("contacts.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    credit_note_number: Mapped[str] = mapped_column(String(80), nullable=False)
+    issue_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="AUD")
+    subtotal: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    gst_amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    total: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    gst_inclusive: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    status: Mapped[CreditNoteStatus] = mapped_column(
+        String(10), nullable=False, default=CreditNoteStatus.DRAFT, index=True
+    )
+    notes: Mapped[str | None] = mapped_column(String(1000))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    source_invoice: Mapped[Invoice] = relationship()
+    contact: Mapped[Contact] = relationship()
+    lines: Mapped[list["CreditNoteLine"]] = relationship(
+        back_populates="credit_note", cascade="all, delete-orphan"
+    )
+    applications: Mapped[list["CreditNoteApplication"]] = relationship(
+        back_populates="credit_note", cascade="all, delete-orphan"
+    )
+    refunds: Mapped[list["CreditNoteRefund"]] = relationship(
+        back_populates="credit_note", cascade="all, delete-orphan"
+    )
+
+
+class CreditNoteLine(CompanyBase):
+    __tablename__ = "credit_note_lines"
+    __table_args__ = (
+        UniqueConstraint(
+            "credit_note_id",
+            "source_invoice_line_id",
+            name="uq_credit_note_line_note_source_line",
+        ),
+        CheckConstraint("quantity > 0", name="ck_credit_note_line_quantity_positive"),
+        CheckConstraint("unit_price >= 0", name="ck_credit_note_line_unit_price_nonneg"),
+        CheckConstraint("line_subtotal >= 0", name="ck_credit_note_line_subtotal_nonneg"),
+        CheckConstraint("line_gst >= 0", name="ck_credit_note_line_gst_nonneg"),
+        CheckConstraint("line_total >= 0", name="ck_credit_note_line_total_nonneg"),
+        CheckConstraint("line_subtotal > 0", name="ck_credit_note_line_subtotal_positive"),
+        CheckConstraint("line_total > 0", name="ck_credit_note_line_total_positive"),
+        CheckConstraint("line_gst <= line_total", name="ck_credit_note_line_gst_within"),
+        CheckConstraint(
+            "tax_code IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none')",
+            name="ck_credit_note_line_tax_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    credit_note_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_notes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_invoice_line_id: Mapped[int] = mapped_column(
+        ForeignKey("invoice_lines.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    description: Mapped[str] = mapped_column(String(500), nullable=False)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    quantity: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    gst_rate: Mapped[Decimal] = mapped_column(Numeric(5, 4), nullable=False)
+    line_subtotal: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    line_gst: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    line_total: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    tax_code: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    credit_note: Mapped[CreditNote] = relationship(back_populates="lines")
+    source_invoice_line: Mapped[InvoiceLine] = relationship()
+    account: Mapped[Account] = relationship()
+
+
+class CreditNoteApplication(CompanyBase):
+    __tablename__ = "credit_note_applications"
+    __table_args__ = (
+        Index(
+            "ix_credit_note_application_active_pair",
+            "credit_note_id",
+            "invoice_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
+        CheckConstraint("amount > 0", name="ck_credit_note_application_amount_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    credit_note_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_notes.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("invoices.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    application_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    status: Mapped[CreditNoteApplicationStatus] = mapped_column(
+        String(10), nullable=False, default=CreditNoteApplicationStatus.ACTIVE, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    credit_note: Mapped[CreditNote] = relationship(back_populates="applications")
+    invoice: Mapped[Invoice] = relationship(back_populates="credit_applications")
+    reversal: Mapped["CreditNoteApplicationReversal | None"] = relationship(
+        back_populates="application",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class CreditNoteApplicationReversal(CompanyBase):
+    __tablename__ = "credit_note_application_reversals"
+    __table_args__ = (
+        UniqueConstraint(
+            "application_id",
+            name="uq_credit_note_application_reversal_application",
+        ),
+        CheckConstraint("reversal_date IS NOT NULL", name="ck_credit_note_application_reversal_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "credit_note_applications.id", ondelete="RESTRICT"
+        ),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    reversal_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    application: Mapped[CreditNoteApplication] = relationship(
+        back_populates="reversal"
+    )
+
+
+class CreditNoteApplicationIdempotencyKey(CompanyBase):
+    __tablename__ = "credit_note_application_idempotency_keys"
+    __table_args__ = (
+        UniqueConstraint(
+            "application_id",
+            name="uq_credit_note_application_idempotency_application",
+        ),
+    )
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "credit_note_applications.id", ondelete="CASCADE"
+        ),
+        nullable=False,
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class CreditNoteRefund(CompanyBase):
+    __tablename__ = "credit_note_refunds"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_credit_note_refund_amount_positive"),
+        CheckConstraint(
+            "status IN ('active', 'reversed')",
+            name="ck_credit_note_refund_status",
+        ),
+        UniqueConstraint(
+            "credit_note_id",
+            "bank_transaction_id",
+            name="uq_credit_note_refund_txn",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    credit_note_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_notes.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    bank_transaction_id: Mapped[int] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="RESTRICT"), nullable=False
+    )
+    journal_entry_id: Mapped[int] = mapped_column(
+        ForeignKey("journal_entries.id", ondelete="RESTRICT"), nullable=False
+    )
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    refund_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    status: Mapped[CreditNoteRefundStatus] = mapped_column(
+        String(10), nullable=False, default=CreditNoteRefundStatus.ACTIVE, index=True
+    )
+    reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reversal_date: Mapped[date | None] = mapped_column(Date)
+    reversal_bank_transaction_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="RESTRICT"),
+        unique=True,
+    )
+    reversal_journal_entry_id: Mapped[int | None] = mapped_column(
+        ForeignKey("journal_entries.id", ondelete="RESTRICT"),
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    credit_note: Mapped[CreditNote] = relationship(back_populates="refunds")
+    bank_transaction: Mapped[BankTransaction] = relationship(
+        foreign_keys=[bank_transaction_id]
+    )
+    journal_entry: Mapped[JournalEntry] = relationship(
+        foreign_keys=[journal_entry_id]
+    )
+    reversal_bank_transaction: Mapped[BankTransaction | None] = relationship(
+        foreign_keys=[reversal_bank_transaction_id]
+    )
+    reversal_journal_entry: Mapped[JournalEntry | None] = relationship(
+        foreign_keys=[reversal_journal_entry_id]
+    )
+
+
+class CreditNoteRefundIdempotencyKey(CompanyBase):
+    __tablename__ = "credit_note_refund_idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    refund_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_note_refunds.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    refund: Mapped[CreditNoteRefund] = relationship()
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +591,9 @@ class BankAccount(CompanyBase):
     bsb: Mapped[str | None] = mapped_column(String(20))
     account_number: Mapped[str | None] = mapped_column(String(50))
     opening_balance: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal("0"))
+    ledger_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT"), unique=True
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     notes: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(
@@ -558,6 +864,14 @@ class JournalEntrySource(str, Enum):
     INVOICE_AR = "invoice_ar"
     INVOICE_AP = "invoice_ap"
     INVOICE_REVERSAL = "invoice_reversal"
+    CREDIT_NOTE_AR = "credit_note_ar"
+    CREDIT_NOTE_AP = "credit_note_ap"
+    CREDIT_NOTE_VOID_AR = "credit_note_void_ar"
+    CREDIT_NOTE_VOID_AP = "credit_note_void_ap"
+    REFUND_AR = "refund_ar"
+    REFUND_AP = "refund_ap"
+    REFUND_REVERSAL_AR = "refund_reversal_ar"
+    REFUND_REVERSAL_AP = "refund_reversal_ap"
 
 
 class JournalEntry(CompanyBase):

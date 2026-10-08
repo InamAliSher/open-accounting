@@ -13,7 +13,9 @@ import sqlite3
 import pytest
 from sqlalchemy import create_engine, event, text
 
+from app.db.base import CompanyBase
 from app.db import migrations
+import app.models.company  # noqa: F401
 
 
 def _engine():
@@ -148,10 +150,41 @@ def _outgoing_sequence(conn) -> int:
 def _populate_legacy_bank_graph(engine, *, stale_helper: bool = False):
     """Create a valid old bank table with a deleted-ID high-water mark."""
     with engine.begin() as conn:
-        conn.execute(text("CREATE TABLE accounts (id INTEGER PRIMARY KEY)"))
-        conn.execute(text("CREATE TABLE bank_accounts (id INTEGER PRIMARY KEY)"))
-        conn.execute(text("INSERT INTO accounts (id) VALUES (1)"))
-        conn.execute(text("INSERT INTO bank_accounts (id) VALUES (1)"))
+        conn.execute(
+            text(
+                "CREATE TABLE accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "code VARCHAR(20) NOT NULL, "
+                "name VARCHAR(200) NOT NULL, "
+                "type VARCHAR(20) NOT NULL, "
+                "parent_id INTEGER REFERENCES accounts(id) ON DELETE RESTRICT, "
+                "is_gst BOOLEAN NOT NULL DEFAULT 0, "
+                "active BOOLEAN NOT NULL DEFAULT 1, "
+                "description VARCHAR(500), "
+                "created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL"
+                ")"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE bank_accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "name VARCHAR(200) NOT NULL, "
+                "opening_balance NUMERIC(16, 2) NOT NULL DEFAULT 0, "
+                "is_active BOOLEAN NOT NULL DEFAULT 1, "
+                "created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL"
+                ")"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO accounts (id, code, name, type, is_gst, active) "
+                "VALUES (1, '1000', 'Operating cash', 'ASSET', 0, 1)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO bank_accounts (id, name) VALUES (1, 'Legacy Bank')")
+        )
         conn.execute(text(_OLD_BANK_TXN_DDL))
         conn.execute(
             text(
@@ -604,14 +637,26 @@ def test_noop_migration_rejects_preexisting_fk_violation_and_restores_fk(tmp_pat
 
 
 def test_migrations_on_fresh_db_is_safe_noop():
-    """Brand-new empty DB (no legacy tables, no columns to drop): the
-    migration run must not raise and must not claim any drops happened.
+    """Brand-new company schema (no legacy tables or columns to drop): the
+    migration run must remain valid and must not claim any drops happened.
     """
     engine = _engine()
+    CompanyBase.metadata.create_all(engine)
     applied = migrations.run_company_migrations(engine)
     # No drops should be reported on an empty DB.
     drops = [step for step in applied if step.startswith("drop_")]
     assert drops == [], f"expected no drops on empty DB, got {drops}"
+    with engine.connect() as conn:
+        invoice_columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(invoices)")).fetchall()
+        }
+    assert {
+        "contact_name_snapshot",
+        "contact_abn_snapshot",
+        "contact_address_snapshot",
+        "contact_email_snapshot",
+        "contact_phone_snapshot",
+    }.issubset(invoice_columns)
 
 
 def test_system_account_reconciliation_error_rolls_back_and_keeps_backup(tmp_path):

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Generator
 
 from sqlalchemy import inspect, text
+from sqlalchemy.schema import CreateTable
 from sqlalchemy.engine import Engine
 
 from .base import CompanyBase
@@ -654,7 +655,9 @@ def _assert_sqlite_integrity(conn, *, context: str) -> None:
 
 
 @contextmanager
-def _migration_transaction(engine: Engine) -> Generator:
+def _migration_transaction(
+    engine: Engine, *, foreign_keys_off: bool = False
+) -> Generator:
     """Run migration work transactionally and never poison a pooled connection.
 
     SQLite ignores ``PRAGMA foreign_keys = ON`` while a transaction is active.
@@ -664,6 +667,13 @@ def _migration_transaction(engine: Engine) -> Generator:
     conn = engine.connect()
     try:
         try:
+            if foreign_keys_off:
+                raw = conn.connection.driver_connection
+                raw.execute("PRAGMA foreign_keys = OFF")
+                if raw.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+                    raise RuntimeError(
+                        "Migration rebuild requires foreign_keys=OFF before its transaction"
+                    )
             with conn.begin():
                 yield conn
         finally:
@@ -685,6 +695,114 @@ def _migration_transaction(engine: Engine) -> Generator:
                 )
     finally:
         conn.close()
+
+
+def _bank_accounts_need_rebuild(conn) -> bool:
+    if not _table_exists(conn, "bank_accounts"):
+        return False
+    if "ledger_account_id" not in _existing_columns(conn, "bank_accounts"):
+        return True
+    foreign_keys = conn.execute(
+        text("PRAGMA foreign_key_list(bank_accounts)")
+    ).fetchall()
+    has_restrict_fk = any(
+        row[2] == "accounts"
+        and row[3] == "ledger_account_id"
+        and row[6].upper() == "RESTRICT"
+        for row in foreign_keys
+    )
+    unique_mapping = False
+    for row in conn.execute(text("PRAGMA index_list(bank_accounts)")).fetchall():
+        if not row[2]:
+            continue
+        index_name = str(row[1]).replace('"', '""')
+        columns = conn.execute(text(f'PRAGMA index_info("{index_name}")')).fetchall()
+        if [item[2] for item in columns] == ["ledger_account_id"]:
+            unique_mapping = True
+            break
+    return not (has_restrict_fk and unique_mapping)
+
+
+def _rebuild_bank_accounts(conn) -> None:
+    """Apply the mapping FK/unique constraint while preserving bank rows."""
+    from ..models.company import BankAccount
+
+    old_columns = _existing_columns(conn, "bank_accounts")
+    if "ledger_account_id" in old_columns:
+        duplicate = conn.execute(
+            text(
+                "SELECT ledger_account_id FROM bank_accounts "
+                "WHERE ledger_account_id IS NOT NULL GROUP BY ledger_account_id "
+                "HAVING COUNT(*) > 1 LIMIT 1"
+            )
+        ).first()
+        if duplicate is not None:
+            raise DataRecoveryRequiredError(
+                "Cannot add unique bank ledger mappings: multiple bank accounts already "
+                f"reference account {duplicate[0]}"
+            )
+
+    model_columns = [column.name for column in BankAccount.__table__.columns]
+    copied_columns = [column for column in model_columns if column in old_columns]
+    high_water_id = _autoincrement_high_water(conn, "bank_accounts")
+    index_rows = conn.execute(
+        text(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='bank_accounts' AND sql IS NOT NULL"
+        )
+    ).fetchall()
+    index_sqls = [row[0] for row in index_rows]
+
+    ddl = str(CreateTable(BankAccount.__table__).compile(dialect=conn.dialect))
+    ddl = ddl.replace("CREATE TABLE bank_accounts", "CREATE TABLE new_bank_accounts", 1)
+    conn.execute(text("DROP TABLE IF EXISTS new_bank_accounts"))
+    conn.execute(text(ddl))
+    quoted = ", ".join(f'"{column}"' for column in copied_columns)
+    conn.execute(
+        text(
+            f"INSERT INTO new_bank_accounts ({quoted}) "
+            f"SELECT {quoted} FROM bank_accounts"
+        )
+    )
+    conn.execute(text("DROP TABLE bank_accounts"))
+    conn.execute(text("ALTER TABLE new_bank_accounts RENAME TO bank_accounts"))
+    _restore_autoincrement_high_water(
+        conn,
+        table="bank_accounts",
+        helper_table="new_bank_accounts",
+        high_water_id=high_water_id,
+    )
+    for index_sql in index_sqls:
+        conn.execute(text(index_sql))
+
+
+def _backfill_bank_account_ledger_mapping(conn) -> int:
+    if not _table_exists(conn, "bank_accounts") or not _table_exists(conn, "accounts"):
+        return 0
+    bank_count = conn.execute(text("SELECT COUNT(*) FROM bank_accounts")).scalar_one()
+    if bank_count != 1:
+        return 0
+    bank = conn.execute(
+        text("SELECT id, ledger_account_id FROM bank_accounts LIMIT 1")
+    ).one()
+    if bank.ledger_account_id is not None:
+        return 0
+    accounts = conn.execute(
+        text(
+            "SELECT id FROM accounts WHERE code = '1000' AND active = 1 "
+            "AND type = 'ASSET' AND is_gst = 0"
+        )
+    ).fetchall()
+    if len(accounts) != 1:
+        return 0
+    result = conn.execute(
+        text(
+            "UPDATE bank_accounts SET ledger_account_id = :account_id "
+            "WHERE id = :bank_id AND ledger_account_id IS NULL"
+        ),
+        {"account_id": accounts[0][0], "bank_id": bank.id},
+    )
+    return int(result.rowcount or 0)
 
 
 def _apply_system_account_reconciliation(conn) -> list[str]:
@@ -1403,6 +1521,57 @@ def _backfill_invoice_authorised_at(conn) -> int:
     return result.rowcount or 0
 
 
+def _backfill_invoice_contact_snapshots(conn) -> int:
+    if not _table_exists(conn, "invoices") or not _table_exists(conn, "contacts"):
+        return 0
+    invoice_columns = _existing_columns(conn, "invoices")
+    snapshot_columns = {
+        "contact_name_snapshot",
+        "contact_abn_snapshot",
+        "contact_address_snapshot",
+        "contact_email_snapshot",
+        "contact_phone_snapshot",
+    }
+    if not {"id", "contact_id", *snapshot_columns}.issubset(invoice_columns):
+        return 0
+    contact_columns = {"id", "name", "abn", "address", "email", "phone"}
+    if not contact_columns.issubset(_existing_columns(conn, "contacts")):
+        return 0
+
+    missing_contacts = conn.execute(
+        text(
+            "SELECT i.id FROM invoices AS i "
+            "LEFT JOIN contacts AS c ON c.id = i.contact_id "
+            "WHERE i.contact_name_snapshot IS NULL AND c.id IS NULL "
+            "ORDER BY i.id"
+        )
+    ).scalars().all()
+    if missing_contacts:
+        raise DataRecoveryRequiredError(
+            "Cannot backfill invoice contact snapshots: invoice(s) "
+            f"{missing_contacts!r} reference a missing Contact. Restore the Contact "
+            "or resolve the invoice through an operator-reviewed recovery workflow."
+        )
+
+    result = conn.execute(
+        text(
+            "UPDATE invoices SET "
+            "contact_name_snapshot = (SELECT c.name FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id), "
+            "contact_abn_snapshot = (SELECT c.abn FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id), "
+            "contact_address_snapshot = (SELECT c.address FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id), "
+            "contact_email_snapshot = (SELECT c.email FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id), "
+            "contact_phone_snapshot = (SELECT c.phone FROM contacts AS c "
+            "WHERE c.id = invoices.contact_id) "
+            "WHERE contact_name_snapshot IS NULL"
+        )
+    )
+    return int(result.rowcount or 0)
+
+
 def _backfill_doc_number_version_suffix(conn) -> int:
     """Rename `XX-YYYY-NNNN` documents to `XX-YYYY-NNNN-1`.
 
@@ -1467,12 +1636,17 @@ def run_company_migrations(
     )
     if backup_path is not None:
         applied.extend(f"backup:{reason}" for reason in backup_reasons)
-    with _migration_transaction(engine) as conn:
+    with engine.connect() as check_conn:
+        rebuild_bank_accounts = _bank_accounts_need_rebuild(check_conn)
+    with _migration_transaction(
+        engine, foreign_keys_off=rebuild_bank_accounts
+    ) as conn:
         # 1. Table drops (for tables removed from the schema). FKs are
         # toggled off so a referenced table can be dropped even when some
         # *other* table still has the dangling FK column (cleaned up in
         # step 2). All data has already been wiped for these legacy tables.
-        conn.execute(text("PRAGMA foreign_keys = OFF"))
+        if not rebuild_bank_accounts:
+            conn.execute(text("PRAGMA foreign_keys = OFF"))
         try:
             for table, indexes in COMPANY_DB_TABLE_DROPS:
                 existed = _table_exists(conn, table)
@@ -1487,7 +1661,8 @@ def run_company_migrations(
                 elif dropped_indexes:
                     applied.append(f"drop_indexes:{table}")
         finally:
-            conn.execute(text("PRAGMA foreign_keys = ON"))
+            if not rebuild_bank_accounts:
+                conn.execute(text("PRAGMA foreign_keys = ON"))
 
         # 2b. Column drops (for columns removed from the schema).
         # (Additive column changes are handled by schema_sync.sync_missing_columns.)
@@ -1498,7 +1673,8 @@ def run_company_migrations(
         # trust_ledger_entries table). SQLite's ALTER TABLE … DROP COLUMN
         # runs an integrity check that rejects "FK references missing
         # table" otherwise.
-        conn.execute(text("PRAGMA foreign_keys = OFF"))
+        if not rebuild_bank_accounts:
+            conn.execute(text("PRAGMA foreign_keys = OFF"))
         try:
             for table, column in COMPANY_DB_COLUMN_DROPS:
                 if not _table_exists(conn, table):
@@ -1514,7 +1690,8 @@ def run_company_migrations(
                 conn.execute(text(f'ALTER TABLE {table} DROP COLUMN "{column}"'))
                 applied.append(f"drop_column:{table}.{column}")
         finally:
-            conn.execute(text("PRAGMA foreign_keys = ON"))
+            if not rebuild_bank_accounts:
+                conn.execute(text("PRAGMA foreign_keys = ON"))
 
         # 3. Table rebuilds for constraint/FK changes.
         #
@@ -1525,6 +1702,10 @@ def run_company_migrations(
         # integrity check rejects. The rebuild (new table → copy → drop → rename)
         # sidesteps that. Full signature comparison also catches partially
         # applied legacy rebuilds, including missing GST checks or FKs.
+        if rebuild_bank_accounts:
+            _rebuild_bank_accounts(conn)
+            applied.append("rebuild:bank_accounts")
+
         for table in TABLE_REBUILDS:
             if not _table_exists(conn, table):
                 continue
@@ -1579,6 +1760,15 @@ def run_company_migrations(
         invoice_rows = _backfill_invoice_authorised_at(conn)
         if invoice_rows:
             applied.append(f"backfill:invoice_authorised_at:{invoice_rows}")
+        invoice_contact_rows = _backfill_invoice_contact_snapshots(conn)
+        if invoice_contact_rows:
+            applied.append(
+                f"backfill:invoice_contact_snapshot:{invoice_contact_rows}"
+            )
+
+        bank_mapping_rows = _backfill_bank_account_ledger_mapping(conn)
+        if bank_mapping_rows:
+            applied.append(f"backfill:bank_account_ledger_mapping:{bank_mapping_rows}")
 
         # 6. Data backfill: ensure every outgoing_documents row has a
         # version-suffixed doc_number (`XX-YYYY-NNNN-1` for the original).

@@ -7,6 +7,7 @@ import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { useModalKeys } from "../../lib/useModalKeys";
 import type { Invoice } from "../../types/api";
 import { displayDocNumber, displayName, formatDate, formatMoney, statusBadgeClass } from "../../lib/format";
+import SourceCreditNoteDrafts from "../credit-notes/SourceCreditNoteDrafts";
 
 async function voidInvoice(id: number): Promise<void> {
   await api.delete(`/invoices/${id}`);
@@ -90,7 +91,9 @@ export default function InvoiceDetailDrawer({ invoice, onClose }: Props) {
                 {formatMoney(invoice.total, invoice.currency)}
               </span>
             </Row>
-            <Row label="Paid">{formatMoney(invoice.paid_amount, invoice.currency)}</Row>
+            <Row label="Cash paid">{formatMoney(invoice.paid_amount, invoice.currency)}</Row>
+            <Row label="Credit applied">{formatMoney(invoice.credit_applied_amount, invoice.currency)}</Row>
+            <Row label="Outstanding">{formatMoney(invoice.outstanding_amount, invoice.currency)}</Row>
           </DetailGrid>
 
           {invoice.notes && (
@@ -100,6 +103,10 @@ export default function InvoiceDetailDrawer({ invoice, onClose }: Props) {
                 {invoice.notes}
               </div>
             </div>
+          )}
+
+          {invoice.status !== "draft" && invoice.status !== "void" && (
+            <SourceCreditNoteDrafts invoiceId={invoice.id} />
           )}
 
           {!isDraft && invoice.status !== "void" && (

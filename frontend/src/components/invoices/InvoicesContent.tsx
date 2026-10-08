@@ -59,15 +59,15 @@ export default function InvoicesContent({
   });
 
   const totals = useMemo(() => {
-    if (!data) return { count: 0, total: 0, unpaid: 0 };
+    if (!data) return { count: 0, total: 0, outstanding: 0 };
     let total = 0;
-    let unpaid = 0;
+    let outstanding = 0;
     for (const inv of data) {
       if (inv.status === "void") continue;
       total += Number(inv.total);
-      unpaid += Number(inv.total) - Number(inv.paid_amount);
+      outstanding += Number(inv.outstanding_amount);
     }
-    return { count: data.length, total, unpaid };
+    return { count: data.length, total, outstanding };
   }, [data]);
 
   if (!currentId) {
@@ -144,7 +144,7 @@ export default function InvoicesContent({
             <div className="text-xs text-slate-500 mb-2">
               Showing <span className="font-semibold">{totals.count}</span> · total{" "}
               <span className="font-semibold">{formatMoney(totals.total)}</span> · outstanding{" "}
-              <span className="font-semibold">{formatMoney(totals.unpaid)}</span>
+              <span className="font-semibold">{formatMoney(totals.outstanding)}</span>
             </div>
             <div className="overflow-auto">
               <table className="w-full text-sm">

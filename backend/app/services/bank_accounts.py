@@ -68,6 +68,14 @@ class BankAccountConfigurationInvalid(BankTxnError):
     http_status = 409
 
 
+class BankLedgerAccountInvalid(BankTxnError):
+    http_status = 400
+
+
+class BankLedgerAccountInUse(BankTxnError):
+    http_status = 409
+
+
 class BankTransactionIdempotencyConflict(BankTxnError):
     http_status = 409
 
@@ -248,10 +256,61 @@ def seed_default_bank_accounts(session: Session) -> int:
     """Insert the default bank account if none exists. Returns rows inserted."""
     existing = session.query(BankAccount).count()
     if existing > 0:
+        if existing == 1:
+            bank = session.query(BankAccount).one()
+            if bank.ledger_account_id is None:
+                ledger = _default_cash_ledger_account(session)
+                if ledger is not None:
+                    bank.ledger_account_id = ledger.id
+                    session.commit()
         return 0
-    session.add(BankAccount(name="Bank Account"))
+    ledger = _default_cash_ledger_account(session)
+    if ledger is None:
+        raise BankAccountConfigurationInvalid(
+            "Cannot provision the default bank account without an active, "
+            "non-GST ASSET account 1000."
+        )
+    session.add(BankAccount(name="Bank Account", ledger_account_id=ledger.id))
     session.commit()
     return 1
+
+
+def _default_cash_ledger_account(db: Session) -> Account | None:
+    account = db.query(Account).filter(Account.code == "1000").one_or_none()
+    if (
+        account is None
+        or not account.active
+        or account.type != AccountType.ASSET
+        or account.is_gst
+    ):
+        return None
+    return account
+
+
+def _validate_bank_ledger_account(
+    db: Session, ledger_account_id: int, *, bank_account_id: int | None = None
+) -> Account:
+    account = db.get(Account, ledger_account_id)
+    if account is None:
+        raise BankLedgerAccountInvalid("Ledger account does not exist")
+    if not account.active:
+        raise BankLedgerAccountInvalid("Ledger account must be active")
+    if account.type != AccountType.ASSET:
+        raise BankLedgerAccountInvalid("Ledger account must be an ASSET account")
+    if account.is_gst:
+        raise BankLedgerAccountInvalid("GST-classified accounts cannot be bank ledgers")
+    if account.code in {"1100", "1200", "2000", "2100"}:
+        raise BankLedgerAccountInvalid(
+            f"Protected account {account.code} cannot be used as a bank ledger"
+        )
+    query = db.query(BankAccount.id).filter(
+        BankAccount.ledger_account_id == ledger_account_id
+    )
+    if bank_account_id is not None:
+        query = query.filter(BankAccount.id != bank_account_id)
+    if query.first() is not None:
+        raise BankLedgerAccountInUse("Ledger account is already mapped to another bank account")
+    return account
 
 
 def _normalise_name(name: str) -> str:
@@ -573,10 +632,12 @@ def create_account(
     bsb: str | None = None,
     account_number: str | None = None,
     is_active: bool = True,
+    ledger_account_id: int,
 ) -> BankAccount:
     name = _normalise_name(name)
     if _account_with_name(db, name) is not None:
         raise BankAccountDuplicate(f"Bank account name already exists: {name}")
+    _validate_bank_ledger_account(db, ledger_account_id)
     if opening_balance != 0:
         try:
             require_opening_balance_equity_account(db)
@@ -587,6 +648,7 @@ def create_account(
         opening_balance=opening_balance,
         bsb=bsb,
         account_number=account_number,
+        ledger_account_id=ledger_account_id,
         is_active=is_active,
     )
     db.add(account)
@@ -603,6 +665,7 @@ def update_account(
     bsb: str | None = None,
     account_number: str | None = None,
     is_active: bool | None = None,
+    ledger_account_id: int | None = None,
 ) -> BankAccount:
     account = db.get(BankAccount, bank_account_id)
     if account is None:
@@ -617,6 +680,11 @@ def update_account(
         account.bsb = bsb
     if account_number is not None:
         account.account_number = account_number
+    if ledger_account_id is not None:
+        _validate_bank_ledger_account(
+            db, ledger_account_id, bank_account_id=account.id
+        )
+        account.ledger_account_id = ledger_account_id
     if is_active is not None:
         account.is_active = is_active
     db.commit()
