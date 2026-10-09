@@ -2,20 +2,13 @@
 
 Two-step pipeline:
 
-  1. preview(file, bank_account_id) → returns parsed rows with proposed
-     column mapping, dedup status (NEW / DUPLICATE), and rule-match
-     suggestions. NO writes.
-  2. commit(bank_account_id, rows_payload) → writes only the rows the
-     caller explicitly accepted, applies their (possibly overridden)
-     account_id / tax_code, sets dedup_key so re-imports don't double up.
+  1. Preview parses a statement and returns identity/review status and rule
+      suggestions without writing.
+  2. Commit reparses the uploaded bytes, verifies preview-bound choices, and
+      writes accepted rows atomically.
 
-Supported formats: .csv and .xlsx (the same parser core that powers the
-invoice spreadsheet import).
-
-Bank statement column heuristics — typical AU bank exports have one of:
-  - separate "Debit" / "Credit" columns (most common — ANZ, NAB, CBA)
-  - signed "Amount" column where positive = credit (Westpac, some online)
-We support both. The user can override the mapping in the preview UI.
+Supported formats: CSV, XLSX, and PDF. Column mapping remains server-derived
+and is bound to the preview decision.
 """
 
 from __future__ import annotations
@@ -26,6 +19,7 @@ import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from sqlalchemy.orm import Session
 
@@ -68,6 +62,7 @@ BANK_FIELDS = [
     "occurred_at",   # required
     "memo",          # narrative / description / details
     "counter_party_name",
+    "provider_transaction_id",
     "amount",        # signed; positive = IN
     "debit",         # unsigned OUT
     "credit",        # unsigned IN
@@ -90,6 +85,14 @@ _HINTS: dict[str, list[str]] = {
         "counter_party_name",
         "对方",
     ],
+    "provider_transaction_id": [
+        "transaction id",
+        "transaction identifier",
+        "transaction reference",
+        "transaction ref",
+        "reference id",
+        "bank transaction id",
+    ],
     "amount": ["amount", "value", "金额"],
     "debit": ["debit", "withdrawal", "out", "支出", "借方"],
     "credit": ["credit", "deposit", "in", "收入", "贷方"],
@@ -100,6 +103,7 @@ _SUBSTRING_FIELD_ORDER = [
     "occurred_at",
     "memo",
     "counter_party_name",
+    "provider_transaction_id",
     "debit",
     "credit",
     "amount",
@@ -183,7 +187,11 @@ def _synthesize_headers(row: list[Any]) -> list[str]:
 
 
 def parse_statement(
-    *, content: bytes, filename: str, bank_format: str | None = None
+    *,
+    content: bytes,
+    filename: str,
+    bank_format: str | None = None,
+    mapping: dict[str, int | None] | None = None,
 ) -> dict[str, Any]:
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
     if ext in {"xlsx", "xlsm"}:
@@ -206,7 +214,7 @@ def parse_statement(
     else:
         raise ValueError(f"Unsupported format: .{ext} (use .csv, .xlsx or .pdf)")
 
-    mapping = propose_mapping(headers)
+    mapping = propose_mapping(headers) if mapping is None else _validate_mapping(mapping, headers)
     rows_out: list[dict[str, Any]] = []
     for i, raw in enumerate(data_rows, start=2):
         if all(c is None or (isinstance(c, str) and not c.strip()) for c in raw):
@@ -223,6 +231,22 @@ def parse_statement(
         "rows": rows_out,
         "field_options": BANK_FIELDS,
     }
+
+
+def _validate_mapping(
+    mapping: dict[str, int | None], headers: list[str]
+) -> dict[str, int | None]:
+    if set(mapping) != set(BANK_FIELDS):
+        raise ValueError("Column mapping does not match the previewed fields")
+    validated: dict[str, int | None] = {}
+    for field in BANK_FIELDS:
+        index = mapping[field]
+        if index is not None and (
+            type(index) is not int or index < 0 or index >= len(headers)
+        ):
+            raise ValueError("Column mapping references an invalid column")
+        validated[field] = index
+    return validated
 
 
 def _row_to_txn_shape(
@@ -246,6 +270,7 @@ def _row_to_txn_shape(
     occurred_at = _parse_date(cell("occurred_at"))
     memo = _cell_to_str(cell("memo")) or None
     counter = _cell_to_str(cell("counter_party_name")) or None
+    provider_transaction_id = _cell_to_str(cell("provider_transaction_id")) or None
 
     debit_raw = cell("debit")
     credit_raw = cell("credit")
@@ -282,6 +307,7 @@ def _row_to_txn_shape(
         "occurred_at": occurred_at,
         "memo": memo,
         "counter_party_name": counter,
+        "provider_transaction_id": provider_transaction_id,
         "direction": direction,
         "amount": str(amount) if amount is not None else None,
         "ambiguous": ambiguous,
@@ -625,13 +651,14 @@ def match_rule(
 # ---------------------------------------------------------------------------
 
 
-def preview_import(
+def _build_preview_rows(
     db: Session,
     *,
     bank_account_id: int,
     content: bytes,
     filename: str,
     bank_format: str | None = None,
+    mapping: dict[str, int | None] | None = None,
     gst_registered: bool,
 ) -> dict[str, Any]:
     bank = db.get(BankAccount, bank_account_id)
@@ -640,7 +667,12 @@ def preview_import(
     if not bank.is_active:
         raise ValueError(f"Bank account {bank.name} is inactive")
 
-    parsed = parse_statement(content=content, filename=filename, bank_format=bank_format)
+    parsed = parse_statement(
+        content=content,
+        filename=filename,
+        bank_format=bank_format,
+        mapping=mapping,
+    )
     rules = load_active_rules(db)
     accounts_by_code = _accounts_by_code(db)
 
@@ -687,41 +719,13 @@ def preview_import(
             "ok": True,
         })
 
-    # Look up which dedup keys are already in the DB.
-    seen_keys = existing_dedup_keys(
-        db,
-        bank_account_id=bank_account_id,
-        keys=[m["dedup_key"] for m in materialised if m.get("ok")],
-    )
-    # Fingerprint index of EVERY existing txn on the account (incl. manual rows
-    # with no dedup_key) so a row duplicating one of those is still flagged.
-    existing_index = existing_txn_fingerprints(db, bank_account_id=bank_account_id)
-
-    # Second pass: rule matching + dedup status. `batch_seen` catches rows that
-    # duplicate an EARLIER row in the same file — commit already skips these
-    # (seen.add per payload row), so the preview must show it too or the count
-    # ("Will import N") won't match what commit actually creates.
-    batch_seen: set[str] = set()
+    # Suggestions are independent of identity classification. The caller below
+    # applies the server-derived review rules shared with commit.
     for m in materialised:
         if not m.get("ok"):
             continue
         p = m["parsed"]
-        dk = m["dedup_key"]
-        is_batch_dup = dk in batch_seen
-        if not is_batch_dup:
-            batch_seen.add(dk)
-        m["is_duplicate"] = (
-            dk in seen_keys
-            or is_batch_dup
-            or fingerprint_is_duplicate(
-                existing_index,
-                direction=p["direction"],
-                amount=p["amount"],
-                occurred_at=p["occurred_at"],
-                memo=p["memo"],
-                counter_party=p["counter_party_name"],
-            )
-        )
+        m["is_duplicate"] = False
         rule = match_rule(
             rules,
             direction=p["direction"],
@@ -830,142 +834,363 @@ def _commit_money(
     return quantised
 
 
-def _canonical_commit_row(
-    row: dict[str, Any],
+def _identity_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _transaction_identity_payload(
+    shape: dict[str, Any], *, provider_namespace: str | None = None
+) -> list[Any]:
+    amount = shape.get("amount")
+    return [
+        shape.get("occurred_at"),
+        shape.get("direction"),
+        f"{Decimal(amount).quantize(Decimal('0.01')):.2f}" if amount else None,
+        _norm_text(shape.get("memo")),
+        _norm_text(shape.get("counter_party_name")),
+        (shape.get("provider_transaction_id") or "").strip() or None,
+        provider_namespace,
+    ]
+
+
+_GENERIC_PROVIDER_NAMESPACE = "open-accounting:generic-bank-import:v1"
+
+
+def _same_provider_transaction(existing: tuple[Any, ...], shape: dict[str, Any]) -> bool:
+    direction, amount, occurred_at, memo, counter_party = existing
+    return (
+        (direction.value if hasattr(direction, "value") else str(direction))
+        == shape.get("direction")
+        and Decimal(amount).quantize(Decimal("0.01"))
+        == Decimal(str(shape.get("amount"))).quantize(Decimal("0.01"))
+        and occurred_at.isoformat() == shape.get("occurred_at")
+        and _norm_text(memo) == _norm_text(shape.get("memo"))
+        and _norm_text(counter_party)
+        == _norm_text(shape.get("counter_party_name"))
+    )
+
+
+def preview_import(
+    db: Session,
     *,
-    row_index: int,
     bank_account_id: int,
+    content: bytes,
+    filename: str,
+    bank_format: str | None = None,
+    mapping: dict[str, int | None] | None = None,
+    gst_registered: bool,
 ) -> dict[str, Any]:
-    """Validate a service caller and derive the server-owned dedup identity."""
-    try:
-        direction = BankTxnDirection(row.get("direction"))
-    except (TypeError, ValueError) as exc:
-        raise _commit_row_error(row_index, "direction must be 'in' or 'out'") from exc
-    try:
-        tax_code = TaxCode(row.get("tax_code") or TaxCode.STANDARD.value)
-    except (TypeError, ValueError) as exc:
-        raise _commit_row_error(row_index, "tax_code is invalid") from exc
-
-    amount = _commit_money(
-        row.get("amount"),
-        row_index=row_index,
-        field="amount",
-        strictly_positive=True,
+    """Parse and classify one statement without suppressing uncertain matches."""
+    result = _build_preview_rows(
+        db,
+        bank_account_id=bank_account_id,
+        content=content,
+        filename=filename,
+        bank_format=bank_format,
+        mapping=mapping,
+        gst_registered=gst_registered,
     )
-    gst_amount = _commit_money(
-        row.get("gst_amount", Decimal("0")),
-        row_index=row_index,
-        field="gst_amount",
-        strictly_positive=False,
-    )
+    chosen_mapping = result["mapping"]
+    namespace = _GENERIC_PROVIDER_NAMESPACE
 
-    occurred_value = row.get("occurred_at")
-    try:
-        occurred_at = (
-            occurred_value
-            if type(occurred_value) is date
-            else date.fromisoformat(occurred_value)
+    occurrences: dict[str, int] = {}
+    for row in result["rows"]:
+        shape = row["parsed"]
+        row_namespace = namespace if shape.get("provider_transaction_id") else None
+        row_fingerprint = _identity_hash(
+            _transaction_identity_payload(
+                shape, provider_namespace=row_namespace
+            )
         )
-    except (TypeError, ValueError) as exc:
-        raise _commit_row_error(row_index, "occurred_at is not a valid date") from exc
-    try:
-        check_txn_date(occurred_at)
-    except ValueError as exc:
-        raise _commit_row_error(
-            row_index,
-            "occurred_at is outside the supported reportable range",
-        ) from exc
+        occurrences[row_fingerprint] = occurrences.get(row_fingerprint, 0) + 1
+        row["row_key"] = _identity_hash(
+            [row_fingerprint, occurrences[row_fingerprint]]
+        )
+        row["provider_namespace"] = row_namespace
 
-    memo = row.get("memo") or None
-    counter_party = row.get("counter_party_name") or None
-    if memo is not None and not isinstance(memo, str):
-        raise _commit_row_error(row_index, "memo must be text")
-    if counter_party is not None and not isinstance(counter_party, str):
-        raise _commit_row_error(row_index, "counter_party_name must be text")
+    statement_key = _identity_hash(sorted(row["row_key"] for row in result["rows"]))
+    valid_rows = [row for row in result["rows"] if row.get("ok")]
+    has_provider_ids = bool(valid_rows) and all(
+        row["parsed"].get("provider_transaction_id") for row in valid_rows
+    )
+    identified_instance_id = str(
+        uuid5(NAMESPACE_URL, f"open-accounting:{bank_account_id}:{statement_key}")
+    )
 
-    return {
-        "row_index": row_index,
-        "occurred_at": occurred_at,
-        "direction": direction,
-        "amount": amount,
-        "dedup_key": compute_dedup_key(
-            bank_account_id=bank_account_id,
-            direction=direction.value,
-            amount=amount,
-            occurred_at=occurred_at,
-            memo=memo,
-            counter_party_name=counter_party,
-        ),
-        "account_id": row.get("account_id"),
-        "tax_code": tax_code,
-        "memo": memo,
-        "counter_party_name": counter_party,
-        "gst_amount": gst_amount,
-        "invoice_allocations": row.get("invoice_allocations") or [],
-        "unapplied_account_id": row.get("unapplied_account_id"),
-    }
+    existing = (
+        db.query(
+            BankTransaction.provider_namespace,
+            BankTransaction.provider_transaction_id,
+            BankTransaction.import_statement_key,
+            BankTransaction.import_instance_id,
+            BankTransaction.import_row_key,
+            BankTransaction.direction,
+            BankTransaction.amount,
+            BankTransaction.occurred_at,
+            BankTransaction.memo,
+            BankTransaction.counter_party_name,
+        )
+        .filter(BankTransaction.bank_account_id == bank_account_id)
+        .all()
+    )
+    provider_rows: dict[tuple[str, str], tuple[Any, ...]] = {}
+    existing_instances: dict[str, set[str]] = {}
+    existing_import_rows: set[tuple[str, str]] = set()
+    for record in existing:
+        namespace_value, provider_id, existing_statement, instance_id, row_key = record[:5]
+        if namespace_value and provider_id:
+            provider_rows[(namespace_value, provider_id)] = record[5:]
+        if existing_statement and instance_id:
+            existing_instances.setdefault(existing_statement, set()).add(instance_id)
+        if instance_id and row_key:
+            existing_import_rows.add((instance_id, row_key))
+
+    prior_instances = existing_instances.get(statement_key, set())
+    statement_review_required = bool(prior_instances) and not has_provider_ids
+    row_provider_counts: dict[tuple[str, str], int] = {}
+    for row in valid_rows:
+        provider_id = (row["parsed"].get("provider_transaction_id") or "").strip()
+        if provider_id:
+            identity = (namespace, provider_id)
+            row_provider_counts[identity] = row_provider_counts.get(identity, 0) + 1
+
+    existing_fingerprints = existing_txn_fingerprints(
+        db, bank_account_id=bank_account_id
+    )
+    for row in result["rows"]:
+        row.update(
+            {
+                "import_statement_key": statement_key,
+                "requires_review": False,
+                "review_reason": None,
+                "review_blocked": False,
+                "is_duplicate": False,
+            }
+        )
+        if not row.get("ok"):
+            continue
+
+        shape = row["parsed"]
+        provider_id = (shape.get("provider_transaction_id") or "").strip()
+        provider_identity = (namespace, provider_id)
+        if provider_id and row_provider_counts.get(provider_identity, 0) > 1:
+            row["requires_review"] = True
+            row["review_reason"] = "provider_id_repeated_in_statement"
+            row["review_blocked"] = True
+        elif provider_id and provider_identity in provider_rows:
+            if _same_provider_transaction(provider_rows[provider_identity], shape):
+                row["is_duplicate"] = True
+            else:
+                row["requires_review"] = True
+                row["review_reason"] = "provider_id_conflict"
+                row["review_blocked"] = True
+        elif has_provider_ids and (identified_instance_id, row["row_key"]) in existing_import_rows:
+            row["is_duplicate"] = True
+        elif fingerprint_is_duplicate(
+            existing_fingerprints,
+            direction=shape["direction"],
+            amount=shape["amount"],
+            occurred_at=shape["occurred_at"],
+            memo=shape["memo"],
+            counter_party=shape["counter_party_name"],
+        ):
+            row["requires_review"] = True
+            row["review_reason"] = "matching_existing_transaction"
+
+        if statement_review_required:
+            row["requires_review"] = True
+            row["review_reason"] = "identical_statement"
+
+    file_fingerprint = hashlib.sha256(content).hexdigest()
+    preview_key = _identity_hash(
+        {
+            "bank_account_id": bank_account_id,
+            "file": file_fingerprint,
+            "filename": filename,
+            "bank_format": bank_format,
+            "mapping": chosen_mapping,
+            "provider_namespace": namespace,
+        }
+    )
+    result.update(
+        {
+            "preview_key": preview_key,
+            "import_statement_key": statement_key,
+            "has_provider_ids": has_provider_ids,
+            "statement_review_required": statement_review_required,
+            "existing_import_count": len(prior_instances),
+        }
+    )
+    return result
 
 
 def commit_import(
     db: Session,
     *,
     bank_account_id: int,
+    content: bytes,
+    filename: str,
+    bank_format: str | None,
+    preview_key: str,
+    mapping: dict[str, int | None],
+    import_mode: str,
     rows: list[dict[str, Any]],
     gst_registered: bool,
-) -> dict[str, Any]:
-    """Write the rows the user accepted.
+) -> dict[str, int]:
+    """Reparse the uploaded bytes, verify keyed decisions, and commit atomically."""
+    preview = preview_import(
+        db,
+        bank_account_id=bank_account_id,
+        content=content,
+        filename=filename,
+        bank_format=bank_format,
+        mapping=mapping,
+        gst_registered=gst_registered,
+    )
+    if preview["preview_key"] != preview_key:
+        raise ValueError("The uploaded file or column mapping differs from the preview")
 
-    Each row in `rows` must carry:
-      - occurred_at (date)
-      - direction ("in" | "out")
-      - amount (Decimal, positive)
-      - dedup_key (legacy wire field; ignored and recomputed server-side)
-      - account_id (int | None)
-      - tax_code (TaxCode value)
-      - memo (str | None)
-      - counter_party_name (str | None)
-      - gst_amount (Decimal, default 0)
+    decisions: dict[str, dict[str, Any]] = {}
+    for row_index, decision in enumerate(rows, start=1):
+        row_key = decision.get("row_key")
+        if not isinstance(row_key, str) or row_key in decisions:
+            raise _commit_row_error(row_index, "row identity is invalid or repeated")
+        decisions[row_key] = decision
+    preview_by_key = {row["row_key"]: row for row in preview["rows"]}
+    if decisions.keys() != preview_by_key.keys():
+        raise ValueError("Commit decisions do not match the previewed row identities")
 
-    Rows that duplicate an existing transaction are silently skipped: by
-    dedup_key (exact re-import) AND by fingerprint (amount+date+direction with
-    memo/counter-party overlap) so a row duplicating a MANUALLY-entered
-    transaction — which has no dedup_key — is enforced server-side too, not only
-    flagged in the preview. Guards against double-counting bank cash / GST / P&L
-    / BAS even if a caller submits a preview-flagged duplicate.
-    """
+    if preview["statement_review_required"]:
+        if import_mode not in {"same_import", "independent_import"}:
+            raise ValueError("Choose whether this is the same or an independent import")
+    elif import_mode == "same_import":
+        raise ValueError("There is no prior import instance to reuse")
+
+    statement_key = preview["import_statement_key"]
     bank = db.get(BankAccount, bank_account_id)
     if bank is None:
         raise ValueError(f"Bank account {bank_account_id} not found")
     if not bank.is_active:
         raise ValueError(f"Bank account {bank.name} is inactive")
 
-    canonical_rows = [
-        _canonical_commit_row(
-            row,
-            row_index=row_index,
-            bank_account_id=bank_account_id,
-        )
-        for row_index, row in enumerate(rows, start=1)
-    ]
-
-    seen = existing_dedup_keys(
-        db,
-        bank_account_id=bank_account_id,
-        keys=[row["dedup_key"] for row in canonical_rows],
+    prior_instances = sorted(
+        {
+            row[0]
+            for row in db.query(BankTransaction.import_instance_id)
+            .filter(
+                BankTransaction.bank_account_id == bank_account_id,
+                BankTransaction.import_statement_key == statement_key,
+                BankTransaction.import_instance_id.is_not(None),
+            )
+            .all()
+            if row[0]
+        }
     )
-    existing_index = existing_txn_fingerprints(db, bank_account_id=bank_account_id)
+    if preview["has_provider_ids"]:
+        instance_id = str(
+            uuid5(
+                NAMESPACE_URL,
+                f"open-accounting:{bank_account_id}:{statement_key}",
+            )
+        )
+    elif import_mode == "same_import":
+        if not prior_instances:
+            raise ValueError("The prior import instance no longer exists")
+        instance_id = prior_instances[0]
+    else:
+        instance_id = str(uuid4())
+
+    existing_identity_pairs = {
+        (row[0], row[1])
+        for row in db.query(
+            BankTransaction.import_instance_id, BankTransaction.import_row_key
+        )
+        .filter(
+            BankTransaction.bank_account_id == bank_account_id,
+            BankTransaction.import_instance_id == instance_id,
+        )
+        .all()
+    }
+    existing_provider_ids = {
+        (row[0], row[1]): row[2:]
+        for row in db.query(
+            BankTransaction.provider_namespace,
+            BankTransaction.provider_transaction_id,
+            BankTransaction.direction,
+            BankTransaction.amount,
+            BankTransaction.occurred_at,
+            BankTransaction.memo,
+            BankTransaction.counter_party_name,
+        )
+        .filter(
+            BankTransaction.bank_account_id == bank_account_id,
+            BankTransaction.provider_transaction_id.is_not(None),
+        )
+        .all()
+        if row[0] and row[1]
+    }
 
     created = 0
     skipped = 0
-    for row in canonical_rows:
-        row_index = row["row_index"]
-        dk = row["dedup_key"]
-        if dk in seen:
+    for row_index, preview_row in enumerate(preview["rows"], start=1):
+        decision = decisions[preview_row["row_key"]]
+        if not preview_row.get("ok"):
+            continue
+        shape = preview_row["parsed"]
+        provider_id = (shape.get("provider_transaction_id") or "").strip() or None
+        provider_namespace_value = preview_row["provider_namespace"] if provider_id else None
+        identity_pair = (instance_id, preview_row["row_key"])
+
+        if preview_row.get("review_blocked") and decision.get("include"):
+            raise _commit_row_error(row_index, "provider transaction ID conflicts; row cannot be imported")
+        if preview_row.get("is_duplicate") or identity_pair in existing_identity_pairs:
             skipped += 1
             continue
-        direction = row["direction"]
-        tc = row["tax_code"]
-        gst_amount = row["gst_amount"]
+        if not decision.get("include"):
+            continue
+
+        if provider_id:
+            existing_provider = existing_provider_ids.get(
+                (provider_namespace_value, provider_id)
+            )
+            if existing_provider is not None:
+                stored = (
+                    existing_provider[0],
+                    existing_provider[1],
+                    existing_provider[2],
+                    existing_provider[3],
+                    existing_provider[4],
+                )
+                if _same_provider_transaction(stored, shape):
+                    skipped += 1
+                    continue
+                raise _commit_row_error(row_index, "provider transaction ID conflicts with an existing row")
+
+        try:
+            occurred_at = date.fromisoformat(shape["occurred_at"])
+            check_txn_date(occurred_at)
+            direction = BankTxnDirection(shape["direction"])
+            amount = _commit_money(
+                shape["amount"],
+                row_index=row_index,
+                field="amount",
+                strictly_positive=True,
+            )
+            tax_code = TaxCode(decision.get("tax_code") or TaxCode.STANDARD.value)
+        except (TypeError, ValueError) as exc:
+            raise _commit_row_error(row_index, "parsed transaction is invalid") from exc
+        gst_amount = _commit_money(
+            decision.get("gst_amount", Decimal("0")),
+            row_index=row_index,
+            field="gst_amount",
+            strictly_positive=False,
+        )
         try:
             gst_policy.require_gst_registered_for_amount(
                 gst_registered=gst_registered,
@@ -978,72 +1203,43 @@ def commit_import(
                 "gst_amount is not allowed while the company is not GST-registered",
             ) from exc
         if not gst_registered:
-            tc = TaxCode.NONE
-        amount = row["amount"]
-        occurred_at = row["occurred_at"]
-        memo = row["memo"]
-        counter_party = row["counter_party_name"]
-        # Skip a row that duplicates a transaction that was ALREADY on the
-        # account before this payload (including manual rows with no dedup_key) —
-        # the same fingerprint the preview flags with, so "Will import N" matches
-        # what commit creates. The index is built once from the DB and NOT
-        # extended with rows created in this batch: two genuinely distinct
-        # same-day/same-amount payments to the same payee (different memos, hence
-        # different dedup_keys) are legitimately imported, not silently collapsed.
-        if fingerprint_is_duplicate(
-            existing_index,
-            direction=direction.value,
-            amount=amount,
-            occurred_at=occurred_at,
-            memo=memo,
-            counter_party=counter_party,
-        ):
-            skipped += 1
-            continue
-        account_id = row["account_id"]
-        invoice_allocations = row["invoice_allocations"]
-        unapplied_account_id = row["unapplied_account_id"]
-        acc = None
+            tax_code = TaxCode.NONE
+            gst_amount = Decimal("0.00")
+
+        account_id = decision.get("account_id")
+        account = None
         if account_id is not None:
-            acc = db.get(Account, account_id)
-            if acc is None:
-                raise _commit_row_error(
-                    row_index,
-                    "account_id does not reference an existing account",
-                )
-            if not acc.active:
-                raise _commit_row_error(
-                    row_index,
-                    "account_id references an inactive account",
-                )
+            account = db.get(Account, account_id)
+            if account is None or not account.active:
+                raise _commit_row_error(row_index, "account_id is missing or inactive")
             try:
-                reject_capital_tax_code_on_control_account(acc, tc)
+                reject_capital_tax_code_on_control_account(account, tax_code)
                 reject_income_category_for_matching_ar_payment(
                     db,
                     direction=direction,
                     amount=amount,
-                    account=acc,
-                    memo=memo,
-                    counter_party_name=counter_party,
+                    account=account,
+                    memo=shape["memo"],
+                    counter_party_name=shape["counter_party_name"],
                     occurred_at=occurred_at,
                 )
                 reject_expense_category_for_matching_ap_payment(
                     db,
                     direction=direction,
                     amount=amount,
-                    account=acc,
-                    memo=memo,
-                    counter_party_name=counter_party,
+                    account=account,
+                    memo=shape["memo"],
+                    counter_party_name=shape["counter_party_name"],
                     occurred_at=occurred_at,
                 )
-                if not invoice_allocations:
+                if not decision.get("invoice_allocations"):
                     reject_control_category_for_void_invoice(
                         db,
                         direction=direction,
                         amount=amount,
-                        account=acc,
-                        memo=memo,
-                        counter_party_name=counter_party,
+                        account=account,
+                        memo=shape["memo"],
+                        counter_party_name=shape["counter_party_name"],
                         occurred_at=occurred_at,
                     )
             except InvoicePaymentWouldDoubleCount as exc:
@@ -1056,29 +1252,28 @@ def commit_import(
                     row_index,
                     "account and tax_code are incompatible",
                 ) from exc
-        # Sanity: forbid GST on non-standard/capital codes.
-        if tc not in (TaxCode.STANDARD, TaxCode.CAPITAL) and gst_amount > 0:
-            raise _commit_row_error(
-                row_index,
-                "gst_amount must be zero for the selected tax_code",
-            )
+
+        if tax_code not in (TaxCode.STANDARD, TaxCode.CAPITAL) and gst_amount > 0:
+            raise _commit_row_error(row_index, "gst_amount must be zero for the selected tax_code")
         if gst_amount > amount:
-            raise _commit_row_error(
-                row_index,
-                "gst_amount must not exceed amount",
-            )
+            raise _commit_row_error(row_index, "gst_amount must not exceed amount")
 
         txn = BankTransaction(
             bank_account_id=bank_account_id,
             direction=direction,
             amount=amount,
             occurred_at=occurred_at,
-            memo=memo,
-            counter_party_name=counter_party,
+            memo=shape["memo"],
+            counter_party_name=shape["counter_party_name"],
             account_id=account_id,
             gst_amount=gst_amount,
-            tax_code=tc,
-            dedup_key=dk,
+            tax_code=tax_code,
+            dedup_key=None,
+            provider_namespace=provider_namespace_value,
+            provider_transaction_id=provider_id,
+            import_statement_key=statement_key,
+            import_instance_id=instance_id,
+            import_row_key=preview_row["row_key"],
         )
         db.add(txn)
         db.flush()
@@ -1086,19 +1281,24 @@ def commit_import(
             invoice_payments.replace_transaction_allocations(
                 db,
                 txn,
-                invoice_allocations,
-                unapplied_account_id=unapplied_account_id,
+                decision.get("invoice_allocations") or [],
+                unapplied_account_id=decision.get("unapplied_account_id"),
             )
         except invoice_payments.PaymentAllocationError as exc:
             raise _commit_row_error(
                 row_index,
                 "invoice allocation is invalid or incomplete",
             ) from exc
-        if not gst_registered:
-            txn.gst_amount = Decimal("0.00")
-            txn.tax_code = TaxCode.NONE
         created += 1
-        seen.add(dk)  # don't double-add within the same payload
+        existing_identity_pairs.add(identity_pair)
+        if provider_id:
+            existing_provider_ids[(provider_namespace_value, provider_id)] = (
+                direction,
+                amount,
+                occurred_at,
+                shape["memo"],
+                shape["counter_party_name"],
+            )
 
     db.commit()
     return {"created": created, "skipped_duplicates": skipped}

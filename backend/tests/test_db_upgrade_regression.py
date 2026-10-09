@@ -77,12 +77,23 @@ CREATE TABLE bank_transactions (
     gst_amount NUMERIC(16, 2) NOT NULL DEFAULT 0,
     tax_code VARCHAR(20) NOT NULL DEFAULT 'standard',
     dedup_key VARCHAR(64),
+    provider_namespace VARCHAR(100),
+    provider_transaction_id VARCHAR(200),
+    import_statement_key VARCHAR(64),
+    import_instance_id VARCHAR(36),
+    import_row_key VARCHAR(64),
     linked_trust_entry_id INTEGER REFERENCES trust_ledger_entries(id) ON DELETE SET NULL,
     created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL
 );
 CREATE UNIQUE INDEX uq_bank_txn_dedup
     ON bank_transactions (bank_account_id, dedup_key)
     WHERE dedup_key IS NOT NULL;
+CREATE UNIQUE INDEX uq_bank_txn_provider_identity
+    ON bank_transactions (bank_account_id, provider_namespace, provider_transaction_id)
+    WHERE provider_namespace IS NOT NULL AND provider_transaction_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_bank_txn_import_row_identity
+    ON bank_transactions (bank_account_id, import_instance_id, import_row_key)
+    WHERE import_instance_id IS NOT NULL AND import_row_key IS NOT NULL;
 """
 
 
@@ -289,9 +300,12 @@ def test_mid_age_db_rebuild_preserves_tax_code_and_dedup_key(data_dir):
         OLD_SCHEMA_MID_AGE,
         "INSERT INTO bank_transactions "
         "(bank_account_id, direction, amount, occurred_at, memo, gst_amount, "
-        " tax_code, dedup_key) "
+        " tax_code, dedup_key, provider_namespace, provider_transaction_id, "
+        " import_statement_key, import_instance_id, import_row_key) "
         "VALUES (1, 'out', 55.50, '2026-02-01', 'mid-age row', 0, "
-        "        'gst_free', 'abc123deadbeef')",
+        "        'gst_free', 'abc123deadbeef', 'synthetic-bank-v1', 'txn-001', "
+        "        'statement-key-001', '00000000-0000-4000-8000-000000000001', "
+        "        'row-key-001')",
     )
 
     engine, report = _boot()  # must not raise
@@ -300,13 +314,26 @@ def test_mid_age_db_rebuild_preserves_tax_code_and_dedup_key(data_dir):
         # Rebuild ran (marker now present) and kept the data intact.
         assert "ck_bank_txn_amount_positive" in _table_sql(conn, "bank_transactions")
         row = conn.exec_driver_sql(
-            "SELECT memo, amount, tax_code, dedup_key FROM bank_transactions"
+            "SELECT memo, amount, tax_code, dedup_key, provider_namespace, "
+            "provider_transaction_id, import_statement_key, import_instance_id, "
+            "import_row_key FROM bank_transactions"
         ).fetchone()
         assert row[0] == "mid-age row"
         assert float(row[1]) == 55.5
         assert row[2] == "gst_free"
         assert row[3] == "abc123deadbeef"
-        assert "uq_bank_txn_dedup" in _index_names(conn)
+        assert row[4:] == (
+            "synthetic-bank-v1",
+            "txn-001",
+            "statement-key-001",
+            "00000000-0000-4000-8000-000000000001",
+            "row-key-001",
+        )
+        assert {
+            "uq_bank_txn_dedup",
+            "uq_bank_txn_provider_identity",
+            "uq_bank_txn_import_row_identity",
+        }.issubset(_index_names(conn))
 
     assert report.is_clean, report.format()
 

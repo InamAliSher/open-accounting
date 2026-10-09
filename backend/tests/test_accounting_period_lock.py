@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -192,21 +194,35 @@ def test_bank_mutations_and_import_are_blocked_by_transaction_date(client, accou
         f"/api/v1/bank-accounts/transactions/{old.json()['id']}", headers=HEAD
     ).status_code == 409
 
+    statement = b"Date,Description,Debit\n2026-05-17,Locked import,33.00\n"
+    preview = client.post(
+        f"/api/v1/bank-accounts/{bank['id']}/import/preview",
+        headers=HEAD,
+        files={"file": ("locked-import.csv", io.BytesIO(statement), "text/csv")},
+    )
+    assert preview.status_code == 200, preview.text
+    preview_body = preview.json()
     imported = client.post(
         f"/api/v1/bank-accounts/{bank['id']}/import/commit",
         headers=HEAD,
-        json={
-            "rows": [
+        files={"file": ("locked-import.csv", io.BytesIO(statement), "text/csv")},
+        data={
+            "payload_json": json.dumps(
                 {
-                    "occurred_at": "2026-05-17",
-                    "direction": "out",
-                    "amount": "33.00",
-                    "account_id": accounts["6100"]["id"],
-                    "tax_code": "standard",
-                    "gst_amount": "3.00",
-                    "memo": "Locked import",
+                    "preview_key": preview_body["preview_key"],
+                    "mapping": preview_body["mapping"],
+                    "import_mode": "new_import",
+                    "rows": [
+                        {
+                            "row_key": preview_body["rows"][0]["row_key"],
+                            "include": True,
+                            "account_id": accounts["6100"]["id"],
+                            "tax_code": "standard",
+                            "gst_amount": "3.00",
+                        }
+                    ],
                 }
-            ]
+            )
         },
     )
     assert imported.status_code == 409

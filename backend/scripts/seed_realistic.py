@@ -520,7 +520,7 @@ def preview_and_commit(api: Api, bank_id: int, content: bytes, filename: str, ac
         f"/api/v1/bank-accounts/{bank_id}/import/preview",
         files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
     ).json()
-    commit_rows = []
+    decisions = []
     desired_by_key = {
         (iso(r["occurred_at"]), r["direction"], str(r["amount"]), r["memo"]): r
         for r in desired
@@ -532,20 +532,28 @@ def preview_and_commit(api: Api, bank_id: int, content: bytes, filename: str, ac
         key = (parsed["occurred_at"], parsed["direction"], parsed["amount"], parsed["memo"])
         source = desired_by_key[key]
         tax_code = source["tax_code"]
-        commit_rows.append(
+        decisions.append(
             {
-                "occurred_at": parsed["occurred_at"],
-                "direction": parsed["direction"],
-                "amount": parsed["amount"],
-                "dedup_key": row["dedup_key"],
-                "memo": parsed["memo"],
-                "counter_party_name": parsed["counter_party_name"],
+                "row_key": row["row_key"],
+                "include": True,
                 "account_id": account_by_code[source["account_code"]]["id"],
                 "tax_code": tax_code,
                 "gst_amount": str(gst_from_gross(Decimal(parsed["amount"]), tax_code)),
             }
         )
-    return api.post(f"/api/v1/bank-accounts/{bank_id}/import/commit", json={"rows": commit_rows}).json()
+    payload = {
+        "preview_key": preview["preview_key"],
+        "mapping": preview["mapping"],
+        "import_mode": (
+            "same_import" if preview["statement_review_required"] else "new_import"
+        ),
+        "rows": decisions,
+    }
+    return api.post(
+        f"/api/v1/bank-accounts/{bank_id}/import/commit",
+        files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
+        data={"payload_json": json.dumps(payload)},
+    ).json()
 
 
 def seed_bank(api: Api, accounts: dict[str, dict[str, Any]], payments: list[dict[str, Any]], rng: random.Random) -> dict[str, Any]:

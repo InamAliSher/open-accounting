@@ -644,6 +644,7 @@ export interface BankImportRowParsed {
   occurred_at: string | null;
   memo: string | null;
   counter_party_name: string | null;
+  provider_transaction_id: string | null;
   direction: "in" | "out" | null;
   amount: string | null;
 }
@@ -656,6 +657,12 @@ export interface BankImportPreviewRow {
   issue: string | null;
   dedup_key: string | null;
   is_duplicate: boolean | null;
+  row_key: string;
+  provider_namespace: string | null;
+  import_statement_key: string;
+  requires_review: boolean;
+  review_reason: string | null;
+  review_blocked: boolean;
   suggested_account_id: number | null;
   suggested_tax_code: TaxCode | null;
   suggested_gst_amount: string | null;
@@ -666,6 +673,11 @@ export interface BankImportPreviewRow {
 
 export interface BankImportPreview {
   bank_account_id: number;
+  preview_key: string;
+  import_statement_key: string;
+  has_provider_ids: boolean;
+  statement_review_required: boolean;
+  existing_import_count: number;
   headers: string[];
   mapping: Record<string, number | null>;
   field_options: string[];
@@ -673,18 +685,16 @@ export interface BankImportPreview {
 }
 
 export interface BankImportCommitRow {
-  occurred_at: string;
-  direction: "in" | "out";
-  amount: string;
-  dedup_key?: string | null;
+  row_key: string;
+  include: boolean;
   account_id?: number | null;
   tax_code?: TaxCode;
-  memo?: string | null;
-  counter_party_name?: string | null;
   gst_amount?: string;
   invoice_allocations?: InvoicePaymentAllocationIn[];
   unapplied_account_id?: number | null;
 }
+
+export type BankImportMode = "new_import" | "same_import" | "independent_import";
 
 export interface BankImportCommitResult {
   created: number;
