@@ -10,7 +10,8 @@ CompanyBase.metadata so create_all() builds the full schema.
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+import re
 from enum import Enum
 
 from sqlalchemy import (
@@ -142,6 +143,42 @@ class CreditNoteRefundStatus(str, Enum):
 
 # Decimal precision used throughout: 2 decimal places, up to 14 integer digits.
 MONEY = Numeric(16, 2)
+GST_ADJUSTMENT_MAX_CENTS = 999_999_999_999_999
+_GST_ADJUSTMENT_MONEY_INPUT = re.compile(r"[0-9]+(?:\.[0-9]{1,2})?\Z")
+
+
+def gst_adjustment_money_to_cents(value: Decimal | int | str) -> int:
+    """Validate a decimal money input and convert it to exact integer cents."""
+    if isinstance(value, bool) or not isinstance(value, (Decimal, int, str)):
+        raise ValueError("GST adjustment money must be a Decimal, integer, or decimal string")
+    raw = str(value)
+    if _GST_ADJUSTMENT_MONEY_INPUT.fullmatch(raw) is None:
+        raise ValueError("GST adjustment money must use plain decimal notation with at most two places")
+    try:
+        amount = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ValueError("GST adjustment money must be a finite decimal") from exc
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("GST adjustment money must be finite and nonnegative")
+    scaled = amount * 100
+    if scaled != scaled.to_integral_value():
+        raise ValueError("GST adjustment money cannot contain fractional cents")
+    cents = int(scaled)
+    if cents > GST_ADJUSTMENT_MAX_CENTS:
+        raise ValueError("GST adjustment money exceeds the supported maximum")
+    return cents
+
+
+def gst_adjustment_cents_to_money(value: int) -> Decimal:
+    """Convert validated integer cents to a two-decimal Decimal value."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > GST_ADJUSTMENT_MAX_CENTS
+    ):
+        raise ValueError("GST adjustment cents are outside supported limits")
+    return Decimal(value).scaleb(-2)
 
 
 class Invoice(CompanyBase):
@@ -504,6 +541,220 @@ class CreditNoteRefundIdempotencyKey(CompanyBase):
     )
 
     refund: Mapped[CreditNoteRefund] = relationship()
+
+
+class GSTAdjustmentEvent(CompanyBase):
+    """Append-only record of a policy-versioned GST adjustment."""
+
+    __tablename__ = "gst_adjustment_events"
+    __table_args__ = (
+        CheckConstraint("source_direction IN ('AR', 'AP')", name="ck_gst_adjustment_event_source_direction"),
+        CheckConstraint(
+            "adjustment_direction IN ('increasing', 'decreasing')",
+            name="ck_gst_adjustment_event_adjustment_direction",
+        ),
+        CheckConstraint("projection_box IN ('1A', '1B')", name="ck_gst_adjustment_event_projection_box"),
+        CheckConstraint(
+            f"typeof(amount_cents) = 'integer' AND amount_cents BETWEEN 1 AND {GST_ADJUSTMENT_MAX_CENTS}",
+            name="ck_gst_adjustment_event_amount_cents_positive",
+        ),
+        CheckConstraint(
+            f"typeof(gst_amount_cents) = 'integer' AND gst_amount_cents BETWEEN 0 AND amount_cents "
+            f"AND gst_amount_cents <= {GST_ADJUSTMENT_MAX_CENTS}",
+            name="ck_gst_adjustment_event_gst_cents_within",
+        ),
+        CheckConstraint(
+            "event_type IN ('agreement', 'refund_repayment', 'adjustment_note', 'reversal')",
+            name="ck_gst_adjustment_event_type",
+        ),
+        CheckConstraint(
+            "tax_code IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none', 'mixed')",
+            name="ck_gst_adjustment_event_tax_code",
+        ),
+        CheckConstraint(
+            "gst_amount_cents > 0 OR tax_code IN ('gst_free', 'input_taxed', 'none', 'mixed')",
+            name="ck_gst_adjustment_event_zero_gst_code",
+        ),
+        CheckConstraint("policy_version IN ('F-02-v1')", name="ck_gst_adjustment_event_policy_version"),
+        CheckConstraint(
+            "source_record_type IS NOT NULL AND source_record_type IN ('credit_note') "
+            "AND length(trim(source_record_type, char(9) || char(10) || char(13) || ' ')) > 0",
+            name="ck_gst_adjustment_event_source_record_type",
+        ),
+        CheckConstraint(
+            "typeof(source_record_id) = 'integer' AND source_record_id > 0",
+            name="ck_gst_adjustment_event_source_record_id",
+        ),
+        CheckConstraint(
+            "manual_review_status IN ('not_required', 'pending', 'approved', 'rejected')",
+            name="ck_gst_adjustment_event_manual_review_status",
+        ),
+        CheckConstraint(
+            "source_record_type IS NOT NULL AND source_record_id IS NOT NULL",
+            name="ck_gst_adjustment_event_source_record_pair",
+        ),
+        CheckConstraint(
+            "(event_type = 'reversal' AND reversal_of_event_id IS NOT NULL) OR "
+            "(event_type != 'reversal' AND reversal_of_event_id IS NULL)",
+            name="ck_gst_adjustment_event_reversal_type_link",
+        ),
+        Index("ix_gst_adjustment_events_effective_date", "effective_date"),
+        Index(
+            "ix_gst_adjustment_events_source_record",
+            "source_record_type",
+            "source_record_id",
+        ),
+        Index(
+            "uq_gst_adjustment_events_reversal_once",
+            "reversal_of_event_id",
+            unique=True,
+            sqlite_where=text("reversal_of_event_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_direction: Mapped[str] = mapped_column(String(2), nullable=False)
+    adjustment_direction: Mapped[str] = mapped_column(String(10), nullable=False)
+    projection_box: Mapped[str] = mapped_column(String(2), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    gst_amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    tax_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(80), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    source_record_type: Mapped[str | None] = mapped_column(String(50))
+    source_record_id: Mapped[int | None] = mapped_column(Integer)
+    lifecycle_operation_type: Mapped[str | None] = mapped_column(String(50))
+    lifecycle_operation_id: Mapped[int | None] = mapped_column(Integer)
+    effective_date: Mapped[date] = mapped_column(Date, nullable=False)
+    awareness_date: Mapped[date | None] = mapped_column(Date)
+    agreement_date: Mapped[date | None] = mapped_column(Date)
+    refund_repayment_date: Mapped[date | None] = mapped_column(Date)
+    adjustment_note_reference: Mapped[str | None] = mapped_column(String(200))
+    adjustment_note_held_date: Mapped[date | None] = mapped_column(Date)
+    manual_review_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="not_required", server_default=text("'not_required'")
+    )
+    reversal_of_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("gst_adjustment_events.id", ondelete="RESTRICT")
+    )
+    tax_slice_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class GSTAdjustmentTaxSlice(CompanyBase):
+    """Tax-code allocation for an event with mixed-tax components."""
+
+    __tablename__ = "gst_adjustment_tax_slices"
+    __table_args__ = (
+        UniqueConstraint("event_id", "tax_code", name="uq_gst_adjustment_tax_slice_code"),
+        CheckConstraint(
+            f"typeof(amount_cents) = 'integer' AND amount_cents BETWEEN 1 AND {GST_ADJUSTMENT_MAX_CENTS}",
+            name="ck_gst_adjustment_tax_slice_amount_cents_positive",
+        ),
+        CheckConstraint(
+            f"typeof(gst_amount_cents) = 'integer' AND gst_amount_cents BETWEEN 0 AND amount_cents "
+            f"AND gst_amount_cents <= {GST_ADJUSTMENT_MAX_CENTS}",
+            name="ck_gst_adjustment_tax_slice_gst_cents_within",
+        ),
+        CheckConstraint(
+            "tax_code IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none')",
+            name="ck_gst_adjustment_tax_slice_tax_code",
+        ),
+        CheckConstraint(
+            "gst_amount_cents > 0 OR tax_code IN ('gst_free', 'input_taxed', 'none')",
+            name="ck_gst_adjustment_tax_slice_zero_gst_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey("gst_adjustment_events.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    tax_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    gst_amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class GSTAdjustmentFinalization(CompanyBase):
+    """Append-only report-eligibility record for a reconciled event allocation."""
+
+    __tablename__ = "gst_adjustment_finalizations"
+    __table_args__ = (
+        CheckConstraint("tax_slice_count > 0", name="ck_gst_adjustment_finalization_slice_count_positive"),
+        CheckConstraint(
+            f"typeof(amount_cents) = 'integer' AND amount_cents BETWEEN 1 AND {GST_ADJUSTMENT_MAX_CENTS}",
+            name="ck_gst_adjustment_finalization_amount_cents_positive",
+        ),
+        CheckConstraint(
+            f"typeof(gst_amount_cents) = 'integer' AND gst_amount_cents BETWEEN 0 AND amount_cents "
+            f"AND gst_amount_cents <= {GST_ADJUSTMENT_MAX_CENTS}",
+            name="ck_gst_adjustment_finalization_gst_cents_within",
+        ),
+    )
+
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey("gst_adjustment_events.id", ondelete="RESTRICT"), primary_key=True
+    )
+    tax_slice_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    gst_amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    finalized_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class GSTAdjustmentEvidence(CompanyBase):
+    """Append-only evidence references retained with an adjustment event."""
+
+    __tablename__ = "gst_adjustment_evidence"
+    __table_args__ = (
+        CheckConstraint("evidence_type IN ('document')", name="ck_gst_adjustment_evidence_type"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey("gst_adjustment_events.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    evidence_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    evidence_reference: Mapped[str] = mapped_column(Text, nullable=False)
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class GSTAdjustmentManualReview(CompanyBase):
+    """Append-only manual-review decision history for an adjustment event."""
+
+    __tablename__ = "gst_adjustment_manual_reviews"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected')",
+            name="ck_gst_adjustment_manual_review_status",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND reviewed_at IS NULL) OR "
+            "(status IN ('approved', 'rejected') AND reviewed_at IS NOT NULL)",
+            name="ck_gst_adjustment_manual_review_timestamp",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey("gst_adjustment_events.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(10), nullable=False)
+    reviewer: Mapped[str | None] = mapped_column(String(200))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 # ---------------------------------------------------------------------------
