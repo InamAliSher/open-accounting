@@ -624,6 +624,8 @@ class GSTAdjustmentEvent(CompanyBase):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     source_record_type: Mapped[str | None] = mapped_column(String(50))
     source_record_id: Mapped[int | None] = mapped_column(Integer)
+    lifecycle_operation_type: Mapped[str | None] = mapped_column(String(50))
+    lifecycle_operation_id: Mapped[int | None] = mapped_column(Integer)
     effective_date: Mapped[date] = mapped_column(Date, nullable=False)
     awareness_date: Mapped[date | None] = mapped_column(Date)
     agreement_date: Mapped[date | None] = mapped_column(Date)

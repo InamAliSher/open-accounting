@@ -60,6 +60,8 @@ def _valid_gst_event(**overrides):
         "refund_repayment_date": None,
         "source_record_type": "credit_note",
         "source_record_id": 1,
+        "lifecycle_operation_type": None,
+        "lifecycle_operation_id": None,
         "adjustment_note_reference": None,
         "adjustment_note_held_date": None,
         "manual_review_status": "not_required",
@@ -77,13 +79,15 @@ _INSERT_GST_EVENT = text(
     "event_type, source_direction, adjustment_direction, projection_box, "
     "amount_cents, gst_amount_cents, tax_code, policy_version, reason, effective_date, "
     "awareness_date, agreement_date, refund_repayment_date, source_record_type, "
-    "source_record_id, adjustment_note_reference, adjustment_note_held_date, "
+    "source_record_id, lifecycle_operation_type, lifecycle_operation_id, "
+    "adjustment_note_reference, adjustment_note_held_date, "
     "manual_review_status, tax_slice_count, reversal_of_event_id"
     ") VALUES ("
     ":event_type, :source_direction, :adjustment_direction, :projection_box, "
     ":amount_cents, :gst_amount_cents, :tax_code, :policy_version, :reason, :effective_date, "
     ":awareness_date, :agreement_date, :refund_repayment_date, :source_record_type, "
-    ":source_record_id, :adjustment_note_reference, :adjustment_note_held_date, "
+    ":source_record_id, :lifecycle_operation_type, :lifecycle_operation_id, "
+    ":adjustment_note_reference, :adjustment_note_held_date, "
     ":manual_review_status, :tax_slice_count, :reversal_of_event_id) RETURNING id"
 )
 
@@ -133,6 +137,173 @@ def _finalize_gst_event(conn, event_id):
         ),
         {"event_id": event_id},
     ).scalar_one()
+
+
+def _insert_journal_entry(
+    conn,
+    source_type,
+    source_id,
+    entry_date="2026-10-01",
+    reverses_entry_id=None,
+):
+    return conn.execute(
+        text(
+            "INSERT INTO journal_entries "
+            "(entry_date, memo, source_type, source_id, reverses_entry_id) "
+            "VALUES (:entry_date, 'Synthetic credit-note journal', :source_type, "
+            ":source_id, :reverses_entry_id) RETURNING id"
+        ),
+        {
+            "entry_date": entry_date,
+            "source_type": source_type,
+            "source_id": source_id,
+            "reverses_entry_id": reverses_entry_id,
+        },
+    ).scalar_one()
+
+
+def _seed_ap_credit_note(conn, credit_note_id=42):
+    conn.execute(
+        text(
+            "INSERT INTO contacts (id, kind, name, active, created_at) "
+            "VALUES (1, 'supplier', 'Synthetic AP supplier', 1, CURRENT_TIMESTAMP)"
+        )
+    )
+    conn.execute(
+        text(
+            "INSERT INTO invoices ("
+            "id, direction, contact_id, invoice_number, issue_date, currency, "
+            "subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+            "source, created_at, updated_at"
+            ") VALUES (1, 'AP', 1, 'INV-AP-SYNTHETIC', '2026-09-01', 'AUD', "
+            "10, 1, 11, 1, 'draft', 0, 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+    )
+    conn.execute(
+        text(
+            "INSERT INTO credit_notes ("
+            "id, source_invoice_id, direction, contact_id, credit_note_number, "
+            "issue_date, currency, subtotal, gst_amount, total, gst_inclusive, "
+            "status, created_at, updated_at"
+            ") VALUES (:id, 1, 'AP', 1, 'CN-AP-SYNTHETIC', '2026-09-02', 'AUD', "
+            "10, 1, 11, 1, 'authorised', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ),
+        {"id": credit_note_id},
+    )
+
+
+def _insert_ap_original(
+    conn,
+    *,
+    source_record_id=42,
+    source_direction="AP",
+    projection_box="1A",
+    event_type="agreement",
+    operation_type="credit_note_ap",
+    journal_source_type="credit_note_ap",
+    journal_source_id=None,
+    effective_date="2026-10-01",
+    journal_entry_date=None,
+    amount="10.00",
+    gst_amount="1.00",
+    tax_code="standard",
+    policy_version="F-02-v1",
+    tax_slice_count=1,
+    slices=None,
+    finalize=True,
+):
+    journal_id = _insert_journal_entry(
+        conn,
+        journal_source_type,
+        source_record_id if journal_source_id is None else journal_source_id,
+        entry_date=effective_date if journal_entry_date is None else journal_entry_date,
+    )
+    event_id = _insert_gst_event(
+        conn,
+        event_type=event_type,
+        source_direction=source_direction,
+        projection_box=projection_box,
+        adjustment_direction="decreasing",
+        effective_date=effective_date,
+        amount=amount,
+        gst_amount=gst_amount,
+        tax_code=tax_code,
+        policy_version=policy_version,
+        tax_slice_count=tax_slice_count,
+        source_record_id=source_record_id,
+        lifecycle_operation_type=operation_type,
+        lifecycle_operation_id=journal_id if operation_type is not None else None,
+    )
+    for slice_code, slice_amount, slice_gst in (
+        ((tax_code, amount, gst_amount),) if slices is None else slices
+    ):
+        _insert_gst_slice(conn, event_id, slice_code, slice_amount, slice_gst)
+    if finalize:
+        _finalize_gst_event(conn, event_id)
+    return event_id, journal_id
+
+
+def _insert_ap_void_reversal(
+    conn,
+    original_id,
+    original_journal_id,
+    *,
+    source_direction="AP",
+    projection_box="1A",
+    adjustment_direction="increasing",
+    event_type="reversal",
+    operation_type="credit_note_void_ap",
+    journal_source_type="credit_note_void_ap",
+    journal_source_id=42,
+    journal_reverses_entry_id=None,
+    effective_date="2026-10-02",
+    journal_date=None,
+    amount="10.00",
+    gst_amount="1.00",
+    tax_code="standard",
+    policy_version="F-02-v1",
+    tax_slice_count=1,
+    source_record_type="credit_note",
+    source_record_id=42,
+    finalize=True,
+    slices=None,
+):
+    void_journal_id = _insert_journal_entry(
+        conn,
+        journal_source_type,
+        journal_source_id,
+        entry_date=effective_date if journal_date is None else journal_date,
+        reverses_entry_id=(
+            original_journal_id
+            if journal_reverses_entry_id is None
+            else journal_reverses_entry_id
+        ),
+    )
+    event_id = _insert_gst_event(
+        conn,
+        event_type=event_type,
+        source_direction=source_direction,
+        adjustment_direction=adjustment_direction,
+        projection_box=projection_box,
+        amount=amount,
+        gst_amount=gst_amount,
+        tax_code=tax_code,
+        policy_version=policy_version,
+        tax_slice_count=tax_slice_count,
+        effective_date=effective_date,
+        source_record_type=source_record_type,
+        source_record_id=source_record_id,
+        lifecycle_operation_type=operation_type,
+        lifecycle_operation_id=void_journal_id if operation_type is not None else None,
+        reversal_of_event_id=original_id,
+    )
+    for slice_code, slice_amount, slice_gst in (
+        ((tax_code, amount, gst_amount),) if slices is None else slices
+    ):
+        _insert_gst_slice(conn, event_id, slice_code, slice_amount, slice_gst)
+    if finalize:
+        _finalize_gst_event(conn, event_id)
+    return event_id, void_journal_id
 
 
 def test_wrong_named_indexes_and_missing_ordinary_index_are_repaired(tmp_path):
@@ -1349,6 +1520,444 @@ def test_gst_adjustment_reversals_are_full_single_and_linked(tmp_path):
             {"event_id": original_id},
         ).one()
         assert original == (11000, 1000, "F-02-v1", None)
+
+
+def test_gst_adjustment_ap_void_same_box_reversal_and_journal_provenance(tmp_path):
+    engine = _engine(tmp_path / "gst-adjustment-ap-void-same-box.db")
+    run_company_migrations(engine)
+
+    with engine.begin() as conn:
+        _seed_ap_credit_note(conn)
+        original_id, posting_journal_id = _insert_ap_original(conn)
+        reversal_id, void_journal_id = _insert_ap_void_reversal(
+            conn, original_id, posting_journal_id
+        )
+
+        assert conn.execute(
+            text(
+                "SELECT event_type, projection_box, lifecycle_operation_type, "
+                "lifecycle_operation_id, reversal_of_event_id "
+                "FROM gst_adjustment_events WHERE id IN (:original, :reversal) "
+                "ORDER BY id"
+            ),
+            {"original": original_id, "reversal": reversal_id},
+        ).all() == [
+            ("agreement", "1A", "credit_note_ap", posting_journal_id, None),
+            ("reversal", "1A", "credit_note_void_ap", void_journal_id, original_id),
+        ]
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_finalizations")
+        ).scalar_one() == 2
+
+        for journal_id in (posting_journal_id, void_journal_id):
+            for column, value in (
+                ("id", journal_id + 1000),
+                ("source_type", "manual"),
+                ("source_id", 99),
+                ("entry_date", "2026-10-03"),
+                (
+                    "reverses_entry_id",
+                    void_journal_id if journal_id == posting_journal_id else None,
+                ),
+            ):
+                with pytest.raises(Exception, match="provenance is immutable"):
+                    conn.execute(
+                        text(f"UPDATE journal_entries SET {column}=:value WHERE id=:id"),
+                        {"value": value, "id": journal_id},
+                    )
+            with pytest.raises(Exception, match="provenance is immutable"):
+                conn.execute(
+                    text("DELETE FROM journal_entries WHERE id=:id"),
+                    {"id": journal_id},
+                )
+            journal = conn.execute(
+                text(
+                    "SELECT entry_date, source_type, source_id, reverses_entry_id "
+                    "FROM journal_entries WHERE id=:id"
+                ),
+                {"id": journal_id},
+            ).one()
+            with pytest.raises(Exception, match="provenance is immutable"):
+                conn.execute(
+                    text(
+                        "INSERT OR REPLACE INTO journal_entries "
+                        "(id, entry_date, memo, source_type, source_id, reverses_entry_id) "
+                        "VALUES (:id, :entry_date, 'Synthetic replacement', :source_type, "
+                        ":source_id, :reverses_entry_id)"
+                    ),
+                    {"id": journal_id, **journal._mapping},
+                )
+        with pytest.raises(Exception, match="provenance is immutable"):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO journal_entries "
+                    "(entry_date, memo, source_type, source_id) "
+                    "VALUES ('2026-10-03', 'Synthetic replacement', "
+                    "'credit_note_ap', 42)"
+                )
+            )
+
+        manual_journal_id = _insert_journal_entry(
+            conn, "manual", None, entry_date="2026-10-01"
+        )
+        conn.execute(
+            text(
+                "UPDATE journal_entries SET id=id + 1000, source_id=99, "
+                "entry_date='2026-10-03' "
+                "WHERE id=:id"
+            ),
+            {"id": manual_journal_id},
+        )
+        conn.execute(
+            text("DELETE FROM journal_entries WHERE id=:id"),
+            {"id": manual_journal_id + 1000},
+        )
+
+    engine.dispose()
+
+
+def test_gst_adjustment_journal_provenance_trigger_repair_is_idempotent(tmp_path):
+    engine = _engine(tmp_path / "gst-adjustment-journal-guard-repair.db")
+    run_company_migrations(engine)
+
+    with engine.begin() as conn:
+        _seed_ap_credit_note(conn)
+        _original_id, posting_journal_id = _insert_ap_original(conn)
+        conn.execute(
+            text(
+                "DROP TRIGGER trg_journal_entries_gst_adjustment_no_provenance_update"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TRIGGER trg_journal_entries_gst_adjustment_no_provenance_update "
+                "BEFORE UPDATE OF source_type, source_id, reverses_entry_id, entry_date "
+                "ON journal_entries WHEN EXISTS ("
+                "SELECT 1 FROM gst_adjustment_events AS event "
+                "JOIN gst_adjustment_finalizations AS finalization "
+                "ON finalization.event_id=event.id "
+                "WHERE event.lifecycle_operation_id=OLD.id "
+                "AND event.lifecycle_operation_type=OLD.source_type "
+                "AND event.source_record_id=OLD.source_id) "
+                "AND (OLD.source_type IS NOT NEW.source_type "
+                "OR OLD.source_id IS NOT NEW.source_id "
+                "OR OLD.reverses_entry_id IS NOT NEW.reverses_entry_id "
+                "OR OLD.entry_date IS NOT NEW.entry_date) "
+                "BEGIN SELECT RAISE(ABORT, 'legacy journal provenance guard'); END"
+            )
+        )
+
+    repaired = run_company_migrations(engine)
+    assert "guards:gst_adjustment_append_only" in repaired
+    assert "guards:gst_adjustment_append_only" not in run_company_migrations(engine)
+    with engine.begin() as conn:
+        with pytest.raises(Exception, match="provenance is immutable"):
+            conn.execute(
+                text("UPDATE journal_entries SET id=id + 1000 WHERE id=:id"),
+                {"id": posting_journal_id},
+            )
+        with pytest.raises(Exception, match="provenance is immutable"):
+            conn.execute(
+                text("UPDATE journal_entries SET source_id=99 WHERE id=:id"),
+                {"id": posting_journal_id},
+            )
+
+    engine.dispose()
+
+
+def test_gst_adjustment_lifecycle_operation_domain_and_journal_binding(tmp_path):
+    engine = _engine(tmp_path / "gst-adjustment-lifecycle-operation-domain.db")
+    run_company_migrations(engine)
+
+    with engine.begin() as conn:
+        invalid_operations = (
+            {"lifecycle_operation_type": "credit_note_ap", "lifecycle_operation_id": None},
+            {"lifecycle_operation_type": None, "lifecycle_operation_id": 1},
+            {"lifecycle_operation_type": "manual", "lifecycle_operation_id": 1},
+            {"lifecycle_operation_type": "credit_note_void_ap", "lifecycle_operation_id": 0},
+            {"lifecycle_operation_type": "credit_note_void_ap", "lifecycle_operation_id": -1},
+            {"lifecycle_operation_type": "credit_note_void_ap", "lifecycle_operation_id": 1.5},
+        )
+        for operation in invalid_operations:
+            with pytest.raises(Exception, match="Invalid GST adjustment event"):
+                _insert_gst_event(conn, **operation)
+
+        legacy_original = _insert_gst_event(
+            conn,
+            source_direction="AP",
+            projection_box="1A",
+            lifecycle_operation_type=None,
+            lifecycle_operation_id=None,
+        )
+        _insert_gst_slice(conn, legacy_original, "standard", "10.00", "1.00")
+        _finalize_gst_event(conn, legacy_original)
+
+        for index, invalid_journal in enumerate(
+            (
+                {"journal_source_type": "manual"},
+                {"journal_source_id": 902},
+                {"journal_entry_date": "2026-10-02"},
+            ),
+            start=100,
+        ):
+            with pytest.raises(Exception, match="incomplete or unreconciled"):
+                with conn.begin_nested():
+                    _insert_ap_original(
+                        conn, source_record_id=index, **invalid_journal
+                    )
+
+        duplicate_source_journal_id = _insert_journal_entry(conn, "credit_note_ap", 103)
+        with pytest.raises(Exception, match="UNIQUE"):
+            _insert_journal_entry(conn, "credit_note_ap", 103)
+
+        original_id, posting_journal_id = _insert_ap_original(conn)
+        unrelated_journal_id = _insert_journal_entry(
+            conn, "manual", None, entry_date="2026-10-01"
+        )
+        wrong_void_cases = (
+            {"journal_source_type": "manual"},
+            {"journal_source_id": 904},
+            {"journal_reverses_entry_id": unrelated_journal_id},
+            {"journal_date": "2026-10-03"},
+            {"operation_type": "credit_note_ap"},
+        )
+        for invalid_void in wrong_void_cases:
+            with pytest.raises(Exception):
+                with conn.begin_nested():
+                    _insert_ap_void_reversal(
+                        conn,
+                        original_id,
+                        posting_journal_id,
+                        projection_box="1B",
+                        **invalid_void,
+                    )
+
+        with pytest.raises(Exception, match="full opposite"):
+            _insert_ap_void_reversal(
+                conn,
+                legacy_original,
+                1,
+                operation_type=None,
+                projection_box="1A",
+            )
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "legacy",
+        "ar",
+        "application",
+        "refund",
+        "ordinary",
+        "arbitrary_operation",
+        "nonfinalized",
+        "already_reversed",
+        "reversal_original",
+    ),
+)
+def test_gst_adjustment_same_box_void_requires_eligible_ap_credit_state(tmp_path, case):
+    engine = _engine(tmp_path / f"gst-adjustment-ap-void-ineligible-{case}.db")
+    run_company_migrations(engine)
+
+    with engine.begin() as conn:
+        _seed_ap_credit_note(conn)
+        reversal_box = "1A"
+        if case == "legacy":
+            original_id = _insert_gst_event(
+                conn,
+                source_direction="AP",
+                projection_box="1A",
+                lifecycle_operation_type=None,
+                lifecycle_operation_id=None,
+            )
+            _insert_gst_slice(conn, original_id, "standard", "10.00", "1.00")
+            _finalize_gst_event(conn, original_id)
+            original_journal_id = _insert_journal_entry(conn, "manual", None)
+        elif case == "ar":
+            original_id, original_journal_id = _insert_ap_original(
+                conn, source_direction="AR", operation_type=None
+            )
+        elif case == "nonfinalized":
+            original_id, original_journal_id = _insert_ap_original(conn, finalize=False)
+        elif case == "reversal_original":
+            base_id, original_journal_id = _insert_ap_original(
+                conn, operation_type=None
+            )
+            original_id = _insert_gst_event(
+                conn,
+                event_type="reversal",
+                source_direction="AP",
+                adjustment_direction="increasing",
+                projection_box="1B",
+                source_record_id=42,
+                reversal_of_event_id=base_id,
+                lifecycle_operation_type=None,
+                lifecycle_operation_id=None,
+            )
+            _insert_gst_slice(conn, original_id, "standard", "10.00", "1.00")
+            _finalize_gst_event(conn, original_id)
+            reversal_box = "1B"
+        else:
+            original_id, original_journal_id = _insert_ap_original(
+                conn, operation_type=None if case == "ordinary" else "credit_note_ap"
+            )
+
+        if case == "application":
+            conn.execute(
+                text(
+                    "INSERT INTO credit_note_applications "
+                    "(credit_note_id, invoice_id, amount, application_date, status) "
+                    "VALUES (42, 1, 1, '2026-10-01', 'active')"
+                )
+            )
+        elif case == "refund":
+            conn.execute(
+                text(
+                    "INSERT INTO bank_accounts (id, name, opening_balance, is_active) "
+                    "VALUES (1, 'Synthetic bank', 0, 1)"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO bank_transactions "
+                    "(id, bank_account_id, direction, amount, occurred_at, gst_amount, "
+                    "tax_code, unapplied_amount) "
+                    "VALUES (1, 1, 'out', 1, '2026-10-01', 0, 'none', 0)"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO credit_note_refunds "
+                    "(credit_note_id, bank_transaction_id, journal_entry_id, amount, "
+                    "refund_date, status) VALUES (42, 1, :journal_id, 1, "
+                    "'2026-10-01', 'active')"
+                ),
+                {"journal_id": original_journal_id},
+            )
+        elif case == "already_reversed":
+            _insert_ap_void_reversal(conn, original_id, original_journal_id)
+
+        operation_type = None if case in {"legacy", "ar", "ordinary"} else "credit_note_void_ap"
+        if case == "arbitrary_operation":
+            operation_type = "arbitrary"
+        with pytest.raises(Exception):
+            _insert_ap_void_reversal(
+                conn,
+                original_id,
+                original_journal_id,
+                projection_box=reversal_box,
+                operation_type=operation_type,
+                adjustment_direction=(
+                    "decreasing" if case == "reversal_original" else "increasing"
+                ),
+            )
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("case", "overrides"),
+    (
+        ("amount", {"amount": "9.00"}),
+        ("gst", {"gst_amount": "0.50"}),
+        ("tax_code", {"tax_code": "capital"}),
+        ("policy", {"policy_version": "F-02-v2"}),
+        ("source_type", {"source_record_type": "invoice"}),
+        ("source_id", {"source_record_id": 43}),
+        ("source_direction", {"source_direction": "AR"}),
+        ("adjustment_direction", {"adjustment_direction": "decreasing"}),
+        ("effective_date", {"effective_date": "2026-09-30"}),
+        ("operation_type", {"operation_type": "credit_note_ap"}),
+        ("journal_type", {"journal_source_type": "manual"}),
+        ("journal_source_id", {"journal_source_id": 904}),
+        ("journal_target", {"journal_reverses_entry_id": "unrelated"}),
+        ("journal_date", {"journal_date": "2026-10-03"}),
+    ),
+)
+def test_gst_adjustment_ap_void_rejects_mismatched_reversal_provenance(
+    tmp_path, case, overrides
+):
+    engine = _engine(tmp_path / f"gst-adjustment-ap-void-mismatch-{case}.db")
+    run_company_migrations(engine)
+
+    with engine.begin() as conn:
+        _seed_ap_credit_note(conn)
+        original_id, posting_journal_id = _insert_ap_original(conn)
+        unrelated_journal_id = _insert_journal_entry(
+            conn, "manual", None, entry_date="2026-10-01"
+        )
+        if overrides.get("journal_reverses_entry_id") == "unrelated":
+            overrides = {**overrides, "journal_reverses_entry_id": unrelated_journal_id}
+
+        with pytest.raises(Exception):
+            with conn.begin_nested():
+                _insert_ap_void_reversal(
+                    conn,
+                    original_id,
+                    posting_journal_id,
+                    projection_box="1B",
+                    **overrides,
+                )
+
+    engine.dispose()
+
+
+def test_gst_adjustment_ap_void_reversal_requires_exact_complete_slices(tmp_path):
+    engine = _engine(tmp_path / "gst-adjustment-ap-void-slices.db")
+    run_company_migrations(engine)
+
+    with engine.begin() as conn:
+        _seed_ap_credit_note(conn)
+        original_id, posting_journal_id = _insert_ap_original(conn)
+
+        with pytest.raises(Exception, match="Invalid or unreconciled"):
+            with conn.begin_nested():
+                _insert_ap_void_reversal(
+                    conn,
+                    original_id,
+                    posting_journal_id,
+                    slices=(("standard", "9.00", "0.90"),),
+                )
+
+        reversal_id, _void_journal_id = _insert_ap_void_reversal(
+            conn,
+            original_id,
+            posting_journal_id,
+            finalize=False,
+            slices=(),
+        )
+        with pytest.raises(Exception, match="incomplete or unreconciled"):
+            _finalize_gst_event(conn, reversal_id)
+
+        mixed_original_id, mixed_posting_journal_id = _insert_ap_original(
+            conn,
+            source_record_id=43,
+            amount="10.00",
+            gst_amount="0.50",
+            tax_code="mixed",
+            tax_slice_count=2,
+            slices=(("standard", "5.00", "0.50"), ("gst_free", "5.00", "0.00")),
+        )
+        partial_reversal_id, _mixed_void_journal_id = _insert_ap_void_reversal(
+            conn,
+            mixed_original_id,
+            mixed_posting_journal_id,
+            source_record_id=43,
+            journal_source_id=43,
+            amount="10.00",
+            gst_amount="0.50",
+            tax_code="mixed",
+            tax_slice_count=2,
+            finalize=False,
+            slices=(("standard", "5.00", "0.50"),),
+        )
+        with pytest.raises(Exception, match="incomplete or unreconciled"):
+            _finalize_gst_event(conn, partial_reversal_id)
+
+    engine.dispose()
 
 
 def test_gst_adjustment_events_are_company_database_isolated(tmp_path):

@@ -175,6 +175,20 @@ def _ensure_gst_adjustment_append_only_guards(conn) -> bool:
             )
         )
         changed = True
+    if _table_exists(conn, "gst_adjustment_events"):
+        event_columns = _existing_columns(conn, "gst_adjustment_events")
+        for column, column_type in (
+            ("lifecycle_operation_type", "VARCHAR(50)"),
+            ("lifecycle_operation_id", "INTEGER"),
+        ):
+            if column not in event_columns:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE gst_adjustment_events ADD COLUMN {column} "
+                        f"{column_type}"
+                    )
+                )
+                changed = True
 
     for table in tables:
         if not _table_exists(conn, table):
@@ -251,6 +265,13 @@ def _ensure_gst_adjustment_append_only_guards(conn) -> bool:
                             OR NEW.source_record_type NOT IN ('credit_note')
                             OR typeof(NEW.source_record_id) != 'integer'
                             OR NEW.source_record_id <= 0
+              OR ((NEW.lifecycle_operation_type IS NULL) != (NEW.lifecycle_operation_id IS NULL))
+              OR (NEW.lifecycle_operation_type IS NOT NULL AND
+                  NEW.lifecycle_operation_type NOT IN ('credit_note_ap', 'credit_note_void_ap'))
+              OR (NEW.lifecycle_operation_id IS NOT NULL AND (
+                  typeof(NEW.lifecycle_operation_id) != 'integer'
+                  OR NEW.lifecycle_operation_id <= 0
+              ))
               OR ((NEW.event_type = 'reversal') != (NEW.reversal_of_event_id IS NOT NULL))
               OR ((NEW.adjustment_note_reference IS NULL) != (NEW.adjustment_note_held_date IS NULL))
               OR (NEW.adjustment_note_reference IS NOT NULL AND
@@ -280,6 +301,50 @@ def _ensure_gst_adjustment_append_only_guards(conn) -> bool:
         changed = _ensure_trigger(conn, domain_trigger, domain_sql) or changed
 
         reversal_trigger = "trg_gst_adjustment_events_reversal_opposite"
+        same_box_journal_condition = "0"
+        if _table_exists(conn, "journal_entries"):
+            same_box_journal_condition = """EXISTS (
+                SELECT 1 FROM journal_entries AS original_journal
+                JOIN journal_entries AS void_journal
+                  ON void_journal.id = NEW.lifecycle_operation_id
+                WHERE original_journal.id = original.lifecycle_operation_id
+                  AND original_journal.source_type = 'credit_note_ap'
+                  AND original_journal.source_id = original.source_record_id
+                  AND original_journal.entry_date = original.effective_date
+                  AND void_journal.source_type = 'credit_note_void_ap'
+                  AND void_journal.source_id = NEW.source_record_id
+                  AND void_journal.reverses_entry_id = original_journal.id
+                  AND void_journal.entry_date = NEW.effective_date
+            )"""
+        no_active_application_condition = (
+            "NOT EXISTS (SELECT 1 FROM credit_note_applications "
+            "WHERE credit_note_id = original.source_record_id AND status = 'active')"
+            if _table_exists(conn, "credit_note_applications")
+            else "0"
+        )
+        no_active_refund_condition = (
+            "NOT EXISTS (SELECT 1 FROM credit_note_refunds "
+            "WHERE credit_note_id = original.source_record_id AND status = 'active')"
+            if _table_exists(conn, "credit_note_refunds")
+            else "0"
+        )
+        same_box_exception = f"""(
+            original.projection_box = '1A'
+            AND NEW.projection_box = '1A'
+            AND original.source_direction = 'AP'
+            AND NEW.source_direction = 'AP'
+            AND original.lifecycle_operation_type = 'credit_note_ap'
+            AND NEW.lifecycle_operation_type = 'credit_note_void_ap'
+            AND original.lifecycle_operation_id IS NOT NULL
+            AND NEW.lifecycle_operation_id IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM gst_adjustment_events AS prior_reversal
+                WHERE prior_reversal.reversal_of_event_id = original.id
+            )
+            AND {same_box_journal_condition}
+            AND {no_active_application_condition}
+            AND {no_active_refund_condition}
+        )"""
         if _table_exists(conn, "gst_adjustment_finalizations"):
             reversal_sql = f'''CREATE TRIGGER "{reversal_trigger}"
                 BEFORE INSERT ON "gst_adjustment_events"
@@ -291,7 +356,8 @@ def _ensure_gst_adjustment_append_only_guards(conn) -> bool:
                           AND original.reversal_of_event_id IS NULL
                           AND original.source_direction = NEW.source_direction
                           AND original.adjustment_direction <> NEW.adjustment_direction
-                          AND original.projection_box <> NEW.projection_box
+                         AND (original.projection_box <> NEW.projection_box
+                             OR {same_box_exception})
                           AND original.amount_cents = NEW.amount_cents
                           AND original.gst_amount_cents = NEW.gst_amount_cents
                           AND original.tax_code = NEW.tax_code
@@ -370,6 +436,62 @@ def _ensure_gst_adjustment_append_only_guards(conn) -> bool:
             if _table_exists(conn, "gst_adjustment_manual_reviews")
             else "0"
         )
+        lifecycle_operation_eligibility = """(
+                        (parent.lifecycle_operation_type IS NULL AND parent.lifecycle_operation_id IS NULL)
+                        OR (
+                                parent.lifecycle_operation_type = 'credit_note_ap'
+                                AND parent.event_type != 'reversal'
+                                AND parent.source_direction = 'AP'
+                                AND (SELECT COUNT(*) FROM journal_entries AS posting_journal
+                                         WHERE posting_journal.id = parent.lifecycle_operation_id
+                                             AND posting_journal.source_type = 'credit_note_ap'
+                                             AND posting_journal.source_id = parent.source_record_id
+                                             AND posting_journal.entry_date = parent.effective_date) = 1
+                                AND (SELECT COUNT(*) FROM journal_entries AS matching_postings
+                                         WHERE matching_postings.source_type = 'credit_note_ap'
+                                             AND matching_postings.source_id = parent.source_record_id) = 1
+                        )
+                        OR (
+                                parent.lifecycle_operation_type = 'credit_note_void_ap'
+                                AND parent.event_type = 'reversal'
+                                AND parent.source_direction = 'AP'
+                                AND EXISTS (
+                                        SELECT 1 FROM gst_adjustment_events AS original
+                                        JOIN gst_adjustment_finalizations AS original_finalization
+                                            ON original_finalization.event_id = original.id
+                                        JOIN journal_entries AS posting_journal
+                                            ON posting_journal.id = original.lifecycle_operation_id
+                                        JOIN journal_entries AS void_journal
+                                            ON void_journal.id = parent.lifecycle_operation_id
+                                        WHERE original.id = parent.reversal_of_event_id
+                                            AND original.reversal_of_event_id IS NULL
+                                            AND original.source_direction = 'AP'
+                                            AND original.lifecycle_operation_type = 'credit_note_ap'
+                                            AND posting_journal.source_type = 'credit_note_ap'
+                                            AND posting_journal.source_id = original.source_record_id
+                                            AND posting_journal.entry_date = original.effective_date
+                                            AND void_journal.source_type = 'credit_note_void_ap'
+                                            AND void_journal.source_id = parent.source_record_id
+                                            AND void_journal.reverses_entry_id = posting_journal.id
+                                            AND void_journal.entry_date = parent.effective_date
+                                            AND (SELECT COUNT(*) FROM journal_entries AS matching_postings
+                                                     WHERE matching_postings.source_type = 'credit_note_ap'
+                                                         AND matching_postings.source_id = parent.source_record_id) = 1
+                                            AND (SELECT COUNT(*) FROM journal_entries AS matching_voids
+                                                     WHERE matching_voids.source_type = 'credit_note_void_ap'
+                                                         AND matching_voids.source_id = parent.source_record_id
+                                                         AND matching_voids.reverses_entry_id = posting_journal.id) = 1
+                                )
+                                AND NOT EXISTS (
+                                        SELECT 1 FROM credit_note_applications
+                                        WHERE credit_note_id = parent.source_record_id AND status = 'active'
+                                )
+                                AND NOT EXISTS (
+                                        SELECT 1 FROM credit_note_refunds
+                                        WHERE credit_note_id = parent.source_record_id AND status = 'active'
+                                )
+                        )
+                )""" if _table_exists(conn, "journal_entries") else "0"
         finalization_sql = f'''CREATE TRIGGER "{finalization_trigger}"
             BEFORE INSERT ON "gst_adjustment_finalizations"
             WHEN NOT EXISTS (
@@ -383,6 +505,7 @@ def _ensure_gst_adjustment_append_only_guards(conn) -> bool:
                                     AND parent.source_record_type IN ('credit_note')
                                     AND typeof(parent.source_record_id) = 'integer'
                                     AND parent.source_record_id > 0
+                                      AND {lifecycle_operation_eligibility}
                   AND {review_eligibility}
                   AND (SELECT COUNT(*) FROM gst_adjustment_tax_slices
                        WHERE event_id = parent.id) = parent.tax_slice_count
@@ -477,6 +600,75 @@ def _ensure_gst_adjustment_append_only_guards(conn) -> bool:
                 SELECT RAISE(ABORT, 'Invalid GST adjustment manual review');
             END'''
         changed = _ensure_trigger(conn, review_trigger, review_sql) or changed
+
+    if (
+        _table_exists(conn, "journal_entries")
+        and _table_exists(conn, "gst_adjustment_events")
+        and _table_exists(conn, "gst_adjustment_finalizations")
+    ):
+        referenced_journal = """EXISTS (
+            SELECT 1 FROM gst_adjustment_events AS event
+            JOIN gst_adjustment_finalizations AS finalization
+              ON finalization.event_id = event.id
+            WHERE event.lifecycle_operation_id = OLD.id
+              AND event.lifecycle_operation_type = OLD.source_type
+              AND event.source_record_id = OLD.source_id
+        )"""
+        journal_update_sql = f'''CREATE TRIGGER "trg_journal_entries_gst_adjustment_no_provenance_update"
+                        BEFORE UPDATE OF id, source_type, source_id, reverses_entry_id, entry_date
+            ON journal_entries
+            WHEN {referenced_journal}
+                            AND (OLD.id IS NOT NEW.id
+                                     OR OLD.source_type IS NOT NEW.source_type
+                   OR OLD.source_id IS NOT NEW.source_id
+                   OR OLD.reverses_entry_id IS NOT NEW.reverses_entry_id
+                   OR OLD.entry_date IS NOT NEW.entry_date)
+            BEGIN
+                SELECT RAISE(ABORT, 'Finalized GST adjustment journal provenance is immutable');
+            END'''
+        changed = _ensure_trigger(
+            conn,
+            "trg_journal_entries_gst_adjustment_no_provenance_update",
+            journal_update_sql,
+        ) or changed
+        journal_delete_sql = f'''CREATE TRIGGER "trg_journal_entries_gst_adjustment_no_provenance_delete"
+            BEFORE DELETE ON journal_entries
+            WHEN {referenced_journal}
+            BEGIN
+                SELECT RAISE(ABORT, 'Finalized GST adjustment journal provenance is immutable');
+            END'''
+        changed = _ensure_trigger(
+            conn,
+            "trg_journal_entries_gst_adjustment_no_provenance_delete",
+            journal_delete_sql,
+        ) or changed
+        journal_replace_sql = f'''CREATE TRIGGER "trg_journal_entries_gst_adjustment_no_provenance_replace"
+            BEFORE INSERT ON journal_entries
+            WHEN EXISTS (
+                SELECT 1 FROM journal_entries AS existing
+                WHERE (existing.id = NEW.id
+                   OR (NEW.source_id IS NOT NULL
+                       AND existing.source_type = NEW.source_type
+                       AND existing.source_id = NEW.source_id)
+                   OR (NEW.reverses_entry_id IS NOT NULL
+                       AND existing.reverses_entry_id = NEW.reverses_entry_id))
+                  AND EXISTS (
+                      SELECT 1 FROM gst_adjustment_events AS event
+                      JOIN gst_adjustment_finalizations AS finalization
+                        ON finalization.event_id = event.id
+                      WHERE event.lifecycle_operation_id = existing.id
+                        AND event.lifecycle_operation_type = existing.source_type
+                        AND event.source_record_id = existing.source_id
+                  )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'Finalized GST adjustment journal provenance is immutable');
+            END'''
+        changed = _ensure_trigger(
+            conn,
+            "trg_journal_entries_gst_adjustment_no_provenance_replace",
+            journal_replace_sql,
+        ) or changed
     return changed
 
 

@@ -228,6 +228,7 @@ def test_gst_adjustment_schema_survives_rebuild_without_legacy_backfill():
                     "SELECT id, event_type, source_direction, adjustment_direction, "
                     "projection_box, amount_cents, gst_amount_cents, tax_code, "
                     "policy_version, reason, source_record_type, source_record_id, "
+                    "lifecycle_operation_type, lifecycle_operation_id, "
                     "effective_date, awareness_date, agreement_date, "
                     "refund_repayment_date, adjustment_note_reference, "
                     "adjustment_note_held_date, manual_review_status, "
@@ -505,6 +506,98 @@ def test_gst_adjustment_schema_survives_rebuild_without_legacy_backfill():
                 )
             )
 
+    engine.dispose()
+
+
+def test_gst_adjustment_lifecycle_operation_columns_are_additive_and_idempotent():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+
+    with engine.begin() as conn:
+        event_id = conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_events ("
+                "event_type, source_direction, adjustment_direction, projection_box, "
+                "amount_cents, gst_amount_cents, tax_code, policy_version, reason, "
+                "source_record_type, source_record_id, effective_date, tax_slice_count"
+                ") VALUES ('agreement', 'AP', 'decreasing', '1B', 10000, 1000, "
+                "'standard', 'F-02-v1', 'Synthetic legacy event', 'credit_note', "
+                "77, '2026-09-01', 1) RETURNING id"
+            )
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 'standard', 10000, 1000)"
+            ),
+            {"event_id": event_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_finalizations "
+                "(event_id, tax_slice_count, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 1, 10000, 1000)"
+            ),
+            {"event_id": event_id},
+        )
+        legacy_event = conn.execute(
+            text(
+                "SELECT event_type, source_direction, adjustment_direction, projection_box, "
+                "amount_cents, gst_amount_cents, tax_code, policy_version, source_record_type, "
+                "source_record_id, effective_date FROM gst_adjustment_events WHERE id=:event_id"
+            ),
+            {"event_id": event_id},
+        ).one()
+        trigger_names = conn.execute(
+            text(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND "
+                "(name LIKE 'trg_gst_adjustment_%' OR "
+                "name LIKE 'trg_journal_entries_gst_adjustment_%')"
+            )
+        ).scalars().all()
+        for trigger_name in trigger_names:
+            conn.execute(text(f'DROP TRIGGER "{trigger_name}"'))
+        conn.execute(
+            text("ALTER TABLE gst_adjustment_events DROP COLUMN lifecycle_operation_type")
+        )
+        conn.execute(
+            text("ALTER TABLE gst_adjustment_events DROP COLUMN lifecycle_operation_id")
+        )
+
+    repaired = migrations.run_company_migrations(engine)
+    assert "guards:gst_adjustment_append_only" in repaired
+    assert not any(step.startswith("rebuild:") for step in repaired)
+    with engine.connect() as conn:
+        event_columns = {
+            row[1]: row for row in conn.execute(text("PRAGMA table_info(gst_adjustment_events)"))
+        }
+        assert event_columns["lifecycle_operation_type"][2].upper() == "VARCHAR(50)"
+        assert event_columns["lifecycle_operation_id"][2].upper() == "INTEGER"
+        assert event_columns["lifecycle_operation_type"][3] == 0
+        assert event_columns["lifecycle_operation_id"][3] == 0
+        assert conn.execute(
+            text(
+                "SELECT lifecycle_operation_type, lifecycle_operation_id FROM "
+                "gst_adjustment_events WHERE id=:event_id"
+            ),
+            {"event_id": event_id},
+        ).one() == (None, None)
+        assert conn.execute(
+            text(
+                "SELECT event_type, source_direction, adjustment_direction, projection_box, "
+                "amount_cents, gst_amount_cents, tax_code, policy_version, source_record_type, "
+                "source_record_id, effective_date FROM gst_adjustment_events WHERE id=:event_id"
+            ),
+            {"event_id": event_id},
+        ).one() == legacy_event
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_finalizations WHERE event_id=:event_id"),
+            {"event_id": event_id},
+        ).scalar_one() == 1
+
+    assert "guards:gst_adjustment_append_only" not in migrations.run_company_migrations(engine)
     engine.dispose()
 
 
