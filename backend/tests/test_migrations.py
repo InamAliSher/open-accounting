@@ -216,6 +216,355 @@ def _bank_sequence(conn) -> int:
     )
 
 
+def test_gst_adjustment_schema_survives_rebuild_without_legacy_backfill():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+
+    def gst_adjustment_snapshot(conn):
+        return {
+            "events": conn.execute(
+                text(
+                    "SELECT id, event_type, source_direction, adjustment_direction, "
+                    "projection_box, amount_cents, gst_amount_cents, tax_code, "
+                    "policy_version, reason, source_record_type, source_record_id, "
+                    "effective_date, awareness_date, agreement_date, "
+                    "refund_repayment_date, adjustment_note_reference, "
+                    "adjustment_note_held_date, manual_review_status, "
+                    "reversal_of_event_id, tax_slice_count, created_at "
+                    "FROM gst_adjustment_events ORDER BY id"
+                )
+            ).all(),
+            "slices": conn.execute(
+                text(
+                    "SELECT id, event_id, tax_code, amount_cents, gst_amount_cents "
+                    "FROM gst_adjustment_tax_slices ORDER BY id"
+                )
+            ).all(),
+            "finalizations": conn.execute(
+                text(
+                    "SELECT event_id, tax_slice_count, amount_cents, gst_amount_cents, "
+                    "finalized_at FROM gst_adjustment_finalizations ORDER BY event_id"
+                )
+            ).all(),
+            "evidence": conn.execute(
+                text(
+                    "SELECT id, event_id, evidence_type, evidence_reference, "
+                    "content_sha256, notes, created_at "
+                    "FROM gst_adjustment_evidence ORDER BY id"
+                )
+            ).all(),
+            "reviews": conn.execute(
+                text(
+                    "SELECT id, event_id, status, reviewer, reviewed_at, reason, created_at "
+                    "FROM gst_adjustment_manual_reviews ORDER BY id"
+                )
+            ).all(),
+        }
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO contacts (id, kind, name, active, created_at) "
+                "VALUES (1, 'customer', 'Synthetic legacy contact', 1, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO invoices ("
+                "id, direction, contact_id, invoice_number, issue_date, currency, "
+                "subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+                "source, created_at, updated_at"
+                ") VALUES (1, 'AR', 1, 'INV-LEGACY', '2026-07-01', 'AUD', "
+                "100, 10, 110, 1, 'draft', 0, 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO credit_notes ("
+                "id, source_invoice_id, direction, contact_id, credit_note_number, "
+                "issue_date, currency, subtotal, gst_amount, total, gst_inclusive, "
+                "status, created_at, updated_at"
+                ") VALUES (99, 1, 'AR', 1, 'CN-LEGACY', '2026-08-01', 'AUD', "
+                "100, 10, 110, 1, 'authorised', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_events ("
+                "id, event_type, source_direction, adjustment_direction, "
+                "projection_box, amount_cents, gst_amount_cents, tax_code, policy_version, "
+                "reason, source_record_type, source_record_id, effective_date, "
+                "awareness_date, agreement_date, refund_repayment_date, "
+                "adjustment_note_reference, adjustment_note_held_date, "
+                "manual_review_status, tax_slice_count"
+                ") VALUES (1, 'agreement', 'AR', 'decreasing', '1B', 11000, 1000, "
+                "'mixed', 'F-02-v1', 'Synthetic agreement', 'credit_note', 77, "
+                "'2026-09-01', '2026-09-02', '2026-09-03', '2026-09-04', "
+                "'CN-77', '2026-09-05', 'pending', 2)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (1, 'standard', 10000, 1000)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (1, 'gst_free', 1000, 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_manual_reviews "
+                "(event_id, status, reviewer, reviewed_at, reason) "
+                "VALUES (1, 'approved', 'Synthetic reviewer', "
+                "'2026-09-06 10:00:00', 'Synthetic approval')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_finalizations "
+                "(event_id, tax_slice_count, amount_cents, gst_amount_cents) "
+                "VALUES (1, 2, 11000, 1000)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_evidence "
+                "(event_id, evidence_type, evidence_reference, content_sha256) "
+                "VALUES (1, 'document', 'synthetic://agreement', "
+                "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')"
+            )
+        )
+        reversal_id = conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_events ("
+                "event_type, source_direction, adjustment_direction, projection_box, "
+                "amount_cents, gst_amount_cents, tax_code, policy_version, reason, "
+                "source_record_type, source_record_id, effective_date, awareness_date, "
+                "agreement_date, refund_repayment_date, adjustment_note_reference, "
+                "adjustment_note_held_date, manual_review_status, tax_slice_count, "
+                "reversal_of_event_id"
+                ") VALUES ('reversal', 'AR', 'increasing', '1A', 11000, 1000, "
+                "'mixed', 'F-02-v1', 'Synthetic reversal', 'credit_note', 77, "
+                "'2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', "
+                "'CN-77-REV', '2026-09-11', 'pending', 2, 1) RETURNING id"
+            )
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 'standard', 10000, 1000)"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 'gst_free', 1000, 0)"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_manual_reviews "
+                "(event_id, status, reviewer, reason) "
+                "VALUES (:event_id, 'pending', 'Synthetic reviewer', 'Reversal review opened')"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_manual_reviews "
+                "(event_id, status, reviewer, reviewed_at, reason) "
+                "VALUES (:event_id, 'approved', 'Synthetic reviewer', "
+                "'2026-09-12 10:00:00', 'Synthetic reversal approval')"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_evidence "
+                "(event_id, evidence_type, evidence_reference, content_sha256) "
+                "VALUES (:event_id, 'document', 'synthetic://reversal', "
+                "'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_finalizations "
+                "(event_id, tax_slice_count, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 2, 11000, 1000)"
+            ),
+            {"event_id": reversal_id},
+        )
+        legacy_credit_note = conn.execute(
+            text(
+                "SELECT id, credit_note_number, subtotal, gst_amount, total, status "
+                "FROM credit_notes WHERE id=99"
+            )
+        ).one()
+        event_before_rebuild = conn.execute(
+            text(
+                "SELECT policy_version, effective_date, awareness_date, agreement_date, "
+                "refund_repayment_date, adjustment_note_held_date "
+                "FROM gst_adjustment_events WHERE id=1"
+            )
+        ).one()
+        f02_before_rebuild = gst_adjustment_snapshot(conn)
+        conn.execute(text("DROP TABLE bank_transactions"))
+        conn.execute(text(_OLD_BANK_TXN_DDL))
+
+    applied = migrations.run_company_migrations(engine)
+    assert "rebuild:bank_transactions" in applied
+
+    with engine.connect() as conn:
+        assert conn.execute(
+            text(
+                "SELECT id, credit_note_number, subtotal, gst_amount, total, status "
+                "FROM credit_notes WHERE id=99"
+            )
+        ).one() == legacy_credit_note
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_events WHERE source_record_id=99")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_events")
+        ).scalar_one() == 2
+        assert conn.execute(
+            text(
+                "SELECT id, event_type, reversal_of_event_id, source_record_type, "
+                "source_record_id, policy_version, amount_cents, gst_amount_cents "
+                "FROM gst_adjustment_events ORDER BY id"
+            )
+        ).all() == [
+            (1, "agreement", None, "credit_note", 77, "F-02-v1", 11000, 1000),
+            (reversal_id, "reversal", 1, "credit_note", 77, "F-02-v1", 11000, 1000),
+        ]
+        assert gst_adjustment_snapshot(conn) == f02_before_rebuild
+        assert conn.execute(
+            text(
+                "SELECT policy_version, effective_date, awareness_date, agreement_date, "
+                "refund_repayment_date, adjustment_note_held_date "
+                "FROM gst_adjustment_events WHERE id=1"
+            )
+        ).one() == event_before_rebuild
+        assert conn.execute(
+            text(
+                "SELECT tax_code, amount_cents, gst_amount_cents FROM gst_adjustment_tax_slices "
+                "WHERE event_id=1 ORDER BY tax_code"
+            )
+        ).all() == [("gst_free", 1000, 0), ("standard", 10000, 1000)]
+        assert conn.execute(
+            text(
+                "SELECT evidence_reference, content_sha256 FROM gst_adjustment_evidence "
+                "WHERE event_id=1"
+            )
+        ).one() == (
+            "synthetic://agreement",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        assert conn.execute(
+            text(
+                "SELECT status, reviewer FROM gst_adjustment_manual_reviews "
+                "WHERE event_id=1"
+            )
+        ).one() == ("approved", "Synthetic reviewer")
+        assert conn.execute(
+            text(
+                "SELECT tax_slice_count, amount_cents, gst_amount_cents "
+                "FROM gst_adjustment_finalizations WHERE event_id=1"
+            )
+        ).one() == (2, 11000, 1000)
+        reversal_index_sql = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='uq_gst_adjustment_events_reversal_once'"
+            )
+        ).scalar_one()
+        assert "WHERE reversal_of_event_id IS NOT NULL" in reversal_index_sql
+
+    second_applied = migrations.run_company_migrations(engine)
+    assert "rebuild:bank_transactions" not in second_applied
+    assert "guards:gst_adjustment_append_only" not in second_applied
+    with engine.connect() as conn:
+        assert gst_adjustment_snapshot(conn) == f02_before_rebuild
+        with pytest.raises(Exception, match="append-only"):
+            conn.execute(
+                text(
+                    "UPDATE gst_adjustment_events SET policy_version='F-02-v2' "
+                    "WHERE id=1"
+                )
+            )
+
+    engine.dispose()
+
+
+def test_legacy_credit_note_upgrade_does_not_infer_gst_events():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    with engine.begin() as conn:
+        for table in (
+            "gst_adjustment_evidence",
+            "gst_adjustment_manual_reviews",
+            "gst_adjustment_tax_slices",
+            "gst_adjustment_finalizations",
+            "gst_adjustment_events",
+        ):
+            conn.execute(text(f'DROP TABLE "{table}"'))
+        conn.execute(
+            text(
+                "INSERT INTO contacts (id, kind, name, active, created_at) "
+                "VALUES (1, 'customer', 'Synthetic legacy contact', 1, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO invoices ("
+                "id, direction, contact_id, invoice_number, issue_date, currency, "
+                "subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+                "source, created_at, updated_at"
+                ") VALUES (1, 'AR', 1, 'INV-LEGACY', '2026-07-01', 'AUD', "
+                "100, 10, 110, 1, 'draft', 0, 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO credit_notes ("
+                "id, source_invoice_id, direction, contact_id, credit_note_number, "
+                "issue_date, currency, subtotal, gst_amount, total, gst_inclusive, "
+                "status, created_at, updated_at"
+                ") VALUES (99, 1, 'AR', 1, 'CN-LEGACY', '2026-08-01', 'AUD', "
+                "100, 10, 110, 1, 'authorised', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    CompanyBase.metadata.create_all(engine)
+    applied = migrations.run_company_migrations(engine)
+    assert "guards:gst_adjustment_append_only" in applied
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_events")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text(
+                "SELECT credit_note_number, subtotal, gst_amount, total, status "
+                "FROM credit_notes WHERE id=99"
+            )
+        ).one() == ("CN-LEGACY", 100, 10, 110, "authorised")
+
+    assert "guards:gst_adjustment_append_only" not in migrations.run_company_migrations(engine)
+    engine.dispose()
+
+
 def test_rebuild_leaves_fk_enforcement_on_for_pooled_connections(tmp_path):
     """A rebuild toggles `PRAGMA foreign_keys=OFF` then runs DML, which opens the
     transaction and makes the closing `PRAGMA foreign_keys=ON` a silent no-op —

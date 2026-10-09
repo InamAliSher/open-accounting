@@ -144,6 +144,395 @@ def _index_exists(conn, name: str) -> bool:
     return row is not None
 
 
+def _sqlite_invalid_iso_date(value_sql: str) -> str:
+    return (
+        f"(typeof({value_sql}) != 'text' OR length({value_sql}) != 10 "
+        f"OR {value_sql} NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' "
+        f"OR substr({value_sql}, 1, 4) NOT BETWEEN '0001' AND '9999' "
+        f"OR strftime('%Y-%m-%d', {value_sql}, '+0 days') IS NOT {value_sql})"
+    )
+
+
+def _ensure_gst_adjustment_append_only_guards(conn) -> bool:
+    """Install or repair canonical append-only and GST-domain triggers."""
+    from ..models.company import GST_ADJUSTMENT_MAX_CENTS
+
+    tables = (
+        "gst_adjustment_events",
+        "gst_adjustment_tax_slices",
+        "gst_adjustment_finalizations",
+        "gst_adjustment_evidence",
+        "gst_adjustment_manual_reviews",
+    )
+    changed = False
+    if _table_exists(conn, "gst_adjustment_events") and (
+        "tax_slice_count" not in _existing_columns(conn, "gst_adjustment_events")
+    ):
+        conn.execute(
+            text(
+                "ALTER TABLE gst_adjustment_events ADD COLUMN tax_slice_count "
+                "INTEGER NOT NULL DEFAULT 1"
+            )
+        )
+        changed = True
+
+    for table in tables:
+        if not _table_exists(conn, table):
+            continue
+
+        for operation in ("UPDATE", "DELETE"):
+            name = f"trg_{table}_no_{operation.lower()}"
+            sql = (
+                f'CREATE TRIGGER "{name}" BEFORE {operation} ON "{table}" '
+                "BEGIN SELECT RAISE(ABORT, 'GST adjustment records are append-only'); END"
+            )
+            changed = _ensure_trigger(conn, name, sql) or changed
+
+        if table == "gst_adjustment_finalizations":
+            insert_conditions = [
+                "EXISTS (SELECT 1 FROM gst_adjustment_finalizations "
+                "WHERE event_id = NEW.event_id)"
+            ]
+        else:
+            insert_conditions = [
+                f'EXISTS (SELECT 1 FROM "{table}" WHERE id = NEW.id)'
+            ]
+        if table == "gst_adjustment_events":
+            insert_conditions.append(
+                "(NEW.reversal_of_event_id IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM gst_adjustment_events "
+                "WHERE reversal_of_event_id = NEW.reversal_of_event_id))"
+            )
+        elif table == "gst_adjustment_tax_slices":
+            insert_conditions.append(
+                "EXISTS (SELECT 1 FROM gst_adjustment_tax_slices "
+                "WHERE event_id = NEW.event_id AND tax_code = NEW.tax_code)"
+            )
+        insert_trigger = f"trg_{table}_no_replace_insert"
+        insert_sql = (
+            f'''CREATE TRIGGER "{insert_trigger}"
+            BEFORE INSERT ON "{table}"
+            WHEN {" OR ".join(insert_conditions)}
+            BEGIN
+                SELECT RAISE(ABORT, 'GST adjustment records are append-only');
+            END'''
+        )
+        changed = _ensure_trigger(conn, insert_trigger, insert_sql) or changed
+
+    if _table_exists(conn, "gst_adjustment_events"):
+        domain_trigger = "trg_gst_adjustment_events_domain"
+        effective_date_invalid = _sqlite_invalid_iso_date("NEW.effective_date")
+        awareness_date_invalid = _sqlite_invalid_iso_date("NEW.awareness_date")
+        agreement_date_invalid = _sqlite_invalid_iso_date("NEW.agreement_date")
+        refund_date_invalid = _sqlite_invalid_iso_date("NEW.refund_repayment_date")
+        note_held_date_invalid = _sqlite_invalid_iso_date("NEW.adjustment_note_held_date")
+        domain_sql = f'''CREATE TRIGGER "{domain_trigger}"
+            BEFORE INSERT ON "gst_adjustment_events"
+            WHEN length(trim(COALESCE(NEW.event_type, ''), char(9) || char(10) || char(13) || ' ')) = 0
+                            OR NEW.event_type NOT IN ('agreement', 'refund_repayment', 'adjustment_note', 'reversal')
+              OR NEW.source_direction NOT IN ('AR', 'AP')
+              OR NEW.adjustment_direction NOT IN ('increasing', 'decreasing')
+              OR NEW.projection_box NOT IN ('1A', '1B')
+              OR NEW.tax_code NOT IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none', 'mixed')
+              OR length(trim(COALESCE(NEW.tax_code, ''), char(9) || char(10) || char(13) || ' ')) = 0
+              OR NEW.policy_version NOT IN ('F-02-v1')
+              OR length(trim(COALESCE(NEW.reason, ''), char(9) || char(10) || char(13) || ' ')) = 0
+              OR typeof(NEW.amount_cents) != 'integer'
+              OR NEW.amount_cents < 1 OR NEW.amount_cents > {GST_ADJUSTMENT_MAX_CENTS}
+              OR typeof(NEW.gst_amount_cents) != 'integer'
+              OR NEW.gst_amount_cents < 0 OR NEW.gst_amount_cents > NEW.amount_cents
+              OR NEW.gst_amount_cents > {GST_ADJUSTMENT_MAX_CENTS}
+              OR NEW.manual_review_status NOT IN ('not_required', 'pending', 'approved', 'rejected')
+              OR typeof(NEW.tax_slice_count) != 'integer' OR NEW.tax_slice_count < 1
+              OR (NEW.tax_code = 'mixed' AND NEW.tax_slice_count < 2)
+              OR (NEW.tax_code != 'mixed' AND NEW.tax_slice_count != 1)
+                            OR NEW.source_record_type IS NULL
+                            OR length(trim(COALESCE(NEW.source_record_type, ''), char(9) || char(10) || char(13) || ' ')) = 0
+                            OR NEW.source_record_type NOT IN ('credit_note')
+                            OR typeof(NEW.source_record_id) != 'integer'
+                            OR NEW.source_record_id <= 0
+              OR ((NEW.event_type = 'reversal') != (NEW.reversal_of_event_id IS NOT NULL))
+              OR ((NEW.adjustment_note_reference IS NULL) != (NEW.adjustment_note_held_date IS NULL))
+              OR (NEW.adjustment_note_reference IS NOT NULL AND
+                  length(trim(NEW.adjustment_note_reference, char(9) || char(10) || char(13) || ' ')) = 0)
+              OR {effective_date_invalid}
+              OR (NEW.awareness_date IS NOT NULL AND (
+                  {awareness_date_invalid}
+                    OR julianday(NEW.awareness_date) < julianday(NEW.effective_date)
+                 ))
+              OR (NEW.agreement_date IS NOT NULL AND (
+                  {agreement_date_invalid}
+                    OR julianday(NEW.agreement_date) < julianday(NEW.effective_date)
+                 ))
+              OR (NEW.refund_repayment_date IS NOT NULL AND (
+                  {refund_date_invalid}
+                    OR julianday(NEW.refund_repayment_date) < julianday(NEW.effective_date)
+                 ))
+              OR (NEW.adjustment_note_held_date IS NOT NULL AND (
+                  {note_held_date_invalid}
+                    OR julianday(NEW.adjustment_note_held_date) < julianday(NEW.effective_date)
+                 ))
+              OR (NEW.tax_code IN ('gst_free', 'input_taxed', 'none') AND NEW.gst_amount_cents != 0)
+              OR (NEW.gst_amount_cents = 0 AND NEW.tax_code NOT IN ('gst_free', 'input_taxed', 'none', 'mixed'))
+            BEGIN
+                SELECT RAISE(ABORT, 'Invalid GST adjustment event');
+            END'''
+        changed = _ensure_trigger(conn, domain_trigger, domain_sql) or changed
+
+        reversal_trigger = "trg_gst_adjustment_events_reversal_opposite"
+        if _table_exists(conn, "gst_adjustment_finalizations"):
+            reversal_sql = f'''CREATE TRIGGER "{reversal_trigger}"
+                BEFORE INSERT ON "gst_adjustment_events"
+                WHEN NEW.reversal_of_event_id IS NOT NULL
+                BEGIN
+                    SELECT CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM gst_adjustment_events AS original
+                        WHERE original.id = NEW.reversal_of_event_id
+                          AND original.reversal_of_event_id IS NULL
+                          AND original.source_direction = NEW.source_direction
+                          AND original.adjustment_direction <> NEW.adjustment_direction
+                          AND original.projection_box <> NEW.projection_box
+                          AND original.amount_cents = NEW.amount_cents
+                          AND original.gst_amount_cents = NEW.gst_amount_cents
+                          AND original.tax_code = NEW.tax_code
+                          AND original.policy_version = NEW.policy_version
+                          AND original.source_record_type IS NEW.source_record_type
+                          AND original.source_record_id IS NEW.source_record_id
+                          AND original.tax_slice_count = NEW.tax_slice_count
+                          AND EXISTS (
+                              SELECT 1 FROM gst_adjustment_finalizations
+                              WHERE event_id = original.id
+                          )
+                          AND julianday(NEW.effective_date) >= julianday(original.effective_date)
+                    ) THEN RAISE(ABORT, 'GST adjustment reversal must be a full opposite linked event') END;
+                END'''
+        else:
+            reversal_sql = f'''CREATE TRIGGER "{reversal_trigger}"
+                BEFORE INSERT ON "gst_adjustment_events"
+                WHEN NEW.reversal_of_event_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'GST adjustment finalization schema is unavailable');
+                END'''
+        changed = _ensure_trigger(conn, reversal_trigger, reversal_sql) or changed
+
+    if _table_exists(conn, "gst_adjustment_tax_slices") and _table_exists(
+        conn, "gst_adjustment_events"
+    ):
+        slice_trigger = "trg_gst_adjustment_tax_slices_domain"
+        slice_sql = f'''CREATE TRIGGER "{slice_trigger}"
+            BEFORE INSERT ON "gst_adjustment_tax_slices"
+            WHEN length(trim(COALESCE(NEW.tax_code, ''))) = 0
+              OR NEW.tax_code NOT IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none')
+              OR typeof(NEW.amount_cents) != 'integer'
+              OR NEW.amount_cents < 1 OR NEW.amount_cents > {GST_ADJUSTMENT_MAX_CENTS}
+              OR typeof(NEW.gst_amount_cents) != 'integer'
+              OR NEW.gst_amount_cents < 0 OR NEW.gst_amount_cents > NEW.amount_cents
+              OR NEW.gst_amount_cents > {GST_ADJUSTMENT_MAX_CENTS}
+              OR (NEW.tax_code IN ('gst_free', 'input_taxed', 'none') AND NEW.gst_amount_cents != 0)
+              OR (NEW.gst_amount_cents = 0 AND NEW.tax_code NOT IN ('gst_free', 'input_taxed', 'none'))
+              OR NOT EXISTS (
+                    SELECT 1 FROM gst_adjustment_events AS parent
+                    WHERE parent.id = NEW.event_id
+                                            AND (parent.tax_code = 'mixed' OR (
+                                                        parent.tax_slice_count = 1 AND parent.tax_code = NEW.tax_code
+                                            ))
+                                            AND parent.tax_slice_count >= 1
+                      AND (SELECT COUNT(*) FROM gst_adjustment_tax_slices
+                           WHERE event_id = NEW.event_id) < parent.tax_slice_count
+                      AND (parent.reversal_of_event_id IS NULL OR EXISTS (
+                            SELECT 1 FROM gst_adjustment_tax_slices AS original_slice
+                            WHERE original_slice.event_id = parent.reversal_of_event_id
+                              AND original_slice.tax_code = NEW.tax_code
+                              AND original_slice.amount_cents = NEW.amount_cents
+                              AND original_slice.gst_amount_cents = NEW.gst_amount_cents
+                      ))
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'Invalid or unreconciled GST adjustment tax slice');
+            END'''
+        changed = _ensure_trigger(conn, slice_trigger, slice_sql) or changed
+
+    if all(
+        _table_exists(conn, table)
+        for table in (
+            "gst_adjustment_events",
+            "gst_adjustment_tax_slices",
+            "gst_adjustment_finalizations",
+        )
+    ):
+        finalization_trigger = "trg_gst_adjustment_finalizations_validate"
+        review_eligibility = (
+            "((parent.manual_review_status = 'not_required' AND NOT EXISTS ("
+            "SELECT 1 FROM gst_adjustment_manual_reviews WHERE event_id = parent.id)) "
+            "OR (parent.manual_review_status = 'pending' AND "
+            "(SELECT status FROM gst_adjustment_manual_reviews "
+            "WHERE event_id = parent.id ORDER BY id DESC LIMIT 1) = 'approved'))"
+            if _table_exists(conn, "gst_adjustment_manual_reviews")
+            else "0"
+        )
+        finalization_sql = f'''CREATE TRIGGER "{finalization_trigger}"
+            BEFORE INSERT ON "gst_adjustment_finalizations"
+            WHEN NOT EXISTS (
+                SELECT 1 FROM gst_adjustment_events AS parent
+                WHERE parent.id = NEW.event_id
+                  AND NEW.tax_slice_count = parent.tax_slice_count
+                  AND NEW.amount_cents = parent.amount_cents
+                  AND NEW.gst_amount_cents = parent.gst_amount_cents
+                                    AND parent.source_record_type IS NOT NULL
+                                    AND length(trim(COALESCE(parent.source_record_type, ''), char(9) || char(10) || char(13) || ' ')) > 0
+                                    AND parent.source_record_type IN ('credit_note')
+                                    AND typeof(parent.source_record_id) = 'integer'
+                                    AND parent.source_record_id > 0
+                  AND {review_eligibility}
+                  AND (SELECT COUNT(*) FROM gst_adjustment_tax_slices
+                       WHERE event_id = parent.id) = parent.tax_slice_count
+                   AND (SELECT COALESCE(SUM(amount_cents), 0)
+                       FROM gst_adjustment_tax_slices
+                       WHERE event_id = parent.id) = parent.amount_cents
+                   AND (SELECT COALESCE(SUM(gst_amount_cents), 0)
+                       FROM gst_adjustment_tax_slices
+                       WHERE event_id = parent.id) = parent.gst_amount_cents
+                  AND (parent.reversal_of_event_id IS NULL OR (
+                      EXISTS (SELECT 1 FROM gst_adjustment_finalizations
+                              WHERE event_id = parent.reversal_of_event_id)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM gst_adjustment_tax_slices AS original_slice
+                          LEFT JOIN gst_adjustment_tax_slices AS reversal_slice
+                            ON reversal_slice.event_id = parent.id
+                           AND reversal_slice.tax_code = original_slice.tax_code
+                           AND reversal_slice.amount_cents = original_slice.amount_cents
+                           AND reversal_slice.gst_amount_cents = original_slice.gst_amount_cents
+                          WHERE original_slice.event_id = parent.reversal_of_event_id
+                            AND reversal_slice.id IS NULL
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM gst_adjustment_tax_slices AS reversal_slice
+                          LEFT JOIN gst_adjustment_tax_slices AS original_slice
+                            ON original_slice.event_id = parent.reversal_of_event_id
+                           AND original_slice.tax_code = reversal_slice.tax_code
+                           AND original_slice.amount_cents = reversal_slice.amount_cents
+                           AND original_slice.gst_amount_cents = reversal_slice.gst_amount_cents
+                          WHERE reversal_slice.event_id = parent.id
+                            AND original_slice.id IS NULL
+                      )
+                  ))
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'GST adjustment slices are incomplete or unreconciled');
+            END'''
+        changed = _ensure_trigger(conn, finalization_trigger, finalization_sql) or changed
+
+    if _table_exists(conn, "gst_adjustment_evidence"):
+        evidence_trigger = "trg_gst_adjustment_evidence_domain"
+        evidence_sql = f'''CREATE TRIGGER "{evidence_trigger}"
+            BEFORE INSERT ON "gst_adjustment_evidence"
+                        WHEN length(trim(COALESCE(NEW.evidence_type, ''), char(9) || char(10) || char(13) || ' ')) = 0
+                            OR NEW.evidence_type NOT IN ('document')
+                            OR length(trim(COALESCE(NEW.evidence_reference, ''), char(9) || char(10) || char(13) || ' ')) = 0
+              OR (NEW.content_sha256 IS NOT NULL AND (
+                    length(NEW.content_sha256) != 64
+                    OR lower(NEW.content_sha256) GLOB '*[^0-9a-f]*'
+                 ))
+            BEGIN
+                SELECT RAISE(ABORT, 'Invalid GST adjustment evidence');
+            END'''
+        changed = _ensure_trigger(conn, evidence_trigger, evidence_sql) or changed
+
+    if _table_exists(conn, "gst_adjustment_manual_reviews"):
+        review_trigger = "trg_gst_adjustment_manual_reviews_domain"
+        review_parent_condition = (
+            "EXISTS (SELECT 1 FROM gst_adjustment_events "
+            "WHERE id = NEW.event_id AND manual_review_status = 'pending')"
+            if _table_exists(conn, "gst_adjustment_events")
+            else "0"
+        )
+        terminal_review_condition = (
+            "EXISTS (SELECT 1 FROM gst_adjustment_manual_reviews "
+            "WHERE event_id = NEW.event_id AND status IN ('approved', 'rejected'))"
+        )
+        finalized_event_condition = (
+            "EXISTS (SELECT 1 FROM gst_adjustment_finalizations "
+            "WHERE event_id = NEW.event_id)"
+            if _table_exists(conn, "gst_adjustment_finalizations")
+            else "0"
+        )
+        review_sql = f'''CREATE TRIGGER "{review_trigger}"
+            BEFORE INSERT ON "gst_adjustment_manual_reviews"
+            WHEN NEW.status NOT IN ('pending', 'approved', 'rejected')
+                            OR NOT ({review_parent_condition})
+                            OR {terminal_review_condition}
+              OR {finalized_event_condition}
+              OR length(trim(COALESCE(NEW.reason, ''), char(9) || char(10) || char(13) || ' ')) = 0
+              OR (NEW.reviewer IS NOT NULL AND
+                  length(trim(NEW.reviewer, char(9) || char(10) || char(13) || ' ')) = 0)
+              OR (NEW.status = 'pending' AND NEW.reviewed_at IS NOT NULL)
+                  OR (NEW.status IN ('approved', 'rejected') AND (
+                          NEW.reviewed_at IS NULL
+                          OR length(NEW.reviewed_at) != 19
+                          OR NEW.reviewed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+                          OR strftime('%Y-%m-%d %H:%M:%S', NEW.reviewed_at) IS NULL
+                          OR strftime('%Y-%m-%d %H:%M:%S', NEW.reviewed_at, '+0 seconds') IS NOT NEW.reviewed_at
+                      ))
+            BEGIN
+                SELECT RAISE(ABORT, 'Invalid GST adjustment manual review');
+            END'''
+        changed = _ensure_trigger(conn, review_trigger, review_sql) or changed
+    return changed
+
+
+def _normalise_trigger_sql(sql: str) -> str:
+    output: list[str] = []
+    pending_space = False
+    in_string = False
+    index = 0
+    while index < len(sql):
+        character = sql[index]
+        if in_string:
+            output.append(character)
+            if character == "'":
+                if index + 1 < len(sql) and sql[index + 1] == "'":
+                    output.append("'")
+                    index += 1
+                else:
+                    in_string = False
+        elif character == "'":
+            if pending_space and output:
+                output.append(" ")
+            pending_space = False
+            in_string = True
+            output.append(character)
+        elif character.isspace():
+            pending_space = True
+        else:
+            if pending_space and output:
+                output.append(" ")
+            pending_space = False
+            output.append(character.upper())
+        index += 1
+    return "".join(output).removesuffix(";")
+
+
+def _ensure_trigger(conn, name: str, canonical_sql: str) -> bool:
+    """Compare and restore the complete canonical SQL for one owned trigger."""
+    row = conn.execute(
+        text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name = :n"),
+        {"n": name},
+    ).fetchone()
+    expected = _normalise_trigger_sql(canonical_sql)
+    if row is not None and row[0] and _normalise_trigger_sql(str(row[0])) == expected:
+        return False
+    if row is not None:
+        conn.execute(text(f'DROP TRIGGER "{name}"'))
+    conn.execute(text(canonical_sql))
+    installed = conn.execute(
+        text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name = :n"),
+        {"n": name},
+    ).scalar_one()
+    if _normalise_trigger_sql(str(installed)) != expected:
+        raise RuntimeError(f"Could not install canonical GST adjustment trigger {name}")
+    return True
+
+
 _BANK_DEDUP_INDEX = SQLiteIndexSignature(
     "uq_bank_txn_dedup",
     ("bank_account_id", "dedup_key"),
@@ -1739,6 +2128,9 @@ def run_company_migrations(
         for _table, index_name in _pending_unexpected_nonunique_indexes(conn):
             conn.execute(text(f'DROP INDEX "{index_name}"'))
             applied.append(f"drop_index:{index_name}")
+
+        if _ensure_gst_adjustment_append_only_guards(conn):
+            applied.append("guards:gst_adjustment_append_only")
 
         # Do not mutate financial rows while any non-targeted table constraint
         # remains absent or counterfeit. Populated drifted tables received an
