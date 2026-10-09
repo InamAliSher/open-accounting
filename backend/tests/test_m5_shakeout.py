@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import sqlite3
 import sys
@@ -45,7 +46,71 @@ def seeded(tmp_path_factory):
 
     with TestClient(app) as client:
         api = seed_realistic.Api(client)
-        summary = seed_realistic.seed(api, reset=False, exercise=False)
+
+        def preview_and_commit(api, bank_id, content, filename, account_by_code, desired):
+            preview = api.post(
+                f"/api/v1/bank-accounts/{bank_id}/import/preview",
+                files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
+            ).json()
+            desired_by_key = {
+                (
+                    seed_realistic.iso(row["occurred_at"]),
+                    row["direction"],
+                    str(row["amount"]),
+                    row["memo"],
+                ): row
+                for row in desired
+            }
+            decisions = []
+            for row in preview["rows"]:
+                if not row["ok"]:
+                    raise RuntimeError(f"Bank import row failed: {row}")
+                parsed = row["parsed"]
+                source = desired_by_key[
+                    (
+                        parsed["occurred_at"],
+                        parsed["direction"],
+                        parsed["amount"],
+                        parsed["memo"],
+                    )
+                ]
+                tax_code = source["tax_code"]
+                decisions.append(
+                    {
+                        "row_key": row["row_key"],
+                        "include": True,
+                        "account_id": account_by_code[source["account_code"]]["id"],
+                        "tax_code": tax_code,
+                        "gst_amount": str(
+                            seed_realistic.gst_from_gross(
+                                Decimal(parsed["amount"]), tax_code
+                            )
+                        ),
+                    }
+                )
+            mode = (
+                "same_import"
+                if preview["statement_review_required"]
+                else "new_import"
+            )
+            payload = {
+                "preview_key": preview["preview_key"],
+                "mapping": preview["mapping"],
+                "import_mode": mode,
+                "rows": decisions,
+            }
+            return api.post(
+                f"/api/v1/bank-accounts/{bank_id}/import/commit",
+                files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
+                data={"payload_json": json.dumps(payload)},
+            ).json()
+
+        original_preview_and_commit = seed_realistic.preview_and_commit
+        seed_realistic.preview_and_commit = preview_and_commit
+        try:
+            summary = seed_realistic.seed(api, reset=False, exercise=False)
+        finally:
+            seed_realistic.preview_and_commit = original_preview_and_commit
         HEAD["X-Company-Generation"] = summary["company_generation"]
         yield {"client": client, "summary": summary, "data_dir": test_data}
 
@@ -152,44 +217,53 @@ def test_bank_balances_match_statement_running_totals(seeded):
 def test_reimport_duplicate_csv_creates_zero_rows(seeded):
     client = seeded["client"]
     bank = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0]
-    txns = client.get(f"/api/v1/bank-accounts/{bank['id']}/transactions", headers=HEAD).json()
-    txn = next(t for t in txns if t["memo"])
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["Date", "Description", "Debit", "Credit"])
-    writer.writerow(
-        [
-            txn["occurred_at"],
-            txn["memo"],
-            txn["amount"] if txn["direction"] == "out" else "",
-            txn["amount"] if txn["direction"] == "in" else "",
-        ]
+    csv_bytes = (
+        b"Date,Description,Transaction ID,Credit\n"
+        b"2025-05-17,Synthetic identity check,m5-provider-001,123.00\n"
     )
-    preview = client.post(
-        f"/api/v1/bank-accounts/{bank['id']}/import/preview",
-        headers=HEAD,
-        files={"file": ("dupe.csv", io.BytesIO(buf.getvalue().encode("utf-8")), "text/csv")},
-    ).json()
-    row = preview["rows"][0]
-    commit = client.post(
-        f"/api/v1/bank-accounts/{bank['id']}/import/commit",
-        headers=HEAD,
-        json={
+
+    def preview_statement():
+        response = client.post(
+            f"/api/v1/bank-accounts/{bank['id']}/import/preview",
+            headers=HEAD,
+            files={"file": ("synthetic.csv", io.BytesIO(csv_bytes), "text/csv")},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    def commit_statement(preview):
+        payload = {
+            "preview_key": preview["preview_key"],
+            "mapping": preview["mapping"],
+            "import_mode": "new_import",
             "rows": [
                 {
-                    "occurred_at": row["parsed"]["occurred_at"],
-                    "direction": row["parsed"]["direction"],
-                    "amount": row["parsed"]["amount"],
-                    "dedup_key": row["dedup_key"],
-                    "memo": row["parsed"]["memo"],
-                    "counter_party_name": row["parsed"]["counter_party_name"],
+                    "row_key": row["row_key"],
+                    "include": row["ok"] and not row["is_duplicate"],
+                    "account_id": None,
+                    "tax_code": "none",
+                    "gst_amount": "0.00",
                 }
-            ]
-        },
-    )
-    assert commit.status_code == 200, commit.text
-    assert commit.json()["created"] == 0
-    assert commit.json()["skipped_duplicates"] == 1
+                for row in preview["rows"]
+            ],
+        }
+        return client.post(
+            f"/api/v1/bank-accounts/{bank['id']}/import/commit",
+            headers=HEAD,
+            files={"file": ("synthetic.csv", io.BytesIO(csv_bytes), "text/csv")},
+            data={"payload_json": json.dumps(payload)},
+        )
+
+    first = commit_statement(preview_statement())
+    assert first.status_code == 200, first.text
+    assert first.json()["created"] == 1
+
+    repeated = preview_statement()
+    assert repeated["has_provider_ids"] is True
+    assert repeated["rows"][0]["is_duplicate"] is True
+    second = commit_statement(repeated)
+    assert second.status_code == 200, second.text
+    assert second.json() == {"created": 0, "skipped_duplicates": 1}
 
 
 def test_tax_code_enforcement_has_no_positive_gst_on_no_gst_codes(seeded):

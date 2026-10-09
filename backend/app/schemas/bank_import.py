@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -214,6 +214,7 @@ class BankImportRowParsed(BaseModel):
     occurred_at: str | None
     memo: str | None
     counter_party_name: str | None
+    provider_transaction_id: str | None = None
     direction: str | None
     amount: str | None
 
@@ -226,6 +227,12 @@ class BankImportPreviewRow(BaseModel):
     issue: str | None = None
     dedup_key: str | None = None
     is_duplicate: bool | None = None
+    row_key: str
+    provider_namespace: str | None = None
+    import_statement_key: str
+    requires_review: bool = False
+    review_reason: str | None = None
+    review_blocked: bool = False
     suggested_account_id: int | None = None
     suggested_tax_code: str | None = None
     suggested_gst_amount: str | None = None
@@ -236,32 +243,26 @@ class BankImportPreviewRow(BaseModel):
 
 class BankImportPreviewOut(BaseModel):
     bank_account_id: int
+    preview_key: str
+    import_statement_key: str
+    has_provider_ids: bool
+    statement_review_required: bool
+    existing_import_count: int
     headers: list[str]
     mapping: dict[str, int | None]
     field_options: list[str]
     rows: list[BankImportPreviewRow]
 
 
-class BankImportCommitRow(BaseModel):
-    """One accepted preview row at the untrusted commit API boundary."""
+class BankImportCommitDecision(BaseModel):
+    """User choices keyed to a server-derived preview row identity."""
 
     model_config = ConfigDict(extra="forbid")
 
-    occurred_at: date
-    direction: str = Field(pattern=_DIRECTION_PATTERN)
-    amount: Decimal = Field(
-        gt=0,
-        le=_MONEY_MAX,
-        max_digits=16,
-        decimal_places=2,
-    )
-    # Retained for wire compatibility with preview clients.  Commit never
-    # trusts this value; the service recomputes its own canonical key.
-    dedup_key: str | None = Field(default=None, max_length=64)
+    row_key: str = Field(min_length=64, max_length=64)
+    include: bool = False
     account_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     tax_code: str = Field(default="standard", pattern=_TAX_CODE_PATTERN)
-    memo: str | None = Field(default=None, max_length=500)
-    counter_party_name: str | None = Field(default=None, max_length=200)
     gst_amount: Decimal = Field(
         default=Decimal("0"),
         ge=0,
@@ -272,20 +273,16 @@ class BankImportCommitRow(BaseModel):
     invoice_allocations: list[InvoicePaymentAllocationIn] = Field(
         default_factory=list, max_length=500
     )
-    unapplied_account_id: int | None = Field(
-        default=None, ge=1, le=SQLITE_INT_MAX
-    )
-
-    @field_validator("occurred_at")
-    @classmethod
-    def _reportable_date(cls, value: date) -> date:
-        return check_txn_date(value)
+    unapplied_account_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
 
 
 class BankImportCommitIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    rows: list[BankImportCommitRow]
+    preview_key: str = Field(min_length=64, max_length=64)
+    mapping: dict[str, int | None]
+    import_mode: Literal["new_import", "same_import", "independent_import"]
+    rows: list[BankImportCommitDecision]
 
 
 class BankImportCommitOut(BaseModel):

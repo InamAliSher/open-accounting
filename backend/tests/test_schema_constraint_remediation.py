@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.db.base import CompanyBase
 from app.db.errors import DataRecoveryRequiredError
@@ -19,6 +23,7 @@ from app.db.schema_sync import (
 )
 from app.models import company as _company_models  # noqa: F401
 from app.models import outgoing as _outgoing_models  # noqa: F401
+from app.models.company import Account, BankAccount, BankTransaction
 
 
 def _engine(path):
@@ -45,6 +50,8 @@ def test_wrong_named_indexes_and_missing_ordinary_index_are_repaired(tmp_path):
     with engine.begin() as conn:
         for name in (
             "uq_bank_txn_dedup",
+            "uq_bank_txn_provider_identity",
+            "uq_bank_txn_import_row_identity",
             "uq_invoice_source_ref",
             "uq_journal_source_doc",
             "uq_journal_reversal_once",
@@ -53,6 +60,18 @@ def test_wrong_named_indexes_and_missing_ordinary_index_are_repaired(tmp_path):
             conn.execute(text(f'DROP INDEX "{name}"'))
         conn.execute(
             text("CREATE INDEX uq_bank_txn_dedup ON bank_transactions (dedup_key)")
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX uq_bank_txn_provider_identity "
+                "ON bank_transactions (provider_transaction_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX uq_bank_txn_import_row_identity "
+                "ON bank_transactions (import_row_key)"
+            )
         )
         conn.execute(
             text("CREATE INDEX uq_invoice_source_ref ON invoices (source_ref)")
@@ -72,6 +91,8 @@ def test_wrong_named_indexes_and_missing_ordinary_index_are_repaired(tmp_path):
 
     applied = run_company_migrations(engine)
     assert "index:uq_bank_txn_dedup" in applied
+    assert "index:uq_bank_txn_provider_identity" in applied
+    assert "index:uq_bank_txn_import_row_identity" in applied
     assert "index:uq_invoice_source_ref" in applied
     assert "index:uq_journal_source_doc" in applied
     assert "index:uq_journal_reversal_once" in applied
@@ -85,6 +106,21 @@ def test_wrong_named_indexes_and_missing_ordinary_index_are_repaired(tmp_path):
                 unique=True,
                 where="dedup_key IS NOT NULL",
             ),
+            SQLiteIndexSignature(
+                "uq_bank_txn_provider_identity",
+                ("bank_account_id", "provider_namespace", "provider_transaction_id"),
+                unique=True,
+                where=(
+                    "provider_namespace IS NOT NULL AND "
+                    "provider_transaction_id IS NOT NULL"
+                ),
+            ),
+            SQLiteIndexSignature(
+                "uq_bank_txn_import_row_identity",
+                ("bank_account_id", "import_instance_id", "import_row_key"),
+                unique=True,
+                where="import_instance_id IS NOT NULL AND import_row_key IS NOT NULL",
+            ),
         ),
         **MIGRATION_INDEX_SIGNATURES,
     }
@@ -95,6 +131,85 @@ def test_wrong_named_indexes_and_missing_ordinary_index_are_repaired(tmp_path):
 
     report = detect_drift(engine, CompanyBase, "repaired-indexes")
     assert report.is_clean, report.format()
+
+    with Session(engine) as session:
+        cash = Account(code="9000", name="Synthetic cash", type="ASSET")
+        session.add(cash)
+        session.flush()
+        bank = BankAccount(name="Synthetic bank", ledger_account_id=cash.id)
+        session.add(bank)
+        session.flush()
+        account_id = bank.id
+        session.add(
+            BankTransaction(
+                bank_account_id=account_id,
+                direction="in",
+                amount=Decimal("10.00"),
+                occurred_at=date(2026, 7, 1),
+                gst_amount=Decimal("0.00"),
+                tax_code="none",
+                unapplied_amount=Decimal("0.00"),
+                provider_namespace="synthetic-provider",
+                provider_transaction_id="provider-1",
+                import_statement_key="statement-1",
+                import_instance_id="instance-1",
+                import_row_key="row-1",
+            )
+        )
+        session.commit()
+
+        session.add(
+            BankTransaction(
+                bank_account_id=account_id,
+                direction="in",
+                amount=Decimal("11.00"),
+                occurred_at=date(2026, 7, 2),
+                gst_amount=Decimal("0.00"),
+                tax_code="none",
+                unapplied_amount=Decimal("0.00"),
+                provider_namespace="synthetic-provider",
+                provider_transaction_id="provider-1",
+                import_statement_key="statement-2",
+                import_instance_id="instance-2",
+                import_row_key="row-2",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+        session.add(
+            BankTransaction(
+                bank_account_id=account_id,
+                direction="in",
+                amount=Decimal("12.00"),
+                occurred_at=date(2026, 7, 3),
+                gst_amount=Decimal("0.00"),
+                tax_code="none",
+                unapplied_amount=Decimal("0.00"),
+                import_statement_key="statement-3",
+                import_instance_id="instance-3",
+                import_row_key="row-3",
+            )
+        )
+        session.commit()
+        session.add(
+            BankTransaction(
+                bank_account_id=account_id,
+                direction="in",
+                amount=Decimal("13.00"),
+                occurred_at=date(2026, 7, 4),
+                gst_amount=Decimal("0.00"),
+                tax_code="none",
+                unapplied_amount=Decimal("0.00"),
+                import_statement_key="statement-4",
+                import_instance_id="instance-3",
+                import_row_key="row-3",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
 
 
 def test_duplicate_source_rows_fail_closed_and_keep_backup(tmp_path):

@@ -650,6 +650,27 @@ class BankTransaction(CompanyBase):
             unique=True,
             sqlite_where=text("dedup_key IS NOT NULL"),
         ),
+        Index(
+            "uq_bank_txn_provider_identity",
+            "bank_account_id",
+            "provider_namespace",
+            "provider_transaction_id",
+            unique=True,
+            sqlite_where=text(
+                "provider_namespace IS NOT NULL "
+                "AND provider_transaction_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_bank_txn_import_row_identity",
+            "bank_account_id",
+            "import_instance_id",
+            "import_row_key",
+            unique=True,
+            sqlite_where=text(
+                "import_instance_id IS NOT NULL AND import_row_key IS NOT NULL"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -695,6 +716,12 @@ class BankTransaction(CompanyBase):
     # Optional because manual entries don't need it; set automatically by the
     # import pipeline.
     dedup_key: Mapped[str | None] = mapped_column(String(64), index=True)
+
+    provider_namespace: Mapped[str | None] = mapped_column(String(100))
+    provider_transaction_id: Mapped[str | None] = mapped_column(String(200))
+    import_statement_key: Mapped[str | None] = mapped_column(String(64))
+    import_instance_id: Mapped[str | None] = mapped_column(String(36))
+    import_row_key: Mapped[str | None] = mapped_column(String(64))
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

@@ -13,8 +13,11 @@ Covers:
 from __future__ import annotations
 
 import io
+import json
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 from decimal import Decimal
 
@@ -71,6 +74,67 @@ def _upload(client, bank_id, csv_text: str, *, filename: str = "stmt.csv"):
         f"/api/v1/bank-accounts/{bank_id}/import/preview",
         headers=HEAD,
         files={"file": (filename, io.BytesIO(csv_text.encode("utf-8")), "text/csv")},
+    )
+
+
+def _commit_preview(
+    client,
+    bank_id: int,
+    content: str | bytes,
+    *,
+    preview: dict | None = None,
+    filename: str = "stmt.csv",
+    bank_format: str | None = None,
+    import_mode: str = "new_import",
+    row_overrides: dict[int, dict] | None = None,
+    mapping_override: dict | None = None,
+    preview_key_override: str | None = None,
+):
+    raw = content.encode("utf-8") if isinstance(content, str) else content
+    if preview is None:
+        response = _upload(client, bank_id, raw.decode("utf-8"), filename=filename)
+        assert response.status_code == 200, response.text
+        preview = response.json()
+    decisions = []
+    for index, row in enumerate(preview["rows"]):
+        override = (row_overrides or {}).get(index, {})
+        include = override.get(
+            "include",
+            row["ok"]
+            and not row.get("is_duplicate")
+            and not row.get("requires_review")
+            and not row.get("review_blocked"),
+        )
+        decisions.append(
+            {
+                "row_key": override.get("row_key", row["row_key"]),
+                "include": include,
+                "account_id": override.get(
+                    "account_id", row.get("suggested_account_id")
+                ),
+                "tax_code": override.get(
+                    "tax_code", row.get("suggested_tax_code") or "standard"
+                ),
+                "gst_amount": override.get(
+                    "gst_amount", row.get("suggested_gst_amount") or "0.00"
+                ),
+                "invoice_allocations": override.get("invoice_allocations", []),
+            }
+        )
+    payload = {
+        "preview_key": preview_key_override or preview["preview_key"],
+        "mapping": mapping_override or preview["mapping"],
+        "import_mode": import_mode,
+        "rows": decisions,
+    }
+    data = {"payload_json": json.dumps(payload)}
+    if bank_format is not None:
+        data["bank_format"] = bank_format
+    return client.post(
+        f"/api/v1/bank-accounts/{bank_id}/import/commit",
+        headers=HEAD,
+        files={"file": (filename, io.BytesIO(raw), "application/octet-stream")},
+        data=data,
     )
 
 
@@ -187,41 +251,23 @@ def test_dedup_marks_existing(client, biz_bank):
     # First import: commit it.
     r = _upload(client, biz_bank["id"], csv)
     rows = r.json()["rows"]
-    commit = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={"rows": [
-            {
-                "occurred_at": rows[0]["parsed"]["occurred_at"],
-                "direction": rows[0]["parsed"]["direction"],
-                "amount": rows[0]["parsed"]["amount"],
-                "dedup_key": rows[0]["dedup_key"],
-                "memo": rows[0]["parsed"]["memo"],
-            }
-        ]},
-    )
+    commit = _commit_preview(client, biz_bank["id"], csv, preview=r.json())
     assert commit.status_code == 200, commit.text
     assert commit.json() == {"created": 1, "skipped_duplicates": 0}
 
-    # Re-preview the same CSV → should mark as duplicate.
+    # An identical no-ID statement is intentionally ambiguous until reviewed.
     r2 = _upload(client, biz_bank["id"], csv)
-    assert r2.json()["rows"][0]["is_duplicate"] is True
+    assert r2.json()["statement_review_required"] is True
+    assert r2.json()["rows"][0]["requires_review"] is True
 
-    # And committing it should skip.
-    rows2 = r2.json()["rows"]
-    commit2 = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={"rows": [
-            {
-                "occurred_at": rows2[0]["parsed"]["occurred_at"],
-                "direction": rows2[0]["parsed"]["direction"],
-                "amount": rows2[0]["parsed"]["amount"],
-                "dedup_key": rows2[0]["dedup_key"],
-                "memo": rows2[0]["parsed"]["memo"],
-            }
-        ]},
+    commit2 = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=r2.json(),
+        import_mode="same_import",
     )
+    assert commit2.status_code == 200, commit2.text
     assert commit2.json() == {"created": 0, "skipped_duplicates": 1}
 
 
@@ -254,7 +300,8 @@ def test_dedup_flags_row_matching_manual_transaction(client, biz_bank):
     r2 = _upload(client, biz_bank["id"], csv)
     assert r2.status_code == 200, r2.text
     rows = r2.json()["rows"]
-    assert rows[0]["is_duplicate"] is True, rows[0]
+    assert rows[0]["is_duplicate"] is False, rows[0]
+    assert rows[0]["requires_review"] is True, rows[0]
     assert rows[1]["is_duplicate"] is False, rows[1]
 
 
@@ -303,9 +350,7 @@ def test_ambiguous_debit_and_credit_row_flagged(client, biz_bank):
 
 
 def test_intra_file_duplicate_rows_flagged(client, biz_bank):
-    """Two identical rows in the SAME file: the second is flagged duplicate so
-    the preview count matches what commit will actually create (commit skips
-    the second)."""
+    """Identical row occurrences in one statement remain distinct identities."""
     csv = (
         "Date,Description,Credit\n"
         "2026-05-01,Salary,5000.00\n"
@@ -315,14 +360,136 @@ def test_intra_file_duplicate_rows_flagged(client, biz_bank):
     assert r.status_code == 200, r.text
     rows = r.json()["rows"]
     assert rows[0]["is_duplicate"] is False, rows[0]
-    assert rows[1]["is_duplicate"] is True, rows[1]
+    assert rows[1]["is_duplicate"] is False, rows[1]
+    assert rows[0]["row_key"] != rows[1]["row_key"]
+    committed = _commit_preview(client, biz_bank["id"], csv, preview=r.json())
+    assert committed.status_code == 200, committed.text
+    assert committed.json() == {"created": 2, "skipped_duplicates": 0}
+
+
+def test_reordered_rows_keep_occurrence_identity(client, biz_bank):
+    original = (
+        "Date,Description,Credit\n"
+        "2026-05-01,Repeated,10.00\n"
+        "2026-05-02,Other,20.00\n"
+        "2026-05-01,Repeated,10.00\n"
+    )
+    reordered = (
+        "Date,Description,Credit\n"
+        "2026-05-01,Repeated,10.00\n"
+        "2026-05-01,Repeated,10.00\n"
+        "2026-05-02,Other,20.00\n"
+    )
+    first = _upload(client, biz_bank["id"], original).json()
+    second = _upload(client, biz_bank["id"], reordered).json()
+    assert first["import_statement_key"] == second["import_statement_key"]
+
+    def identities(preview):
+        grouped = {}
+        for row in preview["rows"]:
+            key = (
+                row["parsed"]["occurred_at"],
+                row["parsed"]["memo"],
+                row["parsed"]["amount"],
+            )
+            grouped.setdefault(key, []).append(row["row_key"])
+        return {key: sorted(values) for key, values in grouped.items()}
+
+    assert identities(first) == identities(second)
+
+
+def test_identical_no_id_statement_requires_same_or_independent_choice(
+    client, biz_bank
+):
+    csv = "Date,Description,Credit\n2026-05-03,Review me,25.00\n"
+    first = _commit_preview(client, biz_bank["id"], csv)
+    assert first.status_code == 200, first.text
+    repeated = _upload(client, biz_bank["id"], csv).json()
+    assert repeated["statement_review_required"] is True
+
+    independent = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=repeated,
+        import_mode="independent_import",
+        row_overrides={0: {"include": True}},
+    )
+    assert independent.status_code == 200, independent.text
+    assert independent.json() == {"created": 1, "skipped_duplicates": 0}
+
+    from app.db.company import company_session
+    from app.models.company import BankTransaction
+
+    with company_session("tc") as db:
+        imported = (
+            db.query(BankTransaction)
+            .filter(BankTransaction.memo == "Review me")
+            .order_by(BankTransaction.id)
+            .all()
+        )
+        assert len(imported) == 2
+        assert imported[0].import_instance_id != imported[1].import_instance_id
+
+
+def test_provider_id_conflict_requires_review_and_is_blocked(client, biz_bank):
+    first_csv = (
+        "Date,Description,Transaction ID,Credit\n"
+        "2026-05-04,Settlement,provider-77,40.00\n"
+    )
+    first = _commit_preview(client, biz_bank["id"], first_csv)
+    assert first.status_code == 200, first.text
+
+    conflict_csv = (
+        "Date,Description,Transaction ID,Credit\n"
+        "2026-05-04,Changed settlement,provider-77,41.00\n"
+    )
+    conflict = _upload(client, biz_bank["id"], conflict_csv).json()
+    row = conflict["rows"][0]
+    assert row["requires_review"] is True
+    assert row["review_blocked"] is True
+    assert row["review_reason"] == "provider_id_conflict"
+
+    rejected = _commit_preview(
+        client,
+        biz_bank["id"],
+        conflict_csv,
+        preview=conflict,
+        row_overrides={0: {"include": True}},
+    )
+    assert rejected.status_code == 400
+    assert "provider transaction ID conflicts" in rejected.json()["detail"]
+
+
+@pytest.mark.parametrize("binding", ["file", "mapping", "row"])
+def test_commit_decisions_are_bound_to_preview(client, biz_bank, binding):
+    csv = "Date,Description,Credit\n2026-05-05,Bound statement,12.00\n"
+    preview = _upload(client, biz_bank["id"], csv).json()
+    changed_csv = csv.replace("12.00", "13.00") if binding == "file" else csv
+    changed_mapping = dict(preview["mapping"])
+    if binding == "mapping":
+        changed_mapping["memo"] = None
+    row_override = {0: {"include": True}}
+    if binding == "row":
+        row_override[0]["row_key"] = "f" * 64
+
+    response = _commit_preview(
+        client,
+        biz_bank["id"],
+        changed_csv,
+        preview=preview,
+        mapping_override=changed_mapping,
+        row_overrides=row_override,
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] in {
+        "The uploaded file or column mapping differs from the preview",
+        "Commit decisions do not match the previewed row identities",
+    }
 
 
 def test_commit_skips_row_duplicating_existing_manual_transaction(client, biz_bank):
-    """Server-side: a committed row that fingerprint-duplicates an existing
-    MANUAL transaction (no dedup_key) is skipped, not created — even if the
-    caller submits it. Guards against double-counting when the UI's default
-    unchecking is bypassed."""
+    """A manual transaction match is surfaced for explicit review, never skipped."""
     m = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
         headers=manual_transaction_headers(HEAD),
@@ -336,55 +503,31 @@ def test_commit_skips_row_duplicating_existing_manual_transaction(client, biz_ba
     )
     assert m.status_code == 201, m.text
 
-    commit = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={
-            "rows": [
-                {
-                    "occurred_at": "2026-07-01",
-                    "direction": "in",
-                    "amount": "5000.00",
-                    "dedup_key": "a_key_not_in_the_db",
-                    "memo": "Invoice payment received",
-                    "counter_party_name": "Acme Client Payment",
-                }
-            ]
-        },
+    csv = (
+        "Date,Description,Credit,Payee\n"
+        "2026-07-01,Invoice payment received,5000.00,Acme Client Payment\n"
+    )
+    preview = _upload(client, biz_bank["id"], csv).json()
+    assert preview["rows"][0]["requires_review"] is True
+    commit = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=preview,
+        row_overrides={0: {"include": True}},
     )
     assert commit.status_code == 200, commit.text
-    assert commit.json() == {"created": 0, "skipped_duplicates": 1}
+    assert commit.json() == {"created": 1, "skipped_duplicates": 0}
 
 
 def test_commit_imports_two_distinct_same_day_same_payee_payments(client, biz_bank):
-    """Two genuine same-day, same-amount receipts from the same client for
-    DIFFERENT invoices (different memos -> different dedup_keys) must BOTH be
-    created. The commit-side fingerprint skip only guards against rows already
-    on the account, never against another row inside the same payload."""
-    commit = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={
-            "rows": [
-                {
-                    "occurred_at": "2026-07-01",
-                    "direction": "in",
-                    "amount": "100.00",
-                    "dedup_key": "key_invoice_123",
-                    "memo": "Invoice 123",
-                    "counter_party_name": "Acme Pty Ltd",
-                },
-                {
-                    "occurred_at": "2026-07-01",
-                    "direction": "in",
-                    "amount": "100.00",
-                    "dedup_key": "key_invoice_456",
-                    "memo": "Invoice 456",
-                    "counter_party_name": "Acme Pty Ltd",
-                },
-            ]
-        },
+    """Distinct rows sharing amount/date/payee both retain their identities."""
+    csv = (
+        "Date,Description,Payee,Credit\n"
+        "2026-07-01,Invoice 123,Acme Pty Ltd,100.00\n"
+        "2026-07-01,Invoice 456,Acme Pty Ltd,100.00\n"
     )
+    commit = _commit_preview(client, biz_bank["id"], csv)
     assert commit.status_code == 200, commit.text
     assert commit.json() == {"created": 2, "skipped_duplicates": 0}
 
@@ -440,21 +583,13 @@ def test_pdf_statement_preview_and_commit(client, biz_bank):
     dirs = {row["parsed"]["direction"] for row in rows}
     assert dirs == {"in", "out"}
 
-    commit = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={
-            "rows": [
-                {
-                    "occurred_at": row["parsed"]["occurred_at"],
-                    "direction": row["parsed"]["direction"],
-                    "amount": row["parsed"]["amount"],
-                    "dedup_key": row["dedup_key"],
-                    "memo": row["parsed"]["memo"],
-                }
-                for row in rows
-            ]
-        },
+    commit = _commit_preview(
+        client,
+        biz_bank["id"],
+        pdf,
+        preview=r.json(),
+        filename="statement.pdf",
+        bank_format="auto",
     )
     assert commit.status_code == 200, commit.text
     assert commit.json()["created"] == 2
@@ -476,54 +611,30 @@ def test_dedup_unique_index_exists_and_reimport_skips(client, biz_bank):
     assert r.status_code == 200, r.text
     row = r.json()["rows"][0]
 
-    payload = {
-        "rows": [
-            {
-                "occurred_at": row["parsed"]["occurred_at"],
-                "direction": row["parsed"]["direction"],
-                "amount": row["parsed"]["amount"],
-                "dedup_key": row["dedup_key"],
-                "memo": row["parsed"]["memo"],
-            }
-        ]
-    }
-    r = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json=payload,
-    )
+    r = _commit_preview(client, biz_bank["id"], csv, preview=r.json())
     assert r.status_code == 200, r.text
     assert r.json() == {"created": 1, "skipped_duplicates": 0}
 
-    r = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json=payload,
+    r = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=_upload(client, biz_bank["id"], csv).json(),
+        import_mode="same_import",
     )
     assert r.status_code == 200, r.text
     assert r.json() == {"created": 0, "skipped_duplicates": 1}
 
 
 def test_commit_ignores_empty_and_forged_client_dedup_keys(client, biz_bank):
-    base = {
-        "occurred_at": "2026-05-20",
-        "direction": "in",
-        "amount": "321.00",
-        "memo": "Server owned dedup marker",
-        "counter_party_name": "Canonical Client",
-    }
-    response = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={
-            "rows": [
-                {**base, "dedup_key": ""},
-                {**base, "dedup_key": "f" * 64},
-            ]
-        },
+    csv = (
+        "Date,Description,Transaction ID,Credit\n"
+        "2026-05-20,Server owned identity,txn-001,321.00\n"
     )
+    preview = _upload(client, biz_bank["id"], csv).json()
+    response = _commit_preview(client, biz_bank["id"], csv, preview=preview)
     assert response.status_code == 200, response.text
-    assert response.json() == {"created": 1, "skipped_duplicates": 1}
+    assert response.json() == {"created": 1, "skipped_duplicates": 0}
 
     from app.db.company import company_session
     from app.models.company import BankTransaction
@@ -531,86 +642,308 @@ def test_commit_ignores_empty_and_forged_client_dedup_keys(client, biz_bank):
     with company_session("tc") as db:
         stored = (
             db.query(BankTransaction)
-            .filter(BankTransaction.memo == base["memo"])
+            .filter(BankTransaction.memo == "Server owned identity")
             .one()
         )
-        assert stored.dedup_key
-        assert len(stored.dedup_key) == 64
-        assert stored.dedup_key != "f" * 64
+        assert stored.dedup_key is None
+        assert stored.provider_transaction_id == "txn-001"
+        assert stored.provider_namespace
+        assert stored.import_statement_key == preview["import_statement_key"]
+        assert stored.import_instance_id
+        assert stored.import_row_key == preview["rows"][0]["row_key"]
 
-    retry = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={"rows": [{**base, "dedup_key": "retry-forgery"}]},
+    retry_preview = _upload(client, biz_bank["id"], csv).json()
+    assert retry_preview["rows"][0]["is_duplicate"] is True
+    retry = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=retry_preview,
     )
     assert retry.status_code == 200, retry.text
     assert retry.json() == {"created": 0, "skipped_duplicates": 1}
 
 
 def test_commit_canonical_key_includes_counterparty(client, biz_bank):
-    common = {
-        "occurred_at": "2026-05-21",
-        "direction": "in",
-        "amount": "87.00",
-        "memo": "Settlement",
-        # Deliberately identical forged values: server identity must win.
-        "dedup_key": "same-client-key",
-    }
-    payload = {
-        "rows": [
-            {**common, "counter_party_name": "Customer Alpha"},
-            {**common, "counter_party_name": "Customer Beta"},
-        ]
-    }
-    first = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json=payload,
+    csv = (
+        "Date,Description,Payee,Credit\n"
+        "2026-05-21,Settlement,Customer Alpha,87.00\n"
+        "2026-05-21,Settlement,Customer Beta,87.00\n"
     )
+    preview = _upload(client, biz_bank["id"], csv).json()
+    first = _commit_preview(client, biz_bank["id"], csv, preview=preview)
     assert first.status_code == 200, first.text
     assert first.json() == {"created": 2, "skipped_duplicates": 0}
 
-    retry = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json=payload,
+    retry_preview = _upload(client, biz_bank["id"], csv).json()
+    retry = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=retry_preview,
+        import_mode="same_import",
     )
     assert retry.status_code == 200, retry.text
     assert retry.json() == {"created": 0, "skipped_duplicates": 2}
 
 
-def test_concurrent_commit_of_same_canonical_row_writes_once(client, biz_bank):
-    base = {
-        "occurred_at": "2026-05-22",
-        "direction": "out",
-        "amount": "42.50",
-        "memo": "Concurrent canonical marker",
-        "counter_party_name": "One Supplier",
-    }
+def test_concurrent_no_id_commits_cannot_create_second_instance(
+    client, biz_bank, monkeypatch
+):
+    csv = (
+        "Date,Description,Payee,Debit\n"
+        "2026-05-22,Concurrent marker A,One Supplier,42.50\n"
+        "2026-05-23,Concurrent marker B,Other Supplier,19.25\n"
+    )
+    preview = _upload(client, biz_bank["id"], csv).json()
+    first_lock_acquired = threading.Event()
+    second_at_begin = threading.Event()
+    second_begin_returned = threading.Event()
+    first_release_barrier = threading.Barrier(2)
+    session_lock = threading.Lock()
+    sessions = []
 
-    def submit(dedup_key: str):
-        return client.post(
-            f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-            headers=HEAD,
-            json={"rows": [{**base, "dedup_key": dedup_key}]},
+    from app.api.v1 import bank_accounts as bank_accounts_api
+    from app.db.company import company_session
+
+    begin_immediate = bank_accounts_api.begin_sqlite_immediate
+
+    def independent_company_session():
+        db = company_session("tc")
+        try:
+            yield db
+        finally:
+            db.rollback()
+            db.close()
+
+    monkeypatch.setitem(
+        client.app.dependency_overrides,
+        bank_accounts_api.get_company_db,
+        independent_company_session,
+    )
+
+    def coordinated_begin(db):
+        with session_lock:
+            call_number = len(sessions)
+            sessions.append(db)
+
+        if call_number == 0:
+            begin_immediate(db)
+            first_lock_acquired.set()
+            assert second_at_begin.wait(timeout=10), (
+                "Second session did not reach begin_sqlite_immediate while "
+                "the first transaction held the lock"
+            )
+            try:
+                first_release_barrier.wait(timeout=10)
+            except threading.BrokenBarrierError as exc:
+                raise AssertionError(
+                    "Test did not release the first transaction after the second "
+                    "session reached BEGIN IMMEDIATE"
+                ) from exc
+            return
+
+        assert first_lock_acquired.wait(timeout=10), (
+            "Second session reached begin_sqlite_immediate before the first "
+            "session acquired its transaction"
+        )
+        second_at_begin.set()
+        begin_immediate(db)
+        second_begin_returned.set()
+
+    monkeypatch.setattr(
+        bank_accounts_api, "begin_sqlite_immediate", coordinated_begin
+    )
+
+    def submit(request_client):
+        return _commit_preview(
+            request_client,
+            biz_bank["id"],
+            csv,
+            preview=preview,
         )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        responses = list(pool.map(submit, ("", "forged-concurrent-key")))
+    with TestClient(client.app) as second_client:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(submit, client)
+            second_future = None
+            try:
+                assert first_lock_acquired.wait(timeout=10), (
+                    "First session did not acquire BEGIN IMMEDIATE"
+                )
+                second_future = pool.submit(submit, second_client)
+                assert second_at_begin.wait(timeout=10), (
+                    "Second session did not reach begin_sqlite_immediate"
+                )
+                assert not second_begin_returned.wait(timeout=0.25), (
+                    "Second BEGIN IMMEDIATE returned while the first session "
+                    "still held the SQLite write lock"
+                )
+            finally:
+                if first_release_barrier.broken:
+                    pass
+                else:
+                    try:
+                        first_release_barrier.wait(timeout=10)
+                    except threading.BrokenBarrierError:
+                        first_release_barrier.abort()
 
-    assert [response.status_code for response in responses] == [200, 200], [
+            first_response = first_future.result(timeout=20)
+            assert second_future is not None, (
+                "Second commit was not started after first lock acquisition"
+            )
+            second_response = second_future.result(timeout=20)
+            responses = [first_response, second_response]
+
+    assert len(sessions) == 2
+    assert sessions[0] is not sessions[1]
+    assert first_lock_acquired.is_set()
+    assert second_at_begin.is_set()
+    assert second_begin_returned.is_set()
+    assert sorted(response.status_code for response in responses) == [200, 400], [
         response.text for response in responses
     ]
-    assert sorted(response.json()["created"] for response in responses) == [0, 1]
-    assert sorted(
-        response.json()["skipped_duplicates"] for response in responses
-    ) == [0, 1]
+    successful = next(response for response in responses if response.status_code == 200)
+    rejected = next(response for response in responses if response.status_code == 400)
+    assert successful.json() == {"created": 2, "skipped_duplicates": 0}
+    assert "Choose whether this is the same or an independent import" in rejected.json()["detail"]
 
     listed = client.get(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
         headers=HEAD,
     ).json()
-    assert sum(txn["memo"] == base["memo"] for txn in listed) == 1
+    assert len(listed) == 2
+    imported = [
+        (
+            txn["memo"],
+            txn["occurred_at"],
+            txn["direction"],
+            txn["amount"],
+            txn["counter_party_name"],
+        )
+        for txn in listed
+        if txn["memo"] in {"Concurrent marker A", "Concurrent marker B"}
+    ]
+    expected_rows = [
+        ("Concurrent marker A", "2026-05-22", "out", "42.50", "One Supplier"),
+        ("Concurrent marker B", "2026-05-23", "out", "19.25", "Other Supplier"),
+    ]
+    assert len(imported) == 2
+    for expected_row in expected_rows:
+        assert imported.count(expected_row) == 1
+
+
+def test_provider_namespace_is_stable_across_csv_xlsx_and_pdf_sources(
+    client, biz_bank, monkeypatch
+):
+    from openpyxl import Workbook
+    from app.services import bank_pdf
+
+    headers = ["Date", "Description", "Transaction ID", "Credit"]
+    alternate_headers = ["Transaction Date", "Narrative", "Reference ID", "Deposit"]
+    values = ["2026-08-10", "Provider cross-format", "cross-format-1", "45.00"]
+    csv = ",".join(headers) + "\n" + ",".join(values) + "\n"
+    namespace = "open-accounting:generic-bank-import:v1"
+
+    first = _upload(client, biz_bank["id"], csv).json()
+    assert first["rows"][0]["provider_namespace"] == namespace
+    committed = _commit_preview(client, biz_bank["id"], csv, preview=first)
+    assert committed.status_code == 200, committed.text
+    assert committed.json()["created"] == 1
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(alternate_headers)
+    sheet.append(values)
+    xlsx_buffer = io.BytesIO()
+    workbook.save(xlsx_buffer)
+    xlsx_response = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/preview",
+        headers=HEAD,
+        files={
+            "file": (
+                "renamed-source.xlsx",
+                io.BytesIO(xlsx_buffer.getvalue()),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert xlsx_response.status_code == 200, xlsx_response.text
+    xlsx_row = xlsx_response.json()["rows"][0]
+    assert xlsx_row["provider_namespace"] == namespace
+    assert xlsx_row["is_duplicate"] is True
+
+    monkeypatch.setattr(
+        bank_pdf,
+        "parse_pdf",
+        lambda _content, _bank_format: (alternate_headers, [values]),
+    )
+    pdf_response = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/preview",
+        headers=HEAD,
+        files={"file": ("other-bank.pdf", io.BytesIO(b"synthetic-pdf"), "application/pdf")},
+        data={"bank_format": "westpac"},
+    )
+    assert pdf_response.status_code == 200, pdf_response.text
+    pdf_row = pdf_response.json()["rows"][0]
+    assert pdf_row["provider_namespace"] == namespace
+    assert pdf_row["is_duplicate"] is True
+
+
+def test_distinct_provider_namespaces_may_reuse_transaction_id(client, biz_bank):
+    from app.db.company import company_session
+    from app.models.company import BankTransaction
+
+    with company_session("tc") as db:
+        db.add(
+            BankTransaction(
+                bank_account_id=biz_bank["id"],
+                direction="in",
+                amount=Decimal("45.00"),
+                occurred_at=date(2026, 8, 10),
+                memo="Generic provider transaction",
+                gst_amount=Decimal("0.00"),
+                tax_code="none",
+                unapplied_amount=Decimal("0.00"),
+                provider_namespace="another-stable-provider:v1",
+                provider_transaction_id="shared-transaction-id",
+            )
+        )
+        db.commit()
+
+    csv = (
+        "Date,Description,Transaction ID,Credit\n"
+        "2026-08-10,Generic provider transaction,shared-transaction-id,45.00\n"
+    )
+    preview = _upload(client, biz_bank["id"], csv).json()
+    row = preview["rows"][0]
+    assert row["provider_namespace"] == "open-accounting:generic-bank-import:v1"
+    assert row["is_duplicate"] is False
+    assert row["review_blocked"] is False
+    assert row["requires_review"] is True
+
+    committed = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=preview,
+        row_overrides={0: {"include": True}},
+    )
+    assert committed.status_code == 200, committed.text
+    assert committed.json()["created"] == 1
+
+    with company_session("tc") as db:
+        rows = (
+            db.query(BankTransaction.provider_namespace)
+            .filter(
+                BankTransaction.provider_transaction_id == "shared-transaction-id"
+            )
+            .all()
+        )
+    assert {row[0] for row in rows} == {
+        "another-stable-provider:v1",
+        "open-accounting:generic-bank-import:v1",
+    }
 
 
 @pytest.mark.parametrize(
@@ -630,50 +963,49 @@ def test_concurrent_commit_of_same_canonical_row_writes_once(client, biz_bank):
 def test_commit_schema_rejects_bad_money_and_dates_without_500_or_row_echo(
     client, biz_bank, field, value,
 ):
-    row = {
-        "occurred_at": "2026-05-23",
-        "direction": "in",
-        "amount": "10.00",
+    csv = "Date,Description,Credit\n2026-05-23,Bound row,10.00\n"
+    preview = _upload(client, biz_bank["id"], csv).json()
+    decision = {
+        "row_key": preview["rows"][0]["row_key"],
+        "include": True,
         "gst_amount": "0.00",
-        "memo": "SECRET-MEMO-MUST-NOT-ECHO",
-        "counter_party_name": "SECRET-COUNTERPARTY-MUST-NOT-ECHO",
         field: value,
     }
     response = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
         headers=HEAD,
-        json={"rows": [row]},
+        files={"file": ("stmt.csv", io.BytesIO(csv.encode()), "text/csv")},
+        data={
+            "payload_json": json.dumps(
+                {
+                    "preview_key": preview["preview_key"],
+                    "mapping": preview["mapping"],
+                    "import_mode": "new_import",
+                    "rows": [decision],
+                }
+            )
+        },
     )
     assert response.status_code == 422, response.text
-    assert "SECRET-MEMO-MUST-NOT-ECHO" not in response.text
-    assert "SECRET-COUNTERPARTY-MUST-NOT-ECHO" not in response.text
 
 
 def test_commit_business_error_contains_only_row_index_and_field_reason(
     client, biz_bank,
 ):
-    response = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={
-            "rows": [
-                {
-                    "occurred_at": "2026-05-24",
-                    "direction": "in",
-                    "amount": "10.00",
-                    "gst_amount": "11.00",
-                    "memo": "SECRET-BUSINESS-ERROR-MEMO",
-                    "counter_party_name": "SECRET-BUSINESS-ERROR-PARTY",
-                }
-            ]
-        },
+    csv = "Date,Description,Credit\n2026-05-24,Private memo,10.00\n"
+    preview = _upload(client, biz_bank["id"], csv).json()
+    response = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=preview,
+        row_overrides={0: {"include": True, "gst_amount": "11.00"}},
     )
     assert response.status_code == 400, response.text
     assert response.json()["detail"] == (
         "Row 1: gst_amount must not exceed amount"
     )
-    assert "SECRET-BUSINESS-ERROR-MEMO" not in response.text
-    assert "SECRET-BUSINESS-ERROR-PARTY" not in response.text
+    assert "Private memo" not in response.text
 
 
 # ---------------------------------------------------------------------------
@@ -926,21 +1258,18 @@ def test_direction_unsafe_rule_is_ignored_before_bas(client, accounts, biz_bank)
     assert row["suggested_gst_amount"] == "100.00"
     assert row["suggestion_source"] == "heuristic"
 
-    payload_row = {
-        "occurred_at": row["parsed"]["occurred_at"],
-        "direction": row["parsed"]["direction"],
-        "amount": row["parsed"]["amount"],
-        "dedup_key": row["dedup_key"],
-        "memo": row["parsed"]["memo"],
-        "counter_party_name": row["parsed"]["counter_party_name"],
-        "account_id": row["suggested_account_id"],
-        "tax_code": row["suggested_tax_code"],
-        "gst_amount": row["suggested_gst_amount"],
-    }
-    r = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={"rows": [payload_row]},
+    r = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=r.json(),
+        row_overrides={
+            0: {
+                "account_id": row["suggested_account_id"],
+                "tax_code": row["suggested_tax_code"],
+                "gst_amount": row["suggested_gst_amount"],
+            }
+        },
     )
     assert r.status_code == 200, r.text
 
@@ -967,21 +1296,18 @@ def test_counter_party_header_with_hyphen_imports_and_persists(client, biz_bank)
     row = body["rows"][0]
     assert row["parsed"]["counter_party_name"] == "Jane Sample"
 
-    payload_row = {
-        "occurred_at": row["parsed"]["occurred_at"],
-        "direction": row["parsed"]["direction"],
-        "amount": row["parsed"]["amount"],
-        "dedup_key": row["dedup_key"],
-        "memo": row["parsed"]["memo"],
-        "counter_party_name": row["parsed"]["counter_party_name"],
-        "account_id": row["suggested_account_id"],
-        "tax_code": row["suggested_tax_code"],
-        "gst_amount": row["suggested_gst_amount"] or "0.00",
-    }
-    r = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={"rows": [payload_row]},
+    r = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=body,
+        row_overrides={
+            0: {
+                "account_id": row["suggested_account_id"],
+                "tax_code": row["suggested_tax_code"],
+                "gst_amount": row["suggested_gst_amount"] or "0.00",
+            }
+        },
     )
     assert r.status_code == 200, r.text
 
@@ -1021,21 +1347,18 @@ def test_commit_applies_account_and_tax_code(client, accounts, biz_bank):
     csv = "Date,Description,Debit,Credit\n2026-05-01,Office rent,1500.00,\n"
     r = _upload(client, biz_bank["id"], csv)
     rows = r.json()["rows"]
-    commit = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={"rows": [
-            {
-                "occurred_at": rows[0]["parsed"]["occurred_at"],
-                "direction": rows[0]["parsed"]["direction"],
-                "amount": rows[0]["parsed"]["amount"],
-                "dedup_key": rows[0]["dedup_key"],
-                "memo": rows[0]["parsed"]["memo"],
+    commit = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=r.json(),
+        row_overrides={
+            0: {
                 "account_id": rent["id"],
                 "tax_code": "standard",
                 "gst_amount": "136.36",
             }
-        ]},
+        },
     )
     assert commit.json()["created"] == 1
     # Verify the txn lands with all the fields wired.
@@ -1217,66 +1540,46 @@ def test_commit_rejects_missing_or_inactive_account(client, accounts, biz_bank):
     csv = "Date,Description,Debit,Credit\n2026-05-01,Office rent,1500.00,\n"
     row = _upload(client, biz_bank["id"], csv).json()["rows"][0]
 
-    payload_row = {
-        "occurred_at": row["parsed"]["occurred_at"],
-        "direction": row["parsed"]["direction"],
-        "amount": row["parsed"]["amount"],
-        "dedup_key": row["dedup_key"],
-        "memo": row["parsed"]["memo"],
-        "account_id": 999999,
-        "tax_code": "standard",
-        "gst_amount": "0.00",
-    }
-    r = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={"rows": [payload_row]},
+    r = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=_upload(client, biz_bank["id"], csv).json(),
+        row_overrides={0: {"include": True, "account_id": 999999}},
     )
     assert r.status_code == 400
-    assert r.json()["detail"] == (
-        "Row 1: account_id does not reference an existing account"
-    )
-    assert payload_row["memo"] not in r.json()["detail"]
+    assert r.json()["detail"] == "Row 1: account_id is missing or inactive"
 
     client.patch(
         f"/api/v1/accounts/{rent['id']}",
         headers=HEAD,
         json={"active": False},
     )
-    payload_row["account_id"] = rent["id"]
-    r = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={"rows": [payload_row]},
+    r = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=_upload(client, biz_bank["id"], csv).json(),
+        row_overrides={0: {"include": True, "account_id": rent["id"]}},
     )
     assert r.status_code == 400
-    assert r.json()["detail"] == (
-        "Row 1: account_id references an inactive account"
-    )
-    assert payload_row["memo"] not in r.json()["detail"]
+    assert r.json()["detail"] == "Row 1: account_id is missing or inactive"
 
 
 def test_commit_skips_duplicate_rows_inside_same_payload(client, biz_bank):
-    csv = "Date,Description,Credit\n2026-05-01,Salary,5000.00\n"
-    row = _upload(client, biz_bank["id"], csv).json()["rows"][0]
-    payload_row = {
-        "occurred_at": row["parsed"]["occurred_at"],
-        "direction": row["parsed"]["direction"],
-        "amount": row["parsed"]["amount"],
-        "dedup_key": row["dedup_key"],
-        "memo": row["parsed"]["memo"],
-    }
-
-    r = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={"rows": [payload_row, payload_row]},
+    csv = (
+        "Date,Description,Credit\n"
+        "2026-05-01,Salary,5000.00\n"
+        "2026-05-01,Salary,5000.00\n"
     )
+    r = _commit_preview(client, biz_bank["id"], csv)
     assert r.status_code == 200, r.text
-    assert r.json() == {"created": 1, "skipped_duplicates": 1}
+    assert r.json() == {"created": 2, "skipped_duplicates": 0}
 
 
 def test_inactive_bank_account_rejects_manual_entry_and_import(client, biz_bank):
+    csv = "Date,Description,Credit\n2026-05-01,Salary,5000.00\n"
+    prior_preview = _upload(client, biz_bank["id"], csv).json()
     r = client.patch(
         f"/api/v1/bank-accounts/{biz_bank['id']}",
         headers=HEAD,
@@ -1297,25 +1600,15 @@ def test_inactive_bank_account_rejects_manual_entry_and_import(client, biz_bank)
     assert r.status_code == 400
     assert "inactive" in r.json()["detail"]
 
-    csv = "Date,Description,Credit\n2026-05-01,Salary,5000.00\n"
     r = _upload(client, biz_bank["id"], csv)
     assert r.status_code == 400
     assert "inactive" in r.json()["detail"]
 
-    r = client.post(
-        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
-        headers=HEAD,
-        json={
-            "rows": [
-                {
-                    "occurred_at": "2026-05-01",
-                    "direction": "in",
-                    "amount": "5000.00",
-                    "dedup_key": "inactive-test",
-                    "memo": "Salary",
-                }
-            ]
-        },
+    r = _commit_preview(
+        client,
+        biz_bank["id"],
+        csv,
+        preview=prior_preview,
     )
     assert r.status_code == 400
     assert "inactive" in r.json()["detail"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -308,19 +309,29 @@ def test_non_gst_bank_reconciliation_import_and_reports(client):
     assert row["suggested_tax_code"] == "none"
     assert row["suggested_gst_amount"] == "0.00"
 
-    commit_row = {
-        "occurred_at": row["parsed"]["occurred_at"],
-        "direction": row["parsed"]["direction"],
-        "amount": row["parsed"]["amount"],
-        "dedup_key": row["dedup_key"],
-        "account_id": row["suggested_account_id"],
-        "tax_code": "standard",
-        "gst_amount": "10.00",
-    }
+    preview_body = preview.json()
     response = client.post(
         f"/api/v1/bank-accounts/{bank['id']}/import/commit",
         headers=headers,
-        json={"rows": [commit_row]},
+        files={"file": ("statement.csv", io.BytesIO(csv_bytes), "text/csv")},
+        data={
+            "payload_json": json.dumps(
+                {
+                    "preview_key": preview_body["preview_key"],
+                    "mapping": preview_body["mapping"],
+                    "import_mode": "new_import",
+                    "rows": [
+                        {
+                            "row_key": row["row_key"],
+                            "include": True,
+                            "account_id": row["suggested_account_id"],
+                            "tax_code": "standard",
+                            "gst_amount": "10.00",
+                        }
+                    ],
+                }
+            )
+        },
     )
     assert response.status_code == 400, response.text
     assert "not GST-registered" in response.text

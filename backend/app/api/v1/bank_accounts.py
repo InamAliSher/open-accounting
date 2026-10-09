@@ -7,6 +7,8 @@ payments, etc. without an invoice round-trip.
 
 from __future__ import annotations
 
+from datetime import date
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -17,6 +19,9 @@ from fastapi import (
     Query,
     UploadFile,
 )
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from ...db.company import begin_sqlite_immediate
@@ -348,26 +353,68 @@ async def import_preview(
     "/{bank_account_id}/import/commit",
     response_model=BankImportCommitOut,
 )
-def import_commit(
+async def import_commit(
     bank_account_id: PathId,
-    payload: BankImportCommitIn,
+    file: UploadFile = File(...),
+    payload_json: str = Form(...),
+    bank_format: str | None = Form(default=None),
     company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
-    for row in payload.rows:
-        _require_open_period(
-            company,
-            row.occurred_at,
-            operation="import a bank transaction",
-        )
+    content = await _read_import_upload_capped(file)
+    if not content:
+        raise HTTPException(400, "Empty file")
     begin_sqlite_immediate(db)
+    try:
+        payload = BankImportCommitIn.model_validate_json(payload_json)
+        preview = bank_import_svc.preview_import(
+            db,
+            bank_account_id=bank_account_id,
+            content=content,
+            filename=file.filename or "upload.csv",
+            bank_format=bank_format,
+            mapping=payload.mapping,
+            gst_registered=company.gst_registered,
+        )
+    except ValidationError as exc:
+        db.rollback()
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "Invalid import decision payload"},
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+
+    decisions = {row.row_key: row for row in payload.rows}
+    for row in preview["rows"]:
+        decision = decisions.get(row["row_key"])
+        if decision is not None and decision.include and row.get("ok"):
+            _require_open_period(
+                company,
+                date.fromisoformat(row["parsed"]["occurred_at"]),
+                operation="import a bank transaction",
+            )
+
     try:
         return bank_import_svc.commit_import(
             db,
             bank_account_id=bank_account_id,
-            rows=[r.model_dump() for r in payload.rows],
+            content=content,
+            filename=file.filename or "upload.csv",
+            bank_format=bank_format,
+            preview_key=payload.preview_key,
+            mapping=payload.mapping,
+            import_mode=payload.import_mode,
+            rows=[row.model_dump() for row in payload.rows],
             gst_registered=company.gst_registered,
         )
     except ValueError as e:
         db.rollback()
         raise HTTPException(400, str(e)) from e
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(
+            409,
+            "Import identity changed concurrently; preview the statement again",
+        ) from e

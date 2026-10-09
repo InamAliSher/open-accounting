@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import shutil
+import io
+import json
 import sys
 from datetime import date
 from decimal import Decimal
@@ -537,24 +539,38 @@ def test_reconciliation_and_import_paths_require_and_apply_allocations(client, a
     assert client.get(f"/api/v1/invoices/{invoice['id']}", headers=HEAD).json()["status"] == "paid"
 
     second = _posted_invoice(client, accounts, number="ALLOC-IMPORT")
+    statement = b"Date,Description,Credit\n2026-05-21,ALLOC-IMPORT,110.00\n"
+    preview = client.post(
+        f"/api/v1/bank-accounts/{bank['id']}/import/preview",
+        headers=HEAD,
+        files={"file": ("allocation-import.csv", io.BytesIO(statement), "text/csv")},
+    )
+    assert preview.status_code == 200, preview.text
+    preview_body = preview.json()
     imported = client.post(
         f"/api/v1/bank-accounts/{bank['id']}/import/commit",
         headers=HEAD,
-        json={
-            "rows": [
+        files={"file": ("allocation-import.csv", io.BytesIO(statement), "text/csv")},
+        data={
+            "payload_json": json.dumps(
                 {
-                    "occurred_at": "2026-05-21",
-                    "direction": "in",
-                    "amount": "110.00",
-                    "memo": "ALLOC-IMPORT",
-                    "account_id": accounts["1100"]["id"],
-                    "tax_code": "standard",
-                    "gst_amount": "10.00",
-                    "invoice_allocations": [
-                        {"invoice_id": second["id"], "amount": "110.00"}
+                    "preview_key": preview_body["preview_key"],
+                    "mapping": preview_body["mapping"],
+                    "import_mode": "new_import",
+                    "rows": [
+                        {
+                            "row_key": preview_body["rows"][0]["row_key"],
+                            "include": True,
+                            "account_id": accounts["1100"]["id"],
+                            "tax_code": "standard",
+                            "gst_amount": "10.00",
+                            "invoice_allocations": [
+                                {"invoice_id": second["id"], "amount": "110.00"}
+                            ],
+                        }
                     ],
                 }
-            ]
+            )
         },
     )
     assert imported.status_code == 200, imported.text

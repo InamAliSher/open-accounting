@@ -19,6 +19,7 @@ import type {
   Account,
   BankAccountWithBalance,
   BankImportCommitResult,
+  BankImportMode,
   BankImportPreview,
   BankImportPreviewRow,
   BankTransaction,
@@ -927,6 +928,7 @@ function ImportStatementDialog({
   const [bankFormat, setBankFormat] = useState("auto");
   const [preview, setPreview] = useState<BankImportPreview | null>(null);
   const [rows, setRows] = useState<ImportRow[]>([]);
+  const [importMode, setImportMode] = useState<BankImportMode>("new_import");
   const [error, setError] = useState<string | null>(null);
 
   const isPdf = !!file && file.name.toLowerCase().endsWith(".pdf");
@@ -975,11 +977,12 @@ function ImportStatementDialog({
             override_tax_code: deferredControl
               ? "none"
               : ((r.suggested_tax_code ?? "standard") as TaxCode),
-            // Default: include if ok and not duplicate.
-            included: r.ok && !r.is_duplicate,
+            included:
+              r.ok && !r.is_duplicate && !r.requires_review && !r.review_blocked,
           };
         }),
       );
+      setImportMode("new_import");
       setError(null);
     },
     onError: (e) => setError(apiErrorMessage(e)),
@@ -987,31 +990,35 @@ function ImportStatementDialog({
 
   const commitMut = useMutation({
     mutationFn: async () => {
-      const payload = {
-        rows: rows
-          .filter((r) => r.included && r.ok && r.parsed.occurred_at && r.parsed.amount && r.parsed.direction)
-          .map((r) => {
+      if (!file || !preview) throw new Error("The previewed upload is no longer available");
+      const form = new FormData();
+      form.append("file", file, file.name);
+      if (file.name.toLowerCase().endsWith(".pdf")) {
+        form.append("bank_format", bankFormat);
+      }
+      form.append("payload_json", JSON.stringify({
+        preview_key: preview.preview_key,
+        mapping: preview.mapping,
+        import_mode: importMode,
+        rows: rows.map((r) => {
             const deferToReconciliation = defersInvoiceAllocation(r);
             return {
-              occurred_at: r.parsed.occurred_at!,
-              direction: r.parsed.direction!,
-              amount: r.parsed.amount!,
-              dedup_key: r.dedup_key,
+              row_key: r.row_key,
+              include: r.included && r.ok,
               account_id: deferToReconciliation ? null : r.override_account_id,
               tax_code:
                 deferToReconciliation || !gstRegistered ? "none" : r.override_tax_code,
-              memo: r.parsed.memo,
-              counter_party_name: r.parsed.counter_party_name,
               gst_amount: deferToReconciliation
                 ? "0"
                 : importRowGstAmount(r, gstRegistered),
               invoice_allocations: [],
             };
           }),
-      };
+      }));
       const { data } = await api.post<BankImportCommitResult>(
         `/bank-accounts/${bankAccountId}/import/commit`,
-        payload,
+        form,
+        { headers: { "Content-Type": "multipart/form-data" } },
       );
       return data;
     },
@@ -1038,7 +1045,8 @@ function ImportStatementDialog({
     !!companyQ.data &&
     !commitResult &&
     !!preview &&
-    includedCount > 0 &&
+    (!preview.statement_review_required || importMode !== "new_import") &&
+    (includedCount > 0 || importMode === "same_import") &&
     !commitMut.isPending;
 
   useModalKeys({
@@ -1162,6 +1170,50 @@ function ImportStatementDialog({
                 </div>
               )}
 
+              {preview.statement_review_required && (
+                <fieldset className="rounded border border-amber-300 bg-amber-50 p-3 text-sm">
+                  <legend className="px-1 font-medium text-amber-900">
+                    This no-ID statement matches a prior import
+                  </legend>
+                  <div className="flex flex-wrap gap-x-6 gap-y-2 text-amber-950">
+                    <label className="inline-flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="bank-import-mode"
+                        value="same_import"
+                        checked={importMode === "same_import"}
+                        onChange={() => {
+                          setImportMode("same_import");
+                          setRows((current) => current.map((row) =>
+                            row.review_reason === "identical_statement"
+                              ? { ...row, included: false }
+                              : row,
+                          ));
+                        }}
+                      />
+                      Same import, skip rows already recorded
+                    </label>
+                    <label className="inline-flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="bank-import-mode"
+                        value="independent_import"
+                        checked={importMode === "independent_import"}
+                        onChange={() => {
+                          setImportMode("independent_import");
+                          setRows((current) => current.map((row) =>
+                            row.review_reason === "identical_statement" && row.ok
+                              ? { ...row, included: true }
+                              : row,
+                          ));
+                        }}
+                      />
+                      Independent import, create these transactions again
+                    </label>
+                  </div>
+                </fieldset>
+              )}
+
               <div className="overflow-auto border border-slate-200 rounded">
                 <table className="w-full min-w-[920px] text-xs">
                   <thead className="bg-slate-50 text-left">
@@ -1180,7 +1232,7 @@ function ImportStatementDialog({
                   <tbody>
                     {rows.map((r, i) => (
                       <tr
-                        key={r.row_no}
+                        key={r.row_key}
                         className={`border-t ${
                           !r.ok
                             ? "bg-rose-50"
@@ -1193,7 +1245,7 @@ function ImportStatementDialog({
                           <input
                             type="checkbox"
                             checked={r.included}
-                            disabled={!r.ok}
+                            disabled={!r.ok || r.review_blocked}
                             onChange={(e) =>
                               setRows((curr) =>
                                 curr.map((x, j) =>
@@ -1286,13 +1338,19 @@ function ImportStatementDialog({
                           </select>
                         </td>
                         <td className="px-2 py-1 text-slate-500">
-                          {defersInvoiceAllocation(r) ? (
+                          {r.review_blocked ? (
+                            <span className="text-rose-700">provider ID conflict; review source and omit this row</span>
+                          ) : defersInvoiceAllocation(r) ? (
                             <span className="text-blue-700">
                               import uncategorised; allocate invoices in Reconciliation
                             </span>
                           ) : r.issue ??
                             (r.is_duplicate ? (
                               "duplicate"
+                            ) : r.review_reason === "identical_statement" ? (
+                              "statement-level choice required"
+                            ) : r.requires_review ? (
+                              "possible existing transaction; include only after review"
                             ) : r.suggestion_source === "rule" && r.matched_rule_description ? (
                               `rule: ${r.matched_rule_description}`
                             ) : r.suggestion_source === "heuristic" && r.matched_rule_description ? (

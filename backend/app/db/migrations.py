@@ -150,11 +150,29 @@ _BANK_DEDUP_INDEX = SQLiteIndexSignature(
     unique=True,
     where="dedup_key IS NOT NULL",
 )
+_BANK_PROVIDER_IDENTITY_INDEX = SQLiteIndexSignature(
+    "uq_bank_txn_provider_identity",
+    ("bank_account_id", "provider_namespace", "provider_transaction_id"),
+    unique=True,
+    where=(
+        "provider_namespace IS NOT NULL AND provider_transaction_id IS NOT NULL"
+    ),
+)
+_BANK_IMPORT_ROW_IDENTITY_INDEX = SQLiteIndexSignature(
+    "uq_bank_txn_import_row_identity",
+    ("bank_account_id", "import_instance_id", "import_row_key"),
+    unique=True,
+    where="import_instance_id IS NOT NULL AND import_row_key IS NOT NULL",
+)
 
 
 def _required_unique_indexes() -> dict[str, tuple[SQLiteIndexSignature, ...]]:
     required = dict(MIGRATION_INDEX_SIGNATURES)
-    required["bank_transactions"] = (_BANK_DEDUP_INDEX,)
+    required["bank_transactions"] = (
+        _BANK_DEDUP_INDEX,
+        _BANK_PROVIDER_IDENTITY_INDEX,
+        _BANK_IMPORT_ROW_IDENTITY_INDEX,
+    )
     return required
 
 
@@ -972,6 +990,16 @@ def _rebuild_bank_transactions(conn) -> None:
     unapplied_amount_source = (
         "unapplied_amount" if "unapplied_amount" in old_columns else "0"
     )
+    identity_sources = {
+        name: name if name in old_columns else "NULL"
+        for name in (
+            "provider_namespace",
+            "provider_transaction_id",
+            "import_statement_key",
+            "import_instance_id",
+            "import_row_key",
+        )
+    }
 
     # Snapshot original index DDL so we can recreate post-rename.
     index_rows = conn.execute(
@@ -1013,6 +1041,11 @@ def _rebuild_bank_transactions(conn) -> None:
                     unapplied_account_id INTEGER REFERENCES accounts(id) ON DELETE RESTRICT,
                     unapplied_amount NUMERIC(16, 2) NOT NULL DEFAULT 0,
                     dedup_key VARCHAR(64),
+                    provider_namespace VARCHAR(100),
+                    provider_transaction_id VARCHAR(200),
+                    import_statement_key VARCHAR(64),
+                    import_instance_id VARCHAR(36),
+                    import_row_key VARCHAR(64),
                     created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
                     CONSTRAINT ck_bank_txn_amount_positive CHECK (amount > 0),
                     CONSTRAINT ck_bank_txn_gst_nonneg CHECK (gst_amount >= 0),
@@ -1034,13 +1067,20 @@ def _rebuild_bank_transactions(conn) -> None:
                 INSERT INTO new_bank_transactions (
                     id, bank_account_id, direction, amount, occurred_at, memo,
                     counter_party_name, account_id, gst_amount, tax_code,
-                    unapplied_account_id, unapplied_amount, dedup_key, created_at
+                    unapplied_account_id, unapplied_amount, dedup_key,
+                    provider_namespace, provider_transaction_id,
+                    import_statement_key, import_instance_id, import_row_key,
+                    created_at
                 )
                 SELECT
                     id, bank_account_id, direction, amount, occurred_at, memo,
                     counter_party_name, account_id, gst_amount, tax_code,
                     {unapplied_account_source}, {unapplied_amount_source},
-                    dedup_key, created_at
+                    dedup_key, {identity_sources['provider_namespace']},
+                    {identity_sources['provider_transaction_id']},
+                    {identity_sources['import_statement_key']},
+                    {identity_sources['import_instance_id']},
+                    {identity_sources['import_row_key']}, created_at
                 FROM bank_transactions
                 """
             )
