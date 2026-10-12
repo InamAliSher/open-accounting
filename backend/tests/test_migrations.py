@@ -1166,3 +1166,167 @@ def test_system_account_reconciliation_error_rolls_back_and_keeps_backup(tmp_pat
         assert conn.execute(
             text("SELECT name, type, active FROM accounts WHERE code='2000'")
         ).one() == ("AP renamed", "LIABILITY", 1)
+
+
+def test_allocation_history_migration_repairs_owned_guards_and_indexes_idempotently():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    first = migrations.run_company_migrations(engine)
+    second = migrations.run_company_migrations(engine)
+    assert "guards:allocation_history_append_only" in first
+    assert "guards:allocation_history_append_only" not in second
+    assert "schema:allocation_history" not in second
+
+    with engine.begin() as conn:
+        conn.execute(text('DROP INDEX "uq_allocation_history_idempotency"'))
+        conn.execute(
+            text(
+                "CREATE INDEX uq_allocation_history_idempotency "
+                "ON allocation_history_events (bank_transaction_id)"
+            )
+        )
+        canonical = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_allocation_history_events_domain'"
+            )
+        ).scalar_one()
+        altered_case = canonical.replace(
+            "'allocation_correction'", "'ALLOCATION_CORRECTION'"
+        )
+        assert altered_case != canonical
+        conn.execute(text('DROP TRIGGER "trg_allocation_history_events_domain"'))
+        conn.exec_driver_sql(altered_case)
+
+    repaired = migrations.run_company_migrations(engine)
+    assert "schema:allocation_history" in repaired
+    assert "guards:allocation_history_append_only" in repaired
+    with engine.connect() as conn:
+        assert migrations.sqlite_index_matches(
+            conn,
+            "allocation_history_events",
+            migrations.SQLiteIndexSignature(
+                "uq_allocation_history_idempotency",
+                ("idempotency_key",),
+                unique=True,
+                where="idempotency_key IS NOT NULL",
+            ),
+        )
+        canonical = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_allocation_history_events_domain'"
+            )
+        ).scalar_one()
+        assert "'allocation_correction'" in canonical
+        assert "'ALLOCATION_CORRECTION'" not in canonical
+        assert "Invalid allocation history event" in canonical
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM bas_period_lodgment_markers")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM allocation_history_events")
+        ).scalar_one() == 0
+        with pytest.raises(Exception, match="Invalid internal BAS period marker"):
+            conn.execute(
+                text(
+                    "INSERT INTO bas_period_lodgment_markers "
+                    "(period_id, period_start, period_end, lodged_status, "
+                    "internally_asserted_at, actor_placeholder, evidence_reference, "
+                    "evidence_scope) VALUES ('blank', '2026-10-01', '2026-10-31', 1, "
+                    "'2026-11-01', 'synthetic', ' ', "
+                    "'internal_assertion_not_ato_lodgment_evidence')"
+                )
+            )
+    engine.dispose()
+
+
+def test_allocation_history_migration_repairs_empty_partial_table_by_table():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE allocation_history_tax_components"))
+        conn.execute(
+            text(
+                "CREATE TABLE allocation_history_tax_components "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO allocation_history_tax_components (id) VALUES (7)")
+        )
+
+    repaired = migrations.run_company_migrations(engine)
+    assert "schema:allocation_history" in repaired
+    with engine.connect() as conn:
+        assert {
+            "id", "snapshot_id", "tax_code", "gross_cents", "gst_cents"
+        }.issubset(
+            {row[1] for row in conn.execute(
+                text("PRAGMA table_info(allocation_history_tax_components)")
+            )}
+        )
+        assert conn.execute(
+            text(
+                "SELECT id, snapshot_id, tax_code, gross_cents, gst_cents "
+                "FROM allocation_history_tax_components"
+            )
+        ).one() == (7, None, None, None, None)
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM allocation_history_events")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM bas_period_lodgment_markers")
+        ).scalar_one() == 0
+    engine.dispose()
+
+
+def test_bank_transaction_rebuild_preserves_allocation_history(monkeypatch):
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO bank_accounts (id, name, opening_balance, is_active) "
+                "VALUES (1, 'Synthetic history bank', 0, 1)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO bank_transactions "
+                "(id, bank_account_id, direction, amount, occurred_at, gst_amount, "
+                "tax_code, unapplied_amount) "
+                "VALUES (1, 1, 'in', 20, '2026-10-01', 0, 'none', 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO allocation_history_events "
+                "(operation, bank_transaction_id) "
+                "VALUES ('legacy_history_unknown', 1)"
+            )
+        )
+
+    monkeypatch.setattr(migrations, "_bank_needs_rebuild", lambda _conn: True)
+    rebuilt = migrations.run_company_migrations(engine)
+    assert "rebuild:bank_transactions" in rebuilt
+    with engine.connect() as conn:
+        assert conn.execute(
+            text(
+                "SELECT id, operation, bank_transaction_id, effective_date, "
+                "evidence_reference FROM allocation_history_events"
+            )
+        ).all() == [(1, "legacy_history_unknown", 1, None, None)]
+        assert conn.execute(
+            text("SELECT id, amount, occurred_at FROM bank_transactions")
+        ).one() == (1, 20, "2026-10-01")
+        assert conn.execute(text("PRAGMA foreign_key_check")).fetchall() == []
+        assert conn.execute(
+            text(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_bank_transactions_allocation_history_no_delete'"
+            )
+        ).scalar_one() == 1
+    engine.dispose()

@@ -1073,6 +1073,228 @@ class InvoicePaymentTaxComponent(CompanyBase):
     )
 
 
+class AllocationHistorySnapshot(CompanyBase):
+    """Immutable, integer-cent allocation state finalized with tax components."""
+
+    __tablename__ = "allocation_history_snapshots"
+    __table_args__ = (
+        CheckConstraint("source_kind IN ('invoice', 'bill')", name="ck_allocation_snapshot_source_kind"),
+        CheckConstraint("gross_cents > 0", name="ck_allocation_snapshot_gross_positive"),
+        CheckConstraint(
+            "gst_cents >= 0 AND gst_cents <= gross_cents",
+            name="ck_allocation_snapshot_gst_within",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("invoices.id", ondelete="RESTRICT"), nullable=False
+    )
+    gross_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    gst_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AllocationHistoryTaxComponent(CompanyBase):
+    """Tax composition for one allocation snapshot, represented exactly in cents."""
+
+    __tablename__ = "allocation_history_tax_components"
+    __table_args__ = (
+        Index(
+            "uq_allocation_history_tax_component",
+            "snapshot_id",
+            "tax_code",
+            unique=True,
+        ),
+        CheckConstraint("gross_cents > 0", name="ck_allocation_component_gross_positive"),
+        CheckConstraint(
+            "gst_cents >= 0 AND gst_cents <= gross_cents",
+            name="ck_allocation_component_gst_within",
+        ),
+        CheckConstraint(
+            "tax_code IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none')",
+            name="ck_allocation_component_tax_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey("allocation_history_snapshots.id", ondelete="RESTRICT"), nullable=False
+    )
+    tax_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    gross_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    gst_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class AllocationHistoryFinalization(CompanyBase):
+    """One immutable proof that a snapshot's components reconcile exactly."""
+
+    __tablename__ = "allocation_history_finalizations"
+
+    snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey("allocation_history_snapshots.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    component_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    gross_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    gst_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    finalized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BASPeriodLodgmentMarker(CompanyBase):
+    """Internal assertion only; this is not authenticated ATO lodgment evidence."""
+
+    __tablename__ = "bas_period_lodgment_markers"
+    __table_args__ = (
+        Index("uq_bas_period_lodgment_period", "period_id", unique=True),
+        CheckConstraint("lodged_status = 1", name="ck_bas_period_lodged_assertion"),
+        CheckConstraint(
+            "evidence_scope = 'internal_assertion_not_ato_lodgment_evidence'",
+            name="ck_bas_period_evidence_scope",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    period_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    lodged_status: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    internally_asserted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    actor_placeholder: Mapped[str] = mapped_column(String(200), nullable=False)
+    evidence_reference: Mapped[str] = mapped_column(String(500), nullable=False)
+    evidence_scope: Mapped[str] = mapped_column(
+        String(80), nullable=False, default="internal_assertion_not_ato_lodgment_evidence"
+    )
+
+
+class AllocationPeriodCorrectionApproval(CompanyBase):
+    """Append-only approval keyed to a planned correction's idempotency key."""
+
+    __tablename__ = "allocation_period_correction_approvals"
+    __table_args__ = (
+        Index(
+            "uq_allocation_period_correction_approval",
+            "period_marker_id",
+            "approved_idempotency_key",
+            unique=True,
+        ),
+        CheckConstraint("length(trim(reason)) > 0", name="ck_allocation_approval_reason_nonblank"),
+        CheckConstraint(
+            "length(trim(evidence_reference)) > 0",
+            name="ck_allocation_approval_evidence_nonblank",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    period_marker_id: Mapped[int] = mapped_column(
+        ForeignKey("bas_period_lodgment_markers.id", ondelete="RESTRICT"), nullable=False
+    )
+    allocation_id: Mapped[int] = mapped_column(
+        ForeignKey("invoice_payment_allocations.id", ondelete="RESTRICT"), nullable=False
+    )
+    approved_idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_placeholder: Mapped[str] = mapped_column(String(200), nullable=False)
+    reason: Mapped[str] = mapped_column(String(1000), nullable=False)
+    evidence_reference: Mapped[str] = mapped_column(String(500), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AllocationHistoryEvent(CompanyBase):
+    """Append-only correction, reversal, or deliberately incomplete legacy marker."""
+
+    __tablename__ = "allocation_history_events"
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('allocation_correction', 'allocation_reversal', 'legacy_history_unknown')",
+            name="ck_allocation_history_operation",
+        ),
+        CheckConstraint(
+            "(operation = 'legacy_history_unknown' AND snapshot_id IS NULL "
+            "AND version IS NULL AND effective_date IS NULL AND recorded_at IS NULL "
+            "AND idempotency_key IS NULL AND expected_prior_version IS NULL "
+            "AND actor_placeholder IS NULL AND reason IS NULL "
+            "AND evidence_reference IS NULL AND evidence_sha256 IS NULL "
+            "AND linked_event_id IS NULL AND linked_allocation_id IS NULL "
+            "AND approval_id IS NULL) OR "
+            "(operation IN ('allocation_correction', 'allocation_reversal') "
+            "AND snapshot_id IS NOT NULL AND version > 0 AND effective_date IS NOT NULL "
+            "AND recorded_at IS NOT NULL AND idempotency_key IS NOT NULL "
+            "AND expected_prior_version >= 0 AND actor_placeholder IS NOT NULL "
+            "AND reason IS NOT NULL AND evidence_reference IS NOT NULL "
+            "AND ((linked_event_id IS NOT NULL) != (linked_allocation_id IS NOT NULL)))",
+            name="ck_allocation_history_operation_fields",
+        ),
+        Index(
+            "uq_allocation_history_idempotency",
+            "idempotency_key",
+            unique=True,
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+        ),
+        Index(
+            "uq_allocation_history_version",
+            "allocation_id",
+            "version",
+            unique=True,
+            sqlite_where=text("version IS NOT NULL"),
+        ),
+        Index(
+            "uq_allocation_history_legacy_unknown",
+            "bank_transaction_id",
+            unique=True,
+            sqlite_where=text("operation = 'legacy_history_unknown'"),
+        ),
+        Index(
+            "uq_allocation_history_reversed_event",
+            "linked_event_id",
+            unique=True,
+            sqlite_where=text("operation = 'allocation_reversal' AND linked_event_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_allocation_history_reversed_allocation",
+            "linked_allocation_id",
+            unique=True,
+            sqlite_where=text("operation = 'allocation_reversal' AND linked_allocation_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_allocation_history_snapshot",
+            "snapshot_id",
+            unique=True,
+            sqlite_where=text("snapshot_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    operation: Mapped[str] = mapped_column(String(40), nullable=False)
+    bank_transaction_id: Mapped[int] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="RESTRICT"), nullable=False
+    )
+    allocation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("invoice_payment_allocations.id", ondelete="RESTRICT")
+    )
+    snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("allocation_history_snapshots.id", ondelete="RESTRICT")
+    )
+    version: Mapped[int | None] = mapped_column(Integer)
+    effective_date: Mapped[date | None] = mapped_column(Date)
+    recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    expected_prior_version: Mapped[int | None] = mapped_column(Integer)
+    actor_placeholder: Mapped[str | None] = mapped_column(String(200))
+    reason: Mapped[str | None] = mapped_column(String(1000))
+    evidence_reference: Mapped[str | None] = mapped_column(String(500))
+    evidence_sha256: Mapped[str | None] = mapped_column(String(64))
+    linked_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("allocation_history_events.id", ondelete="RESTRICT")
+    )
+    linked_allocation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("invoice_payment_allocations.id", ondelete="RESTRICT")
+    )
+    approval_id: Mapped[int | None] = mapped_column(
+        ForeignKey("allocation_period_correction_approvals.id", ondelete="RESTRICT")
+    )
+
+
 class PaymentReconciliationEvent(CompanyBase):
     """Immutable record of a fail-safe legacy payment repair at upgrade."""
 

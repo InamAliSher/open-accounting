@@ -365,6 +365,627 @@ def test_wrong_named_indexes_and_missing_ordinary_index_are_repaired(tmp_path):
     assert report.is_clean, report.format()
 
 
+def _allocation_history_engine(tmp_path, name="allocation-history.db"):
+    engine = _engine(tmp_path / name)
+    run_company_migrations(engine)
+    with engine.begin() as conn:
+        _seed_ap_credit_note(conn)
+        conn.execute(
+            text(
+                "INSERT INTO bank_accounts (id, name, opening_balance, is_active) "
+                "VALUES (1, 'Synthetic allocation bank', 0, 1)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO bank_transactions "
+                "(id, bank_account_id, direction, amount, occurred_at, gst_amount, "
+                "tax_code, unapplied_amount) "
+                "VALUES (1, 1, 'out', 20, '2026-10-01', 0, 'none', 0), "
+                "(2, 1, 'out', 1, '2026-10-01', 0, 'none', 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO invoice_payment_allocations "
+                "(id, bank_transaction_id, invoice_id, amount, gst_amount) "
+                "VALUES (1, 1, 1, 10, 1)"
+            )
+        )
+    return engine
+
+
+def _insert_allocation_snapshot(
+    conn, *, gross_cents=1000, gst_cents=100, components=None
+):
+    snapshot_id = conn.execute(
+        text(
+            "INSERT INTO allocation_history_snapshots "
+            "(source_kind, invoice_id, gross_cents, gst_cents, created_at) "
+            "VALUES ('bill', 1, :gross_cents, :gst_cents, '2026-10-02 09:00:00') "
+            "RETURNING id"
+        ),
+        {"gross_cents": gross_cents, "gst_cents": gst_cents},
+    ).scalar_one()
+    for tax_code, component_gross, component_gst in (
+        [("standard", gross_cents, gst_cents)] if components is None else components
+    ):
+        conn.execute(
+            text(
+                "INSERT INTO allocation_history_tax_components "
+                "(snapshot_id, tax_code, gross_cents, gst_cents) "
+                "VALUES (:snapshot_id, :tax_code, :gross_cents, :gst_cents)"
+            ),
+            {
+                "snapshot_id": snapshot_id,
+                "tax_code": tax_code,
+                "gross_cents": component_gross,
+                "gst_cents": component_gst,
+            },
+        )
+    if components is None:
+        _finalize_allocation_snapshot(conn, snapshot_id, 1, gross_cents, gst_cents)
+    return snapshot_id
+
+
+def _finalize_allocation_snapshot(conn, snapshot_id, component_count, gross_cents, gst_cents):
+    return conn.execute(
+        text(
+            "INSERT INTO allocation_history_finalizations "
+            "(snapshot_id, component_count, gross_cents, gst_cents, finalized_at) "
+            "VALUES (:snapshot_id, :component_count, :gross_cents, :gst_cents, "
+            "'2026-10-02 09:01:00')"
+        ),
+        {
+            "snapshot_id": snapshot_id,
+            "component_count": component_count,
+            "gross_cents": gross_cents,
+            "gst_cents": gst_cents,
+        },
+    )
+
+
+def _insert_allocation_history_event(
+    conn,
+    snapshot_id,
+    *,
+    operation="allocation_correction",
+    version=1,
+    expected_prior_version=0,
+    linked_event_id=None,
+    linked_allocation_id=1,
+    idempotency_key="allocation-correction-1",
+    effective_date="2026-10-02",
+    recorded_at="2026-10-02 09:02:00",
+    evidence_reference="synthetic://allocation-evidence",
+    evidence_sha256=None,
+    reason="Synthetic correction reason",
+    approval_id=None,
+    bank_transaction_id=1,
+    allocation_id=1,
+):
+    return conn.execute(
+        text(
+            "INSERT INTO allocation_history_events "
+            "(operation, bank_transaction_id, allocation_id, snapshot_id, version, "
+            "effective_date, recorded_at, idempotency_key, expected_prior_version, "
+            "actor_placeholder, reason, evidence_reference, evidence_sha256, "
+            "linked_event_id, linked_allocation_id, approval_id) "
+            "VALUES (:operation, :bank_transaction_id, :allocation_id, :snapshot_id, "
+            ":version, :effective_date, :recorded_at, :idempotency_key, :expected_prior_version, "
+            "'synthetic-actor', :reason, :evidence_reference, :evidence_sha256, "
+            ":linked_event_id, :linked_allocation_id, :approval_id) RETURNING id"
+        ),
+        {
+            "operation": operation,
+            "bank_transaction_id": bank_transaction_id,
+            "allocation_id": allocation_id,
+            "snapshot_id": snapshot_id,
+            "version": version,
+            "effective_date": effective_date,
+            "recorded_at": recorded_at,
+            "idempotency_key": idempotency_key,
+            "expected_prior_version": expected_prior_version,
+            "reason": reason,
+            "evidence_reference": evidence_reference,
+            "evidence_sha256": evidence_sha256,
+            "linked_event_id": linked_event_id,
+            "linked_allocation_id": linked_allocation_id,
+            "approval_id": approval_id,
+        },
+    ).scalar_one()
+
+
+def test_allocation_history_evidence_legacy_unknown_and_versions_fail_closed(tmp_path):
+    engine = _allocation_history_engine(tmp_path)
+    with engine.begin() as conn:
+        snapshot_id = _insert_allocation_snapshot(conn)
+        for evidence_reference, evidence_sha256, reason in (
+            (None, None, "Synthetic correction reason"),
+            (" \t ", None, "Synthetic correction reason"),
+            ("synthetic://evidence", "not-a-sha256", "Synthetic correction reason"),
+            ("synthetic://evidence", None, " \t "),
+        ):
+            with pytest.raises(Exception):
+                _insert_allocation_history_event(
+                    conn,
+                    snapshot_id,
+                    idempotency_key=f"invalid-{evidence_reference}-{evidence_sha256}-{reason}",
+                    evidence_reference=evidence_reference,
+                    evidence_sha256=evidence_sha256,
+                    reason=reason,
+                )
+
+        with pytest.raises(Exception, match="Invalid allocation history event"):
+            _insert_allocation_history_event(
+                conn,
+                snapshot_id,
+                idempotency_key="invalid-recorded-at",
+                recorded_at="not a timestamp",
+            )
+
+        first_id = _insert_allocation_history_event(
+            conn, snapshot_id, evidence_sha256="a" * 64
+        )
+        with pytest.raises(Exception, match="Invalid allocation history event|append-only"):
+            _insert_allocation_history_event(
+                conn,
+                snapshot_id,
+                version=2,
+                expected_prior_version=1,
+                idempotency_key="stale-allocation-version",
+            )
+        with pytest.raises(Exception):
+            _insert_allocation_history_event(conn, snapshot_id)
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO allocation_history_events "
+                    "(id, operation, bank_transaction_id) "
+                    "VALUES (1, 'legacy_history_unknown', 1)"
+                )
+            )
+
+        # Unknown legacy state has no invented allocation, date, actor, reason,
+        # evidence, idempotency key, or version, and may occur only once per txn.
+        conn.execute(
+            text(
+                "INSERT INTO allocation_history_events (operation, bank_transaction_id) "
+                "VALUES ('legacy_history_unknown', 2)"
+            )
+        )
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT INTO allocation_history_events "
+                    "(operation, bank_transaction_id, evidence_reference) "
+                    "VALUES ('legacy_history_unknown', 1, 'synthetic://invented')"
+                )
+            )
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT INTO allocation_history_events "
+                    "(operation, bank_transaction_id) "
+                    "VALUES ('legacy_history_unknown', 2)"
+                )
+            )
+        unknown = conn.execute(
+            text(
+                "SELECT allocation_id, version, effective_date, recorded_at, "
+                "idempotency_key, expected_prior_version, actor_placeholder, reason, "
+                "evidence_reference, evidence_sha256, snapshot_id "
+                "FROM allocation_history_events WHERE operation='legacy_history_unknown'"
+            )
+        ).one()
+        assert unknown == (None,) * 11
+        assert first_id == 1
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM bas_period_lodgment_markers")
+        ).scalar_one() == 0
+    engine.dispose()
+
+
+def test_allocation_snapshots_require_exact_integer_cent_finalization(tmp_path):
+    engine = _allocation_history_engine(tmp_path)
+    with engine.begin() as conn:
+        snapshot_id = conn.execute(
+            text(
+                "INSERT INTO allocation_history_snapshots "
+                "(source_kind, invoice_id, gross_cents, gst_cents, created_at) "
+                "VALUES ('bill', 1, 1000, 100, '2026-10-02 09:00:00') RETURNING id"
+            )
+        ).scalar_one()
+        with pytest.raises(Exception, match="does not reconcile"):
+              _finalize_allocation_snapshot(conn, snapshot_id, 1, 1000, 1000)
+        conn.execute(
+            text(
+                "INSERT INTO allocation_history_tax_components "
+                "(snapshot_id, tax_code, gross_cents, gst_cents) "
+                "VALUES (:id, 'standard', 400, 40)"
+            ),
+            {"id": snapshot_id},
+        )
+        with pytest.raises(Exception, match="does not reconcile"):
+            _finalize_allocation_snapshot(conn, snapshot_id, 1, 1000, 100)
+        conn.execute(
+            text(
+                "INSERT INTO allocation_history_tax_components "
+                "(snapshot_id, tax_code, gross_cents, gst_cents) "
+                "VALUES (:id, 'gst_free', 600, 60)"
+            ),
+            {"id": snapshot_id},
+        )
+        _finalize_allocation_snapshot(conn, snapshot_id, 2, 1000, 100)
+        with pytest.raises(Exception, match="append-only"):
+            _finalize_allocation_snapshot(conn, snapshot_id, 2, 1000, 100)
+        with pytest.raises(Exception, match="finalized"):
+            conn.execute(
+                text(
+                    "INSERT INTO allocation_history_tax_components "
+                    "(snapshot_id, tax_code, gross_cents, gst_cents) "
+                    "VALUES (:id, 'capital', 1, 0)"
+                ),
+                {"id": snapshot_id},
+            )
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO allocation_history_snapshots "
+                    "(id, source_kind, invoice_id, gross_cents, gst_cents, created_at) "
+                    "VALUES (:id, 'bill', 1, 1000, 100, '2026-10-02 09:00:00')"
+                ),
+                {"id": snapshot_id},
+            )
+        component_id = conn.execute(
+            text(
+                "SELECT id FROM allocation_history_tax_components "
+                "WHERE snapshot_id=:id ORDER BY id LIMIT 1"
+            ),
+            {"id": snapshot_id},
+        ).scalar_one()
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO allocation_history_tax_components "
+                    "(id, snapshot_id, tax_code, gross_cents, gst_cents) "
+                    "VALUES (:id, :snapshot_id, 'standard', 400, 40)"
+                ),
+                {"id": component_id, "snapshot_id": snapshot_id},
+            )
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO allocation_history_finalizations "
+                    "(snapshot_id, component_count, gross_cents, gst_cents, finalized_at) "
+                    "VALUES (:id, 2, 1000, 100, '2026-10-02 09:01:00')"
+                ),
+                {"id": snapshot_id},
+            )
+        incomplete_snapshot = conn.execute(
+            text(
+                "INSERT INTO allocation_history_snapshots "
+                "(source_kind, invoice_id, gross_cents, gst_cents, created_at) "
+                "VALUES ('bill', 1, 1000, 100, '2026-10-02 10:00:00') RETURNING id"
+            )
+        ).scalar_one()
+        with pytest.raises(Exception, match="Invalid allocation history event"):
+            _insert_allocation_history_event(
+                conn,
+                incomplete_snapshot,
+                idempotency_key="incomplete-snapshot-cannot-be-used",
+            )
+
+        for table, key in (
+            ("allocation_history_snapshots", "id"),
+            ("allocation_history_tax_components", "id"),
+            ("allocation_history_finalizations", "snapshot_id"),
+        ):
+            with pytest.raises(Exception, match="append-only"):
+                conn.execute(text(f"UPDATE {table} SET {key}={key}"))
+            with pytest.raises(Exception, match="append-only"):
+                conn.execute(text(f"DELETE FROM {table}"))
+    engine.dispose()
+
+
+def test_allocation_corrections_reversals_and_period_approvals(tmp_path):
+    engine = _allocation_history_engine(tmp_path)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO bas_period_lodgment_markers "
+                "(period_id, period_start, period_end, lodged_status, internally_asserted_at, "
+                "actor_placeholder, evidence_reference, evidence_scope) "
+                "VALUES ('synthetic-2026-10', '2026-10-01', '2026-10-02', 1, "
+                "'2026-11-01 09:00:00', 'synthetic-actor', 'synthetic://internal-lodgment-assertion', "
+                "'internal_assertion_not_ato_lodgment_evidence')"
+            )
+        )
+        with pytest.raises(Exception, match="Invalid internal BAS period marker"):
+            conn.execute(
+                text(
+                    "INSERT INTO bas_period_lodgment_markers "
+                    "(period_id, period_start, period_end, lodged_status, internally_asserted_at, "
+                    "actor_placeholder, evidence_reference, evidence_scope) "
+                    "VALUES ('blank-evidence', '2026-10-01', '2026-10-31', 1, "
+                    "'2026-11-01', 'synthetic', ' \t ', "
+                    "'internal_assertion_not_ato_lodgment_evidence')"
+                )
+            )
+        snapshot_id = _insert_allocation_snapshot(conn)
+        with pytest.raises(Exception, match="Invalid allocation history event"):
+            _insert_allocation_history_event(
+                conn, snapshot_id, idempotency_key="needs-period-approval"
+            )
+
+        approval_id = conn.execute(
+            text(
+                "INSERT INTO allocation_period_correction_approvals "
+                "(period_marker_id, allocation_id, approved_idempotency_key, actor_placeholder, "
+                "reason, evidence_reference, recorded_at) "
+                "VALUES (1, 1, 'needs-period-approval', 'synthetic-approver', "
+                "'Synthetic approval reason', 'synthetic://approval', '2026-10-02 08:00:00') "
+                "RETURNING id"
+            )
+        ).scalar_one()
+        first_id = _insert_allocation_history_event(
+            conn, snapshot_id, idempotency_key="needs-period-approval", approval_id=approval_id
+        )
+        duplicate_key_snapshot = _insert_allocation_snapshot(conn)
+        with pytest.raises(Exception):
+            _insert_allocation_history_event(
+                conn,
+                duplicate_key_snapshot,
+                version=2,
+                expected_prior_version=1,
+                linked_event_id=first_id,
+                linked_allocation_id=None,
+                idempotency_key="needs-period-approval",
+                effective_date="2026-10-03",
+            )
+        second_snapshot = _insert_allocation_snapshot(conn)
+        second_id = _insert_allocation_history_event(
+            conn,
+            second_snapshot,
+            version=2,
+            expected_prior_version=1,
+            linked_event_id=first_id,
+            linked_allocation_id=None,
+            idempotency_key="allocation-correction-2",
+            effective_date="2026-10-03",
+        )
+        with pytest.raises(Exception, match="Invalid allocation history event|components do not match"):
+            oversized_snapshot = _insert_allocation_snapshot(
+                conn, gross_cents=2000, gst_cents=200
+            )
+            _insert_allocation_history_event(
+                conn,
+                oversized_snapshot,
+                operation="allocation_reversal",
+                version=3,
+                expected_prior_version=2,
+                linked_event_id=second_id,
+                linked_allocation_id=None,
+                idempotency_key="over-reversal",
+                effective_date="2026-10-04",
+            )
+
+        mismatched_components_snapshot = _insert_allocation_snapshot(
+            conn,
+            components=[("standard", 900, 90), ("capital", 100, 10)],
+        )
+        with pytest.raises(Exception, match="components do not match"):
+            _insert_allocation_history_event(
+                conn,
+                mismatched_components_snapshot,
+                operation="allocation_reversal",
+                version=3,
+                expected_prior_version=2,
+                linked_event_id=second_id,
+                linked_allocation_id=None,
+                idempotency_key="mismatched-reversal-components",
+                effective_date="2026-10-04",
+            )
+
+        reversal_snapshot = _insert_allocation_snapshot(conn)
+        reversal_id = _insert_allocation_history_event(
+            conn,
+            reversal_snapshot,
+            operation="allocation_reversal",
+            version=3,
+            expected_prior_version=2,
+            linked_event_id=second_id,
+            linked_allocation_id=None,
+            idempotency_key="allocation-reversal-1",
+            effective_date="2026-10-05",
+        )
+        duplicate_reversal_snapshot = _insert_allocation_snapshot(conn)
+        with pytest.raises(Exception, match="Invalid allocation history event|append-only"):
+            _insert_allocation_history_event(
+                conn,
+                duplicate_reversal_snapshot,
+                operation="allocation_reversal",
+                version=4,
+                expected_prior_version=3,
+                linked_event_id=reversal_id,
+                linked_allocation_id=None,
+                idempotency_key="allocation-reversal-duplicate",
+                effective_date="2026-10-06",
+            )
+        with pytest.raises(Exception, match="append-only"):
+            conn.execute(text("UPDATE bas_period_lodgment_markers SET period_end=period_end"))
+        with pytest.raises(Exception, match="append-only"):
+            conn.execute(text("DELETE FROM allocation_period_correction_approvals"))
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO bas_period_lodgment_markers "
+                    "(id, period_id, period_start, period_end, lodged_status, "
+                    "internally_asserted_at, actor_placeholder, evidence_reference, evidence_scope) "
+                    "VALUES (1, 'synthetic-2026-10', '2026-10-01', '2026-10-02', 1, "
+                    "'2026-11-01 09:00:00', 'synthetic-actor', "
+                    "'synthetic://internal-lodgment-assertion', "
+                    "'internal_assertion_not_ato_lodgment_evidence')"
+                )
+            )
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO allocation_period_correction_approvals "
+                    "(id, period_marker_id, allocation_id, approved_idempotency_key, "
+                    "actor_placeholder, reason, evidence_reference, recorded_at) "
+                    "VALUES (1, 1, 1, 'needs-period-approval', 'synthetic-approver', "
+                    "'Synthetic approval reason', 'synthetic://approval', '2026-10-02 08:00:00')"
+                )
+            )
+    engine.dispose()
+
+
+def test_allocation_reversal_rejects_missing_and_cross_transaction_targets(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "allocation-cross-transaction.db")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO invoice_payment_allocations "
+                "(id, bank_transaction_id, invoice_id, amount, gst_amount) "
+                "VALUES (2, 2, 1, 10, 1)"
+            )
+        )
+        conn.execute(text("UPDATE bank_transactions SET amount=20 WHERE id=2"))
+        first_snapshot = _insert_allocation_snapshot(conn)
+        first_event_id = _insert_allocation_history_event(
+            conn, first_snapshot, idempotency_key="txn-one-version-one"
+        )
+        second_snapshot = _insert_allocation_snapshot(
+            conn, gross_cents=1000, gst_cents=100
+        )
+        second_event_id = _insert_allocation_history_event(
+            conn,
+            second_snapshot,
+            bank_transaction_id=2,
+            allocation_id=2,
+            linked_allocation_id=2,
+            idempotency_key="txn-two-version-one",
+        )
+        reversal_snapshot = _insert_allocation_snapshot(
+            conn, gross_cents=1000, gst_cents=100
+        )
+        with pytest.raises(Exception, match="Invalid allocation history event"):
+            _insert_allocation_history_event(
+                conn,
+                reversal_snapshot,
+                operation="allocation_reversal",
+                version=2,
+                expected_prior_version=1,
+                linked_event_id=first_event_id,
+                linked_allocation_id=None,
+                bank_transaction_id=2,
+                allocation_id=2,
+                idempotency_key="cross-transaction-reversal",
+                effective_date="2026-10-03",
+            )
+        with pytest.raises(Exception, match="Invalid allocation history event"):
+            _insert_allocation_history_event(
+                conn,
+                reversal_snapshot,
+                operation="allocation_reversal",
+                version=2,
+                expected_prior_version=1,
+                linked_event_id=999,
+                linked_allocation_id=None,
+                bank_transaction_id=2,
+                allocation_id=2,
+                idempotency_key="missing-reversal-target",
+                effective_date="2026-10-03",
+            )
+        assert second_event_id != first_event_id
+    engine.dispose()
+
+
+def test_allocation_history_protects_cash_identity_and_keeps_other_accounting_separate(tmp_path):
+    engine = _allocation_history_engine(tmp_path)
+    with engine.begin() as conn:
+        snapshot_id = _insert_allocation_snapshot(conn)
+        _insert_allocation_history_event(conn, snapshot_id)
+        cash_before = conn.execute(
+            text("SELECT amount, occurred_at FROM bank_transactions WHERE id=1")
+        ).one()
+        paid_before = conn.execute(
+            text("SELECT paid_amount FROM invoices WHERE id=1")
+        ).scalar_one()
+        with pytest.raises(Exception, match="Bank transaction has allocation history"):
+            conn.execute(text("DELETE FROM bank_transactions WHERE id=1"))
+        with pytest.raises(Exception, match="identity is protected"):
+            conn.execute(
+                text("UPDATE bank_transactions SET occurred_at='2026-10-02' WHERE id=1")
+            )
+        with pytest.raises(Exception, match="identity is protected"):
+            conn.execute(text("UPDATE bank_transactions SET id=10 WHERE id=1"))
+        with pytest.raises(Exception, match="Bank transaction has allocation history"):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO bank_transactions "
+                    "(id, bank_account_id, direction, amount, occurred_at, gst_amount, "
+                    "tax_code, unapplied_amount) "
+                    "VALUES (1, 1, 'out', 99, '2026-10-09', 0, 'none', 0)"
+                )
+            )
+        conn.execute(text("DELETE FROM bank_transactions WHERE id=2"))
+        conn.execute(
+            text(
+                "INSERT INTO bank_transactions "
+                "(id, bank_account_id, direction, amount, occurred_at, gst_amount, "
+                "tax_code, unapplied_amount) "
+                "VALUES (2, 1, 'out', 1, '2026-10-01', 0, 'none', 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT OR REPLACE INTO bank_transactions "
+                "(id, bank_account_id, direction, amount, occurred_at, gst_amount, "
+                "tax_code, unapplied_amount) "
+                "VALUES (2, 1, 'out', 2, '2026-10-01', 0, 'none', 0)"
+            )
+        )
+        _insert_journal_entry(conn, "credit_note_ap", 42)
+        journal_id = conn.execute(
+            text(
+                "SELECT id FROM journal_entries WHERE source_type='credit_note_ap' "
+                "AND source_id=42"
+            )
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO credit_note_applications "
+                "(credit_note_id, invoice_id, amount, application_date, status) "
+                "VALUES (42, 1, 1, '2026-10-01', 'active')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO credit_note_refunds "
+                "(credit_note_id, bank_transaction_id, journal_entry_id, amount, refund_date, status) "
+                "VALUES (42, 2, :journal_id, 1, '2026-10-01', 'active')"
+            ),
+            {"journal_id": journal_id},
+        )
+        assert conn.execute(
+            text("SELECT amount, occurred_at FROM bank_transactions WHERE id=1")
+        ).one() == cash_before
+        assert conn.execute(
+            text("SELECT paid_amount FROM invoices WHERE id=1")
+        ).scalar_one() == paid_before == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM invoice_payment_allocations")
+        ).scalar_one() == 1
+        for table in ("allocation_history_events", "allocation_history_snapshots"):
+            with pytest.raises(Exception, match="append-only"):
+                conn.execute(text(f"UPDATE {table} SET id=id"))
+            with pytest.raises(Exception, match="append-only"):
+                conn.execute(text(f"DELETE FROM {table}"))
+    engine.dispose()
+
+
 def test_gst_adjustment_schema_guards_and_reversal_index(tmp_path):
     engine = _engine(tmp_path / "gst-adjustment-schema.db")
     run_company_migrations(engine)
