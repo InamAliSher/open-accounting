@@ -27,6 +27,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator
 
@@ -790,6 +791,47 @@ def allocation_baseline_integrity_hash(rows) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+_ALLOCATION_BASELINE_MAX_CENTS = (1 << 63) - 1
+
+
+def allocation_baseline_money_to_cents(value) -> int | None:
+    """Return exact nonnegative SQLite-safe cents, or NULL for invalid money."""
+    if value is None:
+        return None
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+
+    sign, digits, exponent = amount.as_tuple()
+    del sign
+    if not any(digits):
+        return 0
+
+    scaled_exponent = exponent + 2
+    digit_text = "".join(str(digit) for digit in digits)
+    if scaled_exponent >= 0:
+        if len(digit_text) + scaled_exponent > 19:
+            return None
+        cents = int(digit_text) * (10 ** scaled_exponent)
+    else:
+        discarded_digits = -scaled_exponent
+        if discarded_digits >= len(digit_text):
+            return None
+        if any(digit != "0" for digit in digits[-discarded_digits:]):
+            return None
+        retained_digits = digits[:-discarded_digits]
+        if len(retained_digits) > 19:
+            return None
+        cents = int("".join(str(digit) for digit in retained_digits))
+
+    if cents > _ALLOCATION_BASELINE_MAX_CENTS:
+        return None
+    return cents
+
+
 class _AllocationBaselineHash:
     def __init__(self):
         self.rows = []
@@ -804,6 +846,12 @@ class _AllocationBaselineHash:
 def _register_allocation_baseline_hash(dbapi_connection, *_):
     dbapi_connection.create_aggregate(
         "allocation_baseline_sha256", 1, _AllocationBaselineHash
+    )
+    dbapi_connection.create_function(
+        "allocation_baseline_cents",
+        1,
+        allocation_baseline_money_to_cents,
+        deterministic=True,
     )
 
 
@@ -1074,12 +1122,8 @@ def _ensure_allocation_history_guards(conn) -> bool:
                                  WHEN 'AR' THEN 'invoice' WHEN 'AP' THEN 'bill' ELSE NULL END
                         OR b.allocated_gross_source IS NOT CAST(a.amount AS TEXT)
                         OR b.allocated_gst_source IS NOT CAST(a.gst_amount AS TEXT)
-                        OR b.allocated_gross_cents IS NOT CASE
-                                 WHEN a.amount*100=ROUND(a.amount*100)
-                                 THEN CAST(ROUND(a.amount*100) AS INTEGER) ELSE NULL END
-                        OR b.allocated_gst_cents IS NOT CASE
-                                 WHEN a.gst_amount*100=ROUND(a.gst_amount*100)
-                                 THEN CAST(ROUND(a.gst_amount*100) AS INTEGER) ELSE NULL END
+                        OR b.allocated_gross_cents IS NOT allocation_baseline_cents(a.amount)
+                        OR b.allocated_gst_cents IS NOT allocation_baseline_cents(a.gst_amount)
                         OR b.allocation_created_at IS NOT CAST(a.created_at AS TEXT))
         ) OR EXISTS (
                 SELECT 1 FROM allocation_history_baseline_bindings b
@@ -1100,12 +1144,8 @@ def _ensure_allocation_history_guards(conn) -> bool:
                         OR c.tax_code IS NOT tb.tax_code
                         OR tb.component_gross_source IS NOT CAST(c.gross_amount AS TEXT)
                         OR tb.component_gst_source IS NOT CAST(c.gst_amount AS TEXT)
-                        OR tb.component_gross_cents IS NOT CASE
-                                 WHEN c.gross_amount*100=ROUND(c.gross_amount*100)
-                                 THEN CAST(ROUND(c.gross_amount*100) AS INTEGER) ELSE NULL END
-                        OR tb.component_gst_cents IS NOT CASE
-                                 WHEN c.gst_amount*100=ROUND(c.gst_amount*100)
-                                 THEN CAST(ROUND(c.gst_amount*100) AS INTEGER) ELSE NULL END)
+                        OR tb.component_gross_cents IS NOT allocation_baseline_cents(c.gross_amount)
+                        OR tb.component_gst_cents IS NOT allocation_baseline_cents(c.gst_amount))
         ) OR EXISTS (
                 SELECT 1 FROM allocation_history_baseline_tax_bindings tb
                 JOIN allocation_history_baseline_bindings ab
@@ -1155,8 +1195,9 @@ def _ensure_allocation_history_guards(conn) -> bool:
                         SELECT 1 FROM allocation_history_baseline_bindings b
                         JOIN invoice_payment_allocations a ON a.id=b.allocation_row_id
                         WHERE b.baseline_event_id=NEW.baseline_event_id AND (
-                            a.amount<=0 OR a.amount*100!=ROUND(a.amount*100)
+                            a.amount<=0 OR allocation_baseline_cents(a.amount) IS NULL
                             OR a.gst_amount<0 OR a.gst_amount>a.amount
+                            OR allocation_baseline_cents(a.gst_amount) IS NULL
                             OR b.allocated_gross_cents IS NULL OR b.allocated_gst_cents IS NULL
                             OR EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings tb
                                 WHERE tb.allocation_binding_id=b.id AND (

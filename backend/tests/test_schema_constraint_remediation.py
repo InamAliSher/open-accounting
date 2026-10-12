@@ -15,7 +15,10 @@ from sqlalchemy.orm import Session
 from app.db import migrations
 from app.db.base import CompanyBase
 from app.db.errors import DataRecoveryRequiredError
-from app.db.migrations import allocation_baseline_integrity_hash, run_company_migrations
+from app.db.migrations import (
+    allocation_baseline_integrity_hash,
+    run_company_migrations,
+)
 from app.db.schema_sync import (
     MIGRATION_INDEX_SIGNATURES,
     SQLiteIndexSignature,
@@ -434,24 +437,16 @@ def _start_legacy_baseline(
     allocation = conn.execute(
         text(
             "SELECT a.id, a.bank_transaction_id, a.invoice_id, "
-            "i.direction, CAST(a.amount AS TEXT), a.amount*100, "
-            "CAST(a.gst_amount AS TEXT), a.gst_amount*100, "
+            "i.direction, CAST(a.amount AS TEXT), allocation_baseline_cents(a.amount), "
+            "CAST(a.gst_amount AS TEXT), allocation_baseline_cents(a.gst_amount), "
             "CAST(a.created_at AS TEXT) "
             "FROM invoice_payment_allocations a JOIN invoices i ON i.id=a.invoice_id "
             "WHERE a.id=1"
         )
     ).one()
     source_kind = "invoice" if allocation.direction == "AR" else "bill"
-    gross_cents = (
-        int(round(allocation[5]))
-        if allocation[5] == round(allocation[5])
-        else None
-    )
-    gst_cents = (
-        int(round(allocation[7]))
-        if allocation[7] == round(allocation[7])
-        else None
-    )
+    gross_cents = allocation[5]
+    gst_cents = allocation[7]
     binding_id = conn.execute(
         text(
             "INSERT INTO allocation_history_baseline_bindings "
@@ -479,21 +474,14 @@ def _start_legacy_baseline(
         component = conn.execute(
             text(
                 "SELECT id, allocation_id, tax_code, CAST(gross_amount AS TEXT), "
-                "gross_amount*100, CAST(gst_amount AS TEXT), gst_amount*100 "
+                "allocation_baseline_cents(gross_amount), CAST(gst_amount AS TEXT), "
+                "allocation_baseline_cents(gst_amount) "
                 "FROM invoice_payment_tax_components WHERE id=:id"
             ),
             {"id": component_id},
         ).one()
-        component_gross_cents = (
-            int(round(component[4]))
-            if component[4] == round(component[4])
-            else None
-        )
-        component_gst_cents = (
-            int(round(component[6]))
-            if component[6] == round(component[6])
-            else None
-        )
+        component_gross_cents = component[4]
+        component_gst_cents = component[6]
         conn.execute(
             text(
                 "INSERT INTO allocation_history_baseline_tax_bindings "
@@ -951,6 +939,53 @@ def test_legacy_allocation_baseline_complete_is_cash_neutral(tmp_path):
     engine.dispose()
 
 
+def test_legacy_baseline_float_trigger_is_repaired_idempotently(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-trigger-repair.db")
+    trigger_name = "trg_allocation_history_baseline_finalizations_domain"
+    legacy_trigger_sql = f'''CREATE TRIGGER "{trigger_name}"
+        BEFORE INSERT ON "allocation_history_baseline_finalizations"
+        WHEN (SELECT amount*100=ROUND(amount*100)
+              FROM invoice_payment_allocations WHERE id=1)
+        BEGIN SELECT RAISE(ABORT,
+            'Legacy allocation baseline does not match observed rows'); END'''
+    with engine.begin() as conn:
+        conn.execute(text(f'DROP TRIGGER "{trigger_name}"'))
+        conn.exec_driver_sql(legacy_trigger_sql)
+
+    run_company_migrations(engine)
+    with engine.connect() as conn:
+        repaired_sql = conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=:name"),
+            {"name": trigger_name},
+        ).scalar_one()
+        assert "allocation_baseline_cents" in repaired_sql
+        assert "amount*100" not in repaired_sql
+        assert "Legacy allocation baseline does not match observed rows" in repaired_sql
+
+    run_company_migrations(engine)
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=:name"),
+            {"name": trigger_name},
+        ).scalar_one() == repaired_sql
+
+    quoted_literal_variant = repaired_sql.replace(
+        "Legacy allocation baseline does not match observed rows",
+        "legacy allocation baseline does not match observed rows",
+    )
+    assert quoted_literal_variant != repaired_sql
+    with engine.begin() as conn:
+        conn.execute(text(f'DROP TRIGGER "{trigger_name}"'))
+        conn.exec_driver_sql(quoted_literal_variant)
+    run_company_migrations(engine)
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=:name"),
+            {"name": trigger_name},
+        ).scalar_one() == repaired_sql
+    engine.dispose()
+
+
 def test_legacy_allocation_baseline_missing_components_is_incomplete(tmp_path):
     engine = _allocation_history_engine(tmp_path, "legacy-baseline-missing-component.db")
     with engine.begin() as conn:
@@ -1025,7 +1060,7 @@ def test_legacy_baseline_preserves_negative_amount_as_incomplete(tmp_path):
             {"id": event_id},
         ).one() == (
             "incomplete",
-            -100,
+            0,
             '["invalid_amount","unreconciled_totals"]',
         )
     engine.dispose()
