@@ -15,6 +15,7 @@ from sqlalchemy import create_engine, event, text
 
 from app.db.base import CompanyBase
 from app.db import migrations
+from app.db.errors import DataRecoveryRequiredError
 import app.models.company  # noqa: F401
 
 
@@ -1185,6 +1186,13 @@ def test_allocation_history_migration_repairs_owned_guards_and_indexes_idempoten
                 "ON allocation_history_events (bank_transaction_id)"
             )
         )
+        conn.execute(text('DROP INDEX "uq_allocation_history_baseline_allocation"'))
+        conn.execute(
+            text(
+                "CREATE INDEX uq_allocation_history_baseline_allocation "
+                "ON allocation_history_baseline_bindings (bank_transaction_id)"
+            )
+        )
         canonical = conn.execute(
             text(
                 "SELECT sql FROM sqlite_master WHERE type='trigger' "
@@ -1197,6 +1205,18 @@ def test_allocation_history_migration_repairs_owned_guards_and_indexes_idempoten
         assert altered_case != canonical
         conn.execute(text('DROP TRIGGER "trg_allocation_history_events_domain"'))
         conn.exec_driver_sql(altered_case)
+        conn.execute(
+            text(
+                'DROP TRIGGER "trg_allocation_history_baseline_finalizations_domain"'
+            )
+        )
+        conn.execute(
+            text(
+                'CREATE TRIGGER "trg_allocation_history_baseline_finalizations_domain" '
+                'BEFORE INSERT ON allocation_history_baseline_finalizations '
+                'BEGIN SELECT 1; END'
+            )
+        )
 
     repaired = migrations.run_company_migrations(engine)
     assert "schema:allocation_history" in repaired
@@ -1212,6 +1232,15 @@ def test_allocation_history_migration_repairs_owned_guards_and_indexes_idempoten
                 where="idempotency_key IS NOT NULL",
             ),
         )
+        assert migrations.sqlite_index_matches(
+            conn,
+            "allocation_history_baseline_bindings",
+            migrations.SQLiteIndexSignature(
+                "uq_allocation_history_baseline_allocation",
+                ("baseline_event_id", "allocation_row_id"),
+                unique=True,
+            ),
+        )
         canonical = conn.execute(
             text(
                 "SELECT sql FROM sqlite_master WHERE type='trigger' "
@@ -1221,6 +1250,14 @@ def test_allocation_history_migration_repairs_owned_guards_and_indexes_idempoten
         assert "'allocation_correction'" in canonical
         assert "'ALLOCATION_CORRECTION'" not in canonical
         assert "Invalid allocation history event" in canonical
+        baseline_finalization_sql = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_allocation_history_baseline_finalizations_domain'"
+            )
+        ).scalar_one()
+        assert "allocation_baseline_sha256" in baseline_finalization_sql
+        assert "SELECT 1; END" not in baseline_finalization_sql
         assert conn.execute(
             text("SELECT COUNT(*) FROM bas_period_lodgment_markers")
         ).scalar_one() == 0
@@ -1256,6 +1293,18 @@ def test_allocation_history_migration_repairs_empty_partial_table_by_table():
         conn.execute(
             text("INSERT INTO allocation_history_tax_components (id) VALUES (7)")
         )
+        conn.execute(
+            text("DROP TABLE allocation_history_baseline_tax_bindings")
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE allocation_history_baseline_tax_bindings "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO allocation_history_baseline_tax_bindings (id) VALUES (9)")
+        )
 
     repaired = migrations.run_company_migrations(engine)
     assert "schema:allocation_history" in repaired
@@ -1279,6 +1328,30 @@ def test_allocation_history_migration_repairs_empty_partial_table_by_table():
         assert conn.execute(
             text("SELECT COUNT(*) FROM bas_period_lodgment_markers")
         ).scalar_one() == 0
+        assert conn.execute(
+            text(
+                "SELECT id, allocation_binding_id, source_component_row_id, tax_code, "
+                "component_gross_cents, component_gross_source, component_gst_cents, "
+                "component_gst_source FROM allocation_history_baseline_tax_bindings"
+            )
+        ).one() == (9, None, None, None, None, None, None, None)
+    engine.dispose()
+
+
+def test_allocation_history_partial_binding_without_primary_key_fails_closed():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE allocation_history_baseline_bindings"))
+        conn.execute(
+            text(
+                "CREATE TABLE allocation_history_baseline_bindings "
+                "(baseline_event_id INTEGER)"
+            )
+        )
+    with pytest.raises(DataRecoveryRequiredError, match="primary key is missing"):
+        migrations.run_company_migrations(engine)
     engine.dispose()
 
 

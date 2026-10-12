@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import date
 from decimal import Decimal
@@ -11,9 +12,10 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.db import migrations
 from app.db.base import CompanyBase
 from app.db.errors import DataRecoveryRequiredError
-from app.db.migrations import run_company_migrations
+from app.db.migrations import allocation_baseline_integrity_hash, run_company_migrations
 from app.db.schema_sync import (
     MIGRATION_INDEX_SIGNATURES,
     SQLiteIndexSignature,
@@ -395,6 +397,211 @@ def _allocation_history_engine(tmp_path, name="allocation-history.db"):
     return engine
 
 
+def _start_legacy_baseline(
+    conn,
+    *,
+    component=True,
+    tax_code="standard",
+    allocation_gross=None,
+    component_gross=10,
+    component_gst=1,
+):
+    if allocation_gross is not None:
+        conn.execute(
+            text("UPDATE invoice_payment_allocations SET amount=:amount WHERE id=1"),
+            {"amount": allocation_gross},
+        )
+    event_id = conn.execute(
+        text(
+            "INSERT INTO allocation_history_events "
+            "(operation, bank_transaction_id) VALUES ('legacy_history_unknown', 1) "
+            "RETURNING id"
+        )
+    ).scalar_one()
+    component_ids = []
+    if component:
+        component_ids.append(
+            conn.execute(
+                text(
+                    "INSERT INTO invoice_payment_tax_components "
+                    "(allocation_id, tax_code, gross_amount, gst_amount) "
+                    "VALUES (1, :tax_code, :gross, :gst) RETURNING id"
+                ),
+                {"tax_code": tax_code, "gross": component_gross, "gst": component_gst},
+            ).scalar_one()
+        )
+
+    allocation = conn.execute(
+        text(
+            "SELECT a.id, a.bank_transaction_id, a.invoice_id, "
+            "i.direction, CAST(a.amount AS TEXT), a.amount*100, "
+            "CAST(a.gst_amount AS TEXT), a.gst_amount*100, "
+            "CAST(a.created_at AS TEXT) "
+            "FROM invoice_payment_allocations a JOIN invoices i ON i.id=a.invoice_id "
+            "WHERE a.id=1"
+        )
+    ).one()
+    source_kind = "invoice" if allocation.direction == "AR" else "bill"
+    gross_cents = (
+        int(round(allocation[5]))
+        if allocation[5] == round(allocation[5])
+        else None
+    )
+    gst_cents = (
+        int(round(allocation[7]))
+        if allocation[7] == round(allocation[7])
+        else None
+    )
+    binding_id = conn.execute(
+        text(
+            "INSERT INTO allocation_history_baseline_bindings "
+            "(baseline_event_id, bank_transaction_id, allocation_row_id, source_kind, "
+            "invoice_or_bill_id, allocated_gross_cents, allocated_gross_source, "
+            "allocated_gst_cents, allocated_gst_source, allocation_created_at) "
+            "VALUES (:event_id, :bank_id, :allocation_id, :source_kind, :document_id, "
+            ":gross_cents, :gross_source, :gst_cents, :gst_source, :created_at) "
+            "RETURNING id"
+        ),
+        {
+            "event_id": event_id,
+            "bank_id": allocation.bank_transaction_id,
+            "allocation_id": allocation.id,
+            "source_kind": source_kind,
+            "document_id": allocation.invoice_id,
+            "gross_cents": gross_cents,
+            "gross_source": allocation[4],
+            "gst_cents": gst_cents,
+            "gst_source": allocation[6],
+            "created_at": allocation[8],
+        },
+    ).scalar_one()
+    for component_id in component_ids:
+        component = conn.execute(
+            text(
+                "SELECT id, allocation_id, tax_code, CAST(gross_amount AS TEXT), "
+                "gross_amount*100, CAST(gst_amount AS TEXT), gst_amount*100 "
+                "FROM invoice_payment_tax_components WHERE id=:id"
+            ),
+            {"id": component_id},
+        ).one()
+        component_gross_cents = (
+            int(round(component[4]))
+            if component[4] == round(component[4])
+            else None
+        )
+        component_gst_cents = (
+            int(round(component[6]))
+            if component[6] == round(component[6])
+            else None
+        )
+        conn.execute(
+            text(
+                "INSERT INTO allocation_history_baseline_tax_bindings "
+                "(allocation_binding_id, source_component_row_id, tax_code, "
+                "component_gross_cents, component_gross_source, component_gst_cents, "
+                "component_gst_source) VALUES (:binding_id, :row_id, :tax_code, "
+                ":gross_cents, :gross_source, :gst_cents, :gst_source)"
+            ),
+            {
+                "binding_id": binding_id,
+                "row_id": component.id,
+                "tax_code": component.tax_code,
+                "gross_cents": component_gross_cents,
+                "gross_source": component[3],
+                "gst_cents": component_gst_cents,
+                "gst_source": component[5],
+            },
+        )
+    return event_id
+
+
+def _add_second_ap_invoice(conn):
+    conn.execute(
+        text(
+            "INSERT INTO invoices (id, direction, contact_id, invoice_number, issue_date, "
+            "currency, subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+            "source, created_at, updated_at) VALUES "
+            "(2, 'AP', 1, 'INV-AP-SYNTHETIC-2', '2026-09-03', 'AUD', "
+            "1, 0, 1, 1, 'draft', 0, 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+    )
+
+
+def _finalize_legacy_baseline(
+    conn,
+    event_id,
+    *,
+    status="complete",
+    reasons=(),
+    payment_date="2026-10-01",
+    integrity_hash=None,
+):
+    observed_at = "2026-10-02 09:00:00"
+    bank_transaction_id = conn.execute(
+        text("SELECT bank_transaction_id FROM allocation_history_events WHERE id=:id"),
+        {"id": event_id},
+    ).scalar_one()
+    allocations = conn.execute(
+        text(
+            "SELECT id, baseline_event_id, bank_transaction_id, allocation_row_id, "
+            "source_kind, invoice_or_bill_id, allocated_gross_cents, "
+            "allocated_gross_source, allocated_gst_cents, allocated_gst_source, "
+            "allocation_created_at FROM allocation_history_baseline_bindings "
+            "WHERE baseline_event_id=:id"
+        ),
+        {"id": event_id},
+    ).all()
+    components = conn.execute(
+        text(
+            "SELECT tb.id, tb.allocation_binding_id, tb.source_component_row_id, "
+            "tb.tax_code, tb.component_gross_cents, tb.component_gross_source, "
+            "tb.component_gst_cents, tb.component_gst_source "
+            "FROM allocation_history_baseline_tax_bindings tb "
+            "JOIN allocation_history_baseline_bindings b ON b.id=tb.allocation_binding_id "
+            "WHERE b.baseline_event_id=:id"
+        ),
+        {"id": event_id},
+    ).all()
+    gross_total = sum(row.allocated_gross_cents or 0 for row in allocations)
+    gst_total = sum(row.component_gst_cents or 0 for row in components)
+    allocation_values = [
+        ["allocation", *tuple(row)] for row in allocations
+    ]
+    component_values = [["component", *tuple(row)] for row in components]
+    reason_json = json.dumps(list(reasons), separators=(",", ":"))
+    meta = [
+        "meta", event_id, bank_transaction_id, payment_date, observed_at,
+        len(allocations), len(components), gross_total, gst_total, status, reason_json,
+    ]
+    digest = integrity_hash or allocation_baseline_integrity_hash(
+        [meta, *allocation_values, *component_values]
+    )
+    return conn.execute(
+        text(
+            "INSERT INTO allocation_history_baseline_finalizations "
+            "(baseline_event_id, bank_transaction_id, observed_payment_date, observed_at, "
+            "observed_allocation_count, observed_component_count, "
+            "gross_allocation_total_cents, gst_total_cents, integrity_hash, status, "
+            "incomplete_reason_codes) VALUES (:event_id, :bank_id, :payment_date, "
+            ":observed_at, :allocation_count, :component_count, :gross_total, "
+            ":gst_total, :digest, :status, :reasons)"
+        ),
+        {
+            "event_id": event_id,
+            "bank_id": bank_transaction_id,
+            "payment_date": payment_date,
+            "observed_at": observed_at,
+            "allocation_count": len(allocations),
+            "component_count": len(components),
+            "gross_total": gross_total,
+            "gst_total": gst_total,
+            "digest": digest,
+            "status": status,
+            "reasons": reason_json,
+        },
+    )
+
+
 def _insert_allocation_snapshot(
     conn, *, gross_cents=1000, gst_cents=100, components=None
 ):
@@ -685,6 +892,630 @@ def test_allocation_snapshots_require_exact_integer_cent_finalization(tmp_path):
                 conn.execute(text(f"UPDATE {table} SET {key}={key}"))
             with pytest.raises(Exception, match="append-only"):
                 conn.execute(text(f"DELETE FROM {table}"))
+    engine.dispose()
+
+
+def test_legacy_allocation_baseline_complete_is_cash_neutral(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-complete.db")
+    with engine.begin() as conn:
+        cash_before = conn.execute(
+            text("SELECT amount, occurred_at FROM bank_transactions WHERE id=1")
+        ).one()
+        paid_before = conn.execute(
+            text("SELECT paid_amount FROM invoices WHERE id=1")
+        ).scalar_one()
+        event_id = _start_legacy_baseline(conn)
+        _finalize_legacy_baseline(conn, event_id)
+        finalized = conn.execute(
+            text(
+                "SELECT status, observed_allocation_count, observed_component_count, "
+                "gross_allocation_total_cents, gst_total_cents, integrity_hash, "
+                "incomplete_reason_codes FROM allocation_history_baseline_finalizations "
+                "WHERE baseline_event_id=:id"
+            ),
+            {"id": event_id},
+        ).one()
+        assert finalized[:5] == ("complete", 1, 1, 1000, 100)
+        assert len(finalized.integrity_hash) == 64
+        assert finalized.incomplete_reason_codes == "[]"
+        assert conn.execute(
+            text("SELECT amount, occurred_at FROM bank_transactions WHERE id=1")
+        ).one() == cash_before
+        assert conn.execute(
+            text("SELECT paid_amount FROM invoices WHERE id=1")
+        ).scalar_one() == paid_before == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM credit_note_applications")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM credit_note_refunds")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_events")
+        ).scalar_one() == 0
+        with pytest.raises(Exception, match="Bank transaction has allocation history"):
+            conn.execute(text("DELETE FROM bank_transactions WHERE id=1"))
+        with pytest.raises(Exception, match="identity is protected"):
+            conn.execute(
+                text("UPDATE bank_transactions SET occurred_at='2026-10-02' WHERE id=1")
+            )
+        with pytest.raises(Exception, match="Bank transaction has allocation history"):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO bank_transactions "
+                    "(id, bank_account_id, direction, amount, occurred_at, gst_amount, "
+                    "tax_code, unapplied_amount) "
+                    "VALUES (1, 1, 'out', 99, '2026-10-02', 0, 'none', 0)"
+                )
+            )
+    engine.dispose()
+
+
+def test_legacy_allocation_baseline_missing_components_is_incomplete(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-missing-component.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(conn, component=False)
+        _finalize_legacy_baseline(
+            conn,
+            event_id,
+            status="incomplete",
+            reasons=("missing_tax_components",),
+        )
+        assert conn.execute(
+            text(
+                "SELECT status, incomplete_reason_codes, gross_allocation_total_cents, "
+                "gst_total_cents FROM allocation_history_baseline_finalizations "
+                "WHERE baseline_event_id=:id"
+            ),
+            {"id": event_id},
+        ).one() == ("incomplete", '["missing_tax_components"]', 1000, 0)
+    engine.dispose()
+
+
+def test_legacy_allocation_baseline_invalid_amounts_finalize_incomplete(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-invalid-amount.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(
+            conn, allocation_gross=10.005, component_gross=10.005
+        )
+        _finalize_legacy_baseline(
+            conn,
+            event_id,
+            status="incomplete",
+            reasons=("invalid_amount", "unreconciled_totals"),
+        )
+        assert conn.execute(
+            text(
+                "SELECT status, incomplete_reason_codes FROM "
+                "allocation_history_baseline_finalizations WHERE baseline_event_id=:id"
+            ),
+            {"id": event_id},
+        ).one() == (
+            "incomplete",
+            '["invalid_amount","unreconciled_totals"]',
+        )
+        assert conn.execute(
+            text(
+                "SELECT allocated_gross_cents, allocated_gross_source "
+                "FROM allocation_history_baseline_bindings WHERE baseline_event_id=:id"
+            ),
+            {"id": event_id},
+        ).one() == (None, "10.005")
+    engine.dispose()
+
+
+def test_legacy_baseline_preserves_negative_amount_as_incomplete(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-negative-amount.db")
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA ignore_check_constraints=ON"))
+        event_id = _start_legacy_baseline(
+            conn, allocation_gross=-1, component_gross=10, component_gst=1
+        )
+        _finalize_legacy_baseline(
+            conn,
+            event_id,
+            status="incomplete",
+            reasons=("invalid_amount", "unreconciled_totals"),
+        )
+        assert conn.execute(
+            text(
+                "SELECT status, gross_allocation_total_cents, incomplete_reason_codes "
+                "FROM allocation_history_baseline_finalizations WHERE baseline_event_id=:id"
+            ),
+            {"id": event_id},
+        ).one() == (
+            "incomplete",
+            -100,
+            '["invalid_amount","unreconciled_totals"]',
+        )
+    engine.dispose()
+
+
+def test_legacy_baseline_preserves_malformed_payment_date_as_incomplete(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-invalid-date.db")
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE bank_transactions SET occurred_at='unknown-date' WHERE id=1")
+        )
+        event_id = _start_legacy_baseline(conn)
+        _finalize_legacy_baseline(
+            conn,
+            event_id,
+            status="incomplete",
+            reasons=("insufficient_source_data",),
+            payment_date="unknown-date",
+        )
+        assert conn.execute(
+            text(
+                "SELECT observed_payment_date, status, incomplete_reason_codes "
+                "FROM allocation_history_baseline_finalizations WHERE baseline_event_id=:id"
+            ),
+            {"id": event_id},
+        ).one() == (
+            "unknown-date",
+            "incomplete",
+            '["insufficient_source_data"]',
+        )
+    engine.dispose()
+
+
+def test_legacy_allocation_baseline_unsupported_tax_evidence_is_incomplete(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-unsupported-tax.db")
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA ignore_check_constraints=ON"))
+        conn.execute(
+            text("UPDATE invoice_payment_tax_components SET tax_code='unknown' WHERE id=1")
+        )
+        event_id = _start_legacy_baseline(conn, tax_code="unknown")
+        _finalize_legacy_baseline(
+            conn,
+            event_id,
+            status="incomplete",
+            reasons=("unsupported_tax_evidence",),
+        )
+        assert conn.execute(
+            text(
+                "SELECT status, incomplete_reason_codes FROM "
+                "allocation_history_baseline_finalizations WHERE baseline_event_id=:id"
+            ),
+            {"id": event_id},
+        ).one() == ("incomplete", '["unsupported_tax_evidence"]')
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "allocation_insert",
+        "allocation_update",
+        "allocation_delete",
+        "allocation_replace",
+        "allocation_reparent_transaction",
+        "allocation_reparent_document",
+        "allocation_clear",
+        "component_insert",
+        "component_update",
+        "component_delete",
+        "component_replace",
+        "component_reparent",
+        "component_clear",
+    ),
+)
+def test_finalized_legacy_baseline_rejects_live_row_mutations(tmp_path, mutation):
+    engine = _allocation_history_engine(tmp_path, f"legacy-baseline-guard-{mutation}.db")
+    with engine.begin() as conn:
+        _add_second_ap_invoice(conn)
+        conn.execute(
+            text(
+                "INSERT INTO invoice_payment_allocations "
+                "(id, bank_transaction_id, invoice_id, amount, gst_amount) "
+                "VALUES (2, 2, 1, 1, 0)"
+            )
+        )
+        event_id = _start_legacy_baseline(conn)
+        _finalize_legacy_baseline(conn, event_id)
+        mutations = {
+            "allocation_insert": (
+                "INSERT INTO invoice_payment_allocations "
+                "(id, bank_transaction_id, invoice_id, amount, gst_amount) "
+                "VALUES (3, 1, 2, 1, 0)"
+            ),
+            "allocation_update": "UPDATE invoice_payment_allocations SET amount=11 WHERE id=1",
+            "allocation_delete": "DELETE FROM invoice_payment_allocations WHERE id=1",
+            "allocation_replace": (
+                "INSERT OR REPLACE INTO invoice_payment_allocations "
+                "(id, bank_transaction_id, invoice_id, amount, gst_amount) "
+                "VALUES (1, 1, 1, 10, 1)"
+            ),
+            "allocation_reparent_transaction": (
+                "UPDATE invoice_payment_allocations SET bank_transaction_id=2 WHERE id=1"
+            ),
+            "allocation_reparent_document": (
+                "UPDATE invoice_payment_allocations SET invoice_id=2 WHERE id=1"
+            ),
+            "allocation_clear": (
+                "DELETE FROM invoice_payment_allocations WHERE bank_transaction_id=1"
+            ),
+            "component_insert": (
+                "INSERT INTO invoice_payment_tax_components "
+                "(allocation_id, tax_code, gross_amount, gst_amount) "
+                "VALUES (1, 'gst_free', 1, 0)"
+            ),
+            "component_update": (
+                "UPDATE invoice_payment_tax_components SET gross_amount=9 WHERE id=1"
+            ),
+            "component_delete": "DELETE FROM invoice_payment_tax_components WHERE id=1",
+            "component_replace": (
+                "INSERT OR REPLACE INTO invoice_payment_tax_components "
+                "(id, allocation_id, tax_code, gross_amount, gst_amount) "
+                "VALUES (1, 1, 'standard', 10, 1)"
+            ),
+            "component_reparent": (
+                "UPDATE invoice_payment_tax_components SET allocation_id=2 WHERE id=1"
+            ),
+            "component_clear": (
+                "DELETE FROM invoice_payment_tax_components WHERE allocation_id=1"
+            ),
+        }
+        with pytest.raises(Exception, match="Finalized legacy allocation baseline is immutable"):
+            conn.execute(text(mutations[mutation]))
+    engine.dispose()
+
+
+def test_unrelated_transaction_allocations_remain_mutable_after_baseline(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-unrelated-rows.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(conn)
+        _finalize_legacy_baseline(conn, event_id)
+        conn.execute(
+            text(
+                "INSERT INTO invoice_payment_allocations "
+                "(id, bank_transaction_id, invoice_id, amount, gst_amount) "
+                "VALUES (2, 2, 1, 1, 0)"
+            )
+        )
+        conn.execute(
+            text("UPDATE invoice_payment_allocations SET amount=2 WHERE id=2")
+        )
+        conn.execute(
+            text("DELETE FROM invoice_payment_allocations WHERE id=2")
+        )
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM invoice_payment_allocations WHERE id=2")
+        ).scalar_one() == 0
+    engine.dispose()
+
+
+def test_incomplete_legacy_baseline_also_freezes_observed_allocations(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-incomplete-immutable.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(conn, component=False)
+        _finalize_legacy_baseline(
+            conn,
+            event_id,
+            status="incomplete",
+            reasons=("missing_tax_components",),
+        )
+        with pytest.raises(
+            Exception,
+            match="Finalized legacy allocation baseline is immutable",
+        ):
+            conn.execute(
+                text("UPDATE invoice_payment_allocations SET amount=11 WHERE id=1")
+            )
+        with pytest.raises(
+            Exception,
+            match="Finalized legacy allocation baseline is immutable",
+        ):
+            conn.execute(
+                text("DELETE FROM invoice_payment_allocations WHERE id=1")
+            )
+    engine.dispose()
+
+
+def test_legacy_baseline_migration_does_not_backfill_existing_rows(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-no-backfill.db")
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM invoice_payment_allocations")
+        ).scalar_one() == 1
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM allocation_history_baseline_bindings")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM allocation_history_baseline_finalizations")
+        ).scalar_one() == 0
+    run_company_migrations(engine)
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM allocation_history_baseline_bindings")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM allocation_history_baseline_finalizations")
+        ).scalar_one() == 0
+    engine.dispose()
+
+
+def test_legacy_baseline_bindings_and_finalization_survive_bank_rebuild(
+    tmp_path, monkeypatch
+):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-bank-rebuild.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(conn)
+        _finalize_legacy_baseline(conn, event_id)
+        before = conn.execute(
+            text(
+                "SELECT b.id, b.baseline_event_id, b.bank_transaction_id, "
+                "b.allocation_row_id, b.invoice_or_bill_id, b.allocated_gross_cents, "
+                "tb.id, tb.source_component_row_id, tb.tax_code, "
+                "tb.component_gross_cents, tb.component_gst_cents, f.status, f.integrity_hash "
+                "FROM allocation_history_baseline_bindings b "
+                "JOIN allocation_history_baseline_tax_bindings tb "
+                  "ON tb.allocation_binding_id=b.id "
+                "JOIN allocation_history_baseline_finalizations f "
+                  "ON f.baseline_event_id=b.baseline_event_id"
+            )
+        ).one()
+    monkeypatch.setattr(migrations, "_bank_needs_rebuild", lambda _conn: True)
+    rebuilt = run_company_migrations(engine)
+    assert "rebuild:bank_transactions" in rebuilt
+    with engine.connect() as conn:
+        after = conn.execute(
+            text(
+                "SELECT b.id, b.baseline_event_id, b.bank_transaction_id, "
+                "b.allocation_row_id, b.invoice_or_bill_id, b.allocated_gross_cents, "
+                "tb.id, tb.source_component_row_id, tb.tax_code, "
+                "tb.component_gross_cents, tb.component_gst_cents, f.status, f.integrity_hash "
+                "FROM allocation_history_baseline_bindings b "
+                "JOIN allocation_history_baseline_tax_bindings tb "
+                  "ON tb.allocation_binding_id=b.id "
+                "JOIN allocation_history_baseline_finalizations f "
+                  "ON f.baseline_event_id=b.baseline_event_id"
+            )
+        ).one()
+        assert after == before
+        assert conn.execute(text("PRAGMA foreign_key_check")).fetchall() == []
+    engine.dispose()
+
+
+def test_legacy_baseline_supports_service_begin_immediate(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-immediate.db")
+    with engine.connect() as conn:
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+        assert conn.execute(text("SELECT 1")).scalar_one() == 1
+        conn.rollback()
+    engine.dispose()
+
+
+def test_legacy_baseline_bindings_and_finalizations_are_append_only(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-append-only.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(conn)
+        _finalize_legacy_baseline(conn, event_id)
+        for table, key in (
+            ("allocation_history_baseline_bindings", "id"),
+            ("allocation_history_baseline_tax_bindings", "id"),
+            ("allocation_history_baseline_finalizations", "baseline_event_id"),
+        ):
+            with pytest.raises(Exception, match="append-only"):
+                conn.execute(text(f"UPDATE {table} SET {key}={key}"))
+            with pytest.raises(Exception, match="append-only"):
+                conn.execute(text(f"DELETE FROM {table}"))
+        with pytest.raises(Exception, match="append-only|Invalid or finalized"):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO allocation_history_baseline_bindings "
+                    "(id, baseline_event_id, bank_transaction_id, allocation_row_id) "
+                    "SELECT id, baseline_event_id, bank_transaction_id, allocation_row_id "
+                    "FROM allocation_history_baseline_bindings LIMIT 1"
+                )
+            )
+        with pytest.raises(Exception, match="append-only"):
+            conn.execute(
+                text(
+                    "INSERT OR REPLACE INTO allocation_history_baseline_finalizations "
+                    "(baseline_event_id, bank_transaction_id, observed_payment_date, "
+                    "observed_at, observed_allocation_count, observed_component_count, "
+                    "gross_allocation_total_cents, gst_total_cents, integrity_hash, status, "
+                    "incomplete_reason_codes) SELECT baseline_event_id, bank_transaction_id, "
+                    "observed_payment_date, observed_at, observed_allocation_count, "
+                    "observed_component_count, gross_allocation_total_cents, gst_total_cents, "
+                    "integrity_hash, status, incomplete_reason_codes "
+                    "FROM allocation_history_baseline_finalizations"
+                )
+            )
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "table",
+    ("invoice_payment_allocations", "invoice_payment_tax_components"),
+)
+def test_finalized_baseline_rejects_rowid_update_aliases(tmp_path, table):
+    engine = _allocation_history_engine(tmp_path, f"legacy-baseline-rowid-{table}.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(conn)
+        _finalize_legacy_baseline(conn, event_id)
+        with pytest.raises(
+            Exception,
+            match="Finalized legacy allocation baseline is immutable",
+        ):
+            conn.execute(text(f"UPDATE {table} SET rowid=id WHERE id=1"))
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "failure_case",
+    (
+        "changed_allocation",
+        "changed_component",
+        "unbound_allocation",
+        "unbound_component",
+        "wrong_payment_date",
+        "wrong_hash",
+    ),
+)
+def test_legacy_baseline_finalization_rechecks_observed_state(tmp_path, failure_case):
+    engine = _allocation_history_engine(tmp_path, f"legacy-baseline-drift-{failure_case}.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(conn)
+        if failure_case == "changed_allocation":
+            conn.execute(
+                text("UPDATE invoice_payment_allocations SET amount=11 WHERE id=1")
+            )
+        elif failure_case == "changed_component":
+            conn.execute(
+                text("UPDATE invoice_payment_tax_components SET gst_amount=0.5 WHERE id=1")
+            )
+        elif failure_case == "unbound_allocation":
+            _add_second_ap_invoice(conn)
+            conn.execute(
+                text(
+                    "INSERT INTO invoice_payment_allocations "
+                    "(id, bank_transaction_id, invoice_id, amount, gst_amount) "
+                    "VALUES (3, 1, 2, 1, 0)"
+                )
+            )
+        elif failure_case == "unbound_component":
+            conn.execute(
+                text(
+                    "INSERT INTO invoice_payment_tax_components "
+                    "(allocation_id, tax_code, gross_amount, gst_amount) "
+                    "VALUES (1, 'gst_free', 1, 0)"
+                )
+            )
+        elif failure_case == "wrong_hash":
+            with pytest.raises(Exception, match="does not match observed rows"):
+                _finalize_legacy_baseline(conn, event_id, integrity_hash="0" * 64)
+            engine.dispose()
+            return
+
+        payment_date = "2026-10-02" if failure_case == "wrong_payment_date" else "2026-10-01"
+        with pytest.raises(Exception, match="does not match observed rows"):
+            _finalize_legacy_baseline(
+                conn,
+                event_id,
+                payment_date=payment_date,
+                status="incomplete" if failure_case == "unbound_component" else "complete",
+                reasons=("missing_tax_components",) if failure_case == "unbound_component" else (),
+            )
+    engine.dispose()
+
+
+def test_legacy_baseline_duplicate_and_wrong_ownership_bindings_fail_closed(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-identities.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(conn)
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT INTO allocation_history_baseline_bindings "
+                    "(baseline_event_id, bank_transaction_id, allocation_row_id) "
+                    "VALUES (:event_id, 1, 1)"
+                ),
+                {"event_id": event_id},
+            )
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    "INSERT INTO allocation_history_baseline_tax_bindings "
+                    "(allocation_binding_id, source_component_row_id) "
+                    "SELECT allocation_binding_id, source_component_row_id "
+                    "FROM allocation_history_baseline_tax_bindings LIMIT 1"
+                )
+            )
+        with pytest.raises(Exception, match="Invalid or finalized legacy allocation binding"):
+            conn.execute(
+                text(
+                    "INSERT INTO allocation_history_baseline_bindings "
+                    "(baseline_event_id, bank_transaction_id, allocation_row_id) "
+                    "VALUES (:event_id, 2, 2)"
+                ),
+                {"event_id": event_id},
+            )
+        _add_second_ap_invoice(conn)
+        conn.execute(
+            text(
+                "INSERT INTO invoice_payment_allocations "
+                "(id, bank_transaction_id, invoice_id, amount, gst_amount) "
+                "VALUES (3, 1, 2, 1, 0)"
+            )
+        )
+        allocation = conn.execute(
+            text(
+                "SELECT a.amount, a.gst_amount, a.created_at FROM "
+                "invoice_payment_allocations a WHERE a.id=3"
+            )
+        ).one()
+        conn.execute(
+            text(
+                "INSERT INTO allocation_history_baseline_bindings "
+                "(baseline_event_id, bank_transaction_id, allocation_row_id, source_kind, "
+                "invoice_or_bill_id, allocated_gross_cents, allocated_gross_source, "
+                "allocated_gst_cents, allocated_gst_source, allocation_created_at) "
+                "VALUES (:event_id, 1, 3, 'bill', 999, 100, CAST(:amount AS TEXT), "
+                "0, CAST(:gst AS TEXT), CAST(:created AS TEXT))"
+            ),
+            {
+                "event_id": event_id,
+                "amount": allocation.amount,
+                "gst": allocation.gst_amount,
+                "created": allocation.created_at,
+            },
+        )
+        with pytest.raises(Exception, match="does not match observed rows"):
+            _finalize_legacy_baseline(conn, event_id, status="incomplete", reasons=("missing_tax_components",))
+    engine.dispose()
+
+
+def test_legacy_baseline_rejects_component_bound_to_wrong_allocation(tmp_path):
+    engine = _allocation_history_engine(tmp_path, "legacy-baseline-component-owner.db")
+    with engine.begin() as conn:
+        event_id = _start_legacy_baseline(conn)
+        _add_second_ap_invoice(conn)
+        conn.execute(
+            text(
+                "INSERT INTO invoice_payment_allocations "
+                "(id, bank_transaction_id, invoice_id, amount, gst_amount) "
+                "VALUES (3, 1, 2, 1, 0)"
+            )
+        )
+        second_binding_id = conn.execute(
+            text(
+                "INSERT INTO allocation_history_baseline_bindings "
+                "(baseline_event_id, bank_transaction_id, allocation_row_id, source_kind, "
+                "invoice_or_bill_id, allocated_gross_cents, allocated_gross_source, "
+                "allocated_gst_cents, allocated_gst_source, allocation_created_at) "
+                "SELECT :event_id, 1, id, 'bill', invoice_id, 100, CAST(amount AS TEXT), "
+                "0, CAST(gst_amount AS TEXT), CAST(created_at AS TEXT) "
+                "FROM invoice_payment_allocations WHERE id=3 RETURNING id"
+            ),
+            {"event_id": event_id},
+        ).scalar_one()
+        component_id = conn.execute(
+            text(
+                "INSERT INTO invoice_payment_tax_components "
+                "(allocation_id, tax_code, gross_amount, gst_amount) "
+                "VALUES (3, 'standard', 1, 0) RETURNING id"
+            )
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO allocation_history_baseline_tax_bindings "
+                "(allocation_binding_id, source_component_row_id, tax_code, "
+                "component_gross_cents, component_gross_source, component_gst_cents, "
+                "component_gst_source) VALUES (1, :component_id, 'standard', 100, '1', 0, '0')"
+            ),
+            {"component_id": component_id},
+        )
+        assert second_binding_id != 1
+        with pytest.raises(Exception, match="does not match observed rows"):
+            _finalize_legacy_baseline(
+                conn,
+                event_id,
+                status="incomplete",
+                reasons=("missing_tax_components",),
+            )
     engine.dispose()
 
 

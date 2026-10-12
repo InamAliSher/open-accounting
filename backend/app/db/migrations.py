@@ -22,6 +22,7 @@ linear-history bookkeeping Alembic provides. Re-evaluate if any of:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -29,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Generator
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.engine import Engine
 
@@ -753,6 +754,22 @@ _ALLOCATION_HISTORY_INDEXES = (
     ("allocation_history_tax_components", SQLiteIndexSignature(
         "uq_allocation_history_tax_component", ("snapshot_id", "tax_code"), unique=True,
     )),
+    ("allocation_history_baseline_bindings", SQLiteIndexSignature(
+        "uq_allocation_history_baseline_allocation",
+        ("baseline_event_id", "allocation_row_id"), unique=True,
+    )),
+    ("allocation_history_baseline_tax_bindings", SQLiteIndexSignature(
+        "uq_allocation_history_baseline_component",
+        ("allocation_binding_id", "source_component_row_id"), unique=True,
+    )),
+    ("allocation_history_baseline_tax_bindings", SQLiteIndexSignature(
+        "uq_allocation_history_baseline_component_row",
+        ("source_component_row_id",), unique=True,
+    )),
+    ("allocation_history_baseline_finalizations", SQLiteIndexSignature(
+        "uq_allocation_history_baseline_finalization_transaction",
+        ("bank_transaction_id",), unique=True,
+    )),
     ("bas_period_lodgment_markers", SQLiteIndexSignature(
         "uq_bas_period_lodgment_period", ("period_id",), unique=True,
     )),
@@ -761,6 +778,40 @@ _ALLOCATION_HISTORY_INDEXES = (
         ("period_marker_id", "approved_idempotency_key"), unique=True,
     )),
 )
+
+
+def allocation_baseline_integrity_hash(rows) -> str:
+    """Hash canonical JSON rows used by legacy allocation finalizations."""
+    encoded_rows = sorted(
+        json.dumps(row, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        for row in rows
+    )
+    payload = json.dumps(encoded_rows, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class _AllocationBaselineHash:
+    def __init__(self):
+        self.rows = []
+
+    def step(self, row_json):
+        self.rows.append(json.loads(row_json))
+
+    def finalize(self):
+        return allocation_baseline_integrity_hash(self.rows)
+
+
+def _register_allocation_baseline_hash(dbapi_connection, *_):
+    dbapi_connection.create_aggregate(
+        "allocation_baseline_sha256", 1, _AllocationBaselineHash
+    )
+
+
+def _install_allocation_baseline_hash(engine: Engine) -> None:
+    if getattr(engine, "_allocation_baseline_hash_installed", False):
+        return
+    event.listen(engine, "checkout", _register_allocation_baseline_hash)
+    engine._allocation_baseline_hash_installed = True
 
 
 def _ensure_allocation_history_schema(conn) -> bool:
@@ -772,6 +823,9 @@ def _ensure_allocation_history_schema(conn) -> bool:
         "bas_period_lodgment_markers",
         "allocation_period_correction_approvals",
         "allocation_history_events",
+        "allocation_history_baseline_bindings",
+        "allocation_history_baseline_tax_bindings",
+        "allocation_history_baseline_finalizations",
     )
     metadata = _load_company_model_tables()
     changed = False
@@ -813,6 +867,9 @@ def _ensure_allocation_history_guards(conn) -> bool:
         "allocation_history_snapshots",
         "allocation_history_tax_components",
         "allocation_history_finalizations",
+        "allocation_history_baseline_bindings",
+        "allocation_history_baseline_tax_bindings",
+        "allocation_history_baseline_finalizations",
         "bas_period_lodgment_markers",
         "allocation_period_correction_approvals",
     )
@@ -866,6 +923,23 @@ def _ensure_allocation_history_guards(conn) -> bool:
             "EXISTS (SELECT 1 FROM allocation_period_correction_approvals "
             "WHERE period_marker_id=NEW.period_marker_id "
             "AND approved_idempotency_key=NEW.approved_idempotency_key)",
+        ),
+        "allocation_history_baseline_bindings": (
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_bindings WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_bindings "
+            "WHERE baseline_event_id=NEW.baseline_event_id "
+            "AND allocation_row_id=NEW.allocation_row_id)",
+        ),
+        "allocation_history_baseline_tax_bindings": (
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings "
+            "WHERE source_component_row_id=NEW.source_component_row_id)",
+        ),
+        "allocation_history_baseline_finalizations": (
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_finalizations "
+            "WHERE baseline_event_id=NEW.baseline_event_id)",
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_finalizations "
+            "WHERE bank_transaction_id=NEW.bank_transaction_id)",
         ),
     }
     for table, conditions in replace_conditions.items():
@@ -930,6 +1004,323 @@ def _ensure_allocation_history_guards(conn) -> bool:
     changed = _ensure_trigger(
         conn, "trg_allocation_history_finalizations_domain", finalization_sql
     ) or changed
+
+    if all(_table_exists(conn, table) for table in (
+        "allocation_history_events",
+        "allocation_history_baseline_bindings",
+        "allocation_history_baseline_tax_bindings",
+        "allocation_history_baseline_finalizations",
+        "invoice_payment_allocations",
+        "invoice_payment_tax_components",
+        "invoices",
+        "bank_transactions",
+    )):
+        baseline_binding_sql = f'''CREATE TRIGGER "trg_allocation_history_baseline_bindings_domain"
+                BEFORE INSERT ON "allocation_history_baseline_bindings"
+                WHEN typeof(NEW.allocation_row_id)!='integer' OR NEW.allocation_row_id<=0
+                    OR (NEW.source_kind IS NOT NULL AND NEW.source_kind NOT IN ('invoice','bill'))
+                    OR (NEW.invoice_or_bill_id IS NOT NULL AND typeof(NEW.invoice_or_bill_id)!='integer')
+                    OR (NEW.allocated_gross_cents IS NOT NULL
+                            AND typeof(NEW.allocated_gross_cents)!='integer')
+                    OR (NEW.allocated_gst_cents IS NOT NULL
+                            AND typeof(NEW.allocated_gst_cents)!='integer')
+                    OR (NEW.allocated_gross_source IS NOT NULL
+                            AND typeof(NEW.allocated_gross_source)!='text')
+                    OR (NEW.allocated_gst_source IS NOT NULL
+                            AND typeof(NEW.allocated_gst_source)!='text')
+                    OR NOT EXISTS (SELECT 1 FROM allocation_history_events e
+                            WHERE e.id=NEW.baseline_event_id
+                                AND e.operation='legacy_history_unknown'
+                                AND e.bank_transaction_id=NEW.bank_transaction_id)
+                    OR EXISTS (SELECT 1 FROM allocation_history_baseline_finalizations f
+                            WHERE f.baseline_event_id=NEW.baseline_event_id)
+                BEGIN SELECT RAISE(ABORT, 'Invalid or finalized legacy allocation binding'); END'''
+        changed = _ensure_trigger(
+                conn, "trg_allocation_history_baseline_bindings_domain", baseline_binding_sql
+        ) or changed
+
+        baseline_tax_binding_sql = f'''CREATE TRIGGER "trg_allocation_history_baseline_tax_bindings_domain"
+                BEFORE INSERT ON "allocation_history_baseline_tax_bindings"
+                WHEN typeof(NEW.source_component_row_id)!='integer'
+                    OR NEW.source_component_row_id<=0
+                    OR (NEW.component_gross_cents IS NOT NULL
+                            AND typeof(NEW.component_gross_cents)!='integer')
+                    OR (NEW.component_gst_cents IS NOT NULL
+                            AND typeof(NEW.component_gst_cents)!='integer')
+                    OR (NEW.tax_code IS NOT NULL AND typeof(NEW.tax_code)!='text')
+                    OR NOT EXISTS (SELECT 1 FROM allocation_history_baseline_bindings b
+                            WHERE b.id=NEW.allocation_binding_id)
+                    OR EXISTS (SELECT 1 FROM allocation_history_baseline_finalizations f
+                            JOIN allocation_history_baseline_bindings b
+                                ON b.baseline_event_id=f.baseline_event_id
+                            WHERE b.id=NEW.allocation_binding_id)
+                BEGIN SELECT RAISE(ABORT, 'Invalid or finalized legacy tax binding'); END'''
+        changed = _ensure_trigger(
+                conn,
+                "trg_allocation_history_baseline_tax_bindings_domain",
+                baseline_tax_binding_sql,
+        ) or changed
+
+        allocation_identity_mismatch = """EXISTS (
+                SELECT 1 FROM invoice_payment_allocations a
+                LEFT JOIN allocation_history_baseline_bindings b
+                    ON b.baseline_event_id=NEW.baseline_event_id
+                 AND b.allocation_row_id=a.id
+                LEFT JOIN invoices i ON i.id=a.invoice_id
+                WHERE a.bank_transaction_id=NEW.bank_transaction_id
+                    AND (b.id IS NULL OR b.bank_transaction_id IS NOT a.bank_transaction_id
+                        OR b.invoice_or_bill_id IS NOT a.invoice_id
+                        OR b.source_kind IS NOT CASE i.direction
+                                 WHEN 'AR' THEN 'invoice' WHEN 'AP' THEN 'bill' ELSE NULL END
+                        OR b.allocated_gross_source IS NOT CAST(a.amount AS TEXT)
+                        OR b.allocated_gst_source IS NOT CAST(a.gst_amount AS TEXT)
+                        OR b.allocated_gross_cents IS NOT CASE
+                                 WHEN a.amount*100=ROUND(a.amount*100)
+                                 THEN CAST(ROUND(a.amount*100) AS INTEGER) ELSE NULL END
+                        OR b.allocated_gst_cents IS NOT CASE
+                                 WHEN a.gst_amount*100=ROUND(a.gst_amount*100)
+                                 THEN CAST(ROUND(a.gst_amount*100) AS INTEGER) ELSE NULL END
+                        OR b.allocation_created_at IS NOT CAST(a.created_at AS TEXT))
+        ) OR EXISTS (
+                SELECT 1 FROM allocation_history_baseline_bindings b
+                LEFT JOIN invoice_payment_allocations a ON a.id=b.allocation_row_id
+                WHERE b.baseline_event_id=NEW.baseline_event_id
+                    AND (a.id IS NULL OR a.bank_transaction_id IS NOT b.bank_transaction_id
+                        OR a.bank_transaction_id IS NOT NEW.bank_transaction_id)
+        )"""
+        component_identity_mismatch = """EXISTS (
+                SELECT 1 FROM invoice_payment_tax_components c
+                JOIN invoice_payment_allocations a ON a.id=c.allocation_id
+                LEFT JOIN allocation_history_baseline_bindings ab
+                    ON ab.baseline_event_id=NEW.baseline_event_id AND ab.allocation_row_id=a.id
+                LEFT JOIN allocation_history_baseline_tax_bindings tb
+                    ON tb.allocation_binding_id=ab.id AND tb.source_component_row_id=c.id
+                WHERE a.bank_transaction_id=NEW.bank_transaction_id
+                    AND (tb.id IS NULL OR c.allocation_id IS NOT ab.allocation_row_id
+                        OR c.tax_code IS NOT tb.tax_code
+                        OR tb.component_gross_source IS NOT CAST(c.gross_amount AS TEXT)
+                        OR tb.component_gst_source IS NOT CAST(c.gst_amount AS TEXT)
+                        OR tb.component_gross_cents IS NOT CASE
+                                 WHEN c.gross_amount*100=ROUND(c.gross_amount*100)
+                                 THEN CAST(ROUND(c.gross_amount*100) AS INTEGER) ELSE NULL END
+                        OR tb.component_gst_cents IS NOT CASE
+                                 WHEN c.gst_amount*100=ROUND(c.gst_amount*100)
+                                 THEN CAST(ROUND(c.gst_amount*100) AS INTEGER) ELSE NULL END)
+        ) OR EXISTS (
+                SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                JOIN allocation_history_baseline_bindings ab
+                    ON ab.id=tb.allocation_binding_id
+                LEFT JOIN invoice_payment_tax_components c
+                    ON c.id=tb.source_component_row_id
+                WHERE ab.baseline_event_id=NEW.baseline_event_id
+                    AND (c.id IS NULL OR c.allocation_id IS NOT ab.allocation_row_id)
+        )"""
+        baseline_hash_sql = """(
+                SELECT allocation_baseline_sha256(row_json) FROM (
+                    SELECT json_array('meta', NEW.baseline_event_id,
+                            NEW.bank_transaction_id, NEW.observed_payment_date, NEW.observed_at,
+                            NEW.observed_allocation_count, NEW.observed_component_count,
+                            NEW.gross_allocation_total_cents, NEW.gst_total_cents,
+                            NEW.status, NEW.incomplete_reason_codes) AS row_json
+                    UNION ALL
+                    SELECT json_array('allocation', b.id, b.baseline_event_id,
+                            b.bank_transaction_id, b.allocation_row_id, b.source_kind,
+                            b.invoice_or_bill_id, b.allocated_gross_cents,
+                            b.allocated_gross_source, b.allocated_gst_cents,
+                            b.allocated_gst_source, b.allocation_created_at)
+                    FROM allocation_history_baseline_bindings b
+                    WHERE b.baseline_event_id=NEW.baseline_event_id
+                    UNION ALL
+                    SELECT json_array('component', tb.id, tb.allocation_binding_id,
+                            tb.source_component_row_id, tb.tax_code, tb.component_gross_cents,
+                            tb.component_gross_source, tb.component_gst_cents,
+                            tb.component_gst_source)
+                    FROM allocation_history_baseline_tax_bindings tb
+                    JOIN allocation_history_baseline_bindings b
+                        ON b.id=tb.allocation_binding_id
+                    WHERE b.baseline_event_id=NEW.baseline_event_id
+                )
+        )"""
+
+        reasons_sql = f"""(
+            SELECT json_group_array(code) FROM (
+                SELECT code FROM (
+                    SELECT 1 AS ordering, 'missing_tax_components' AS code
+                    WHERE EXISTS (SELECT 1 FROM allocation_history_baseline_bindings b
+                        WHERE b.baseline_event_id=NEW.baseline_event_id
+                            AND NOT EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id))
+                    UNION ALL
+                    SELECT 2, 'invalid_amount' WHERE EXISTS (
+                        SELECT 1 FROM allocation_history_baseline_bindings b
+                        JOIN invoice_payment_allocations a ON a.id=b.allocation_row_id
+                        WHERE b.baseline_event_id=NEW.baseline_event_id AND (
+                            a.amount<=0 OR a.amount*100!=ROUND(a.amount*100)
+                            OR a.gst_amount<0 OR a.gst_amount>a.amount
+                            OR b.allocated_gross_cents IS NULL OR b.allocated_gst_cents IS NULL
+                            OR EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id AND (
+                                    tb.component_gross_cents IS NULL OR tb.component_gst_cents IS NULL
+                                    OR tb.component_gross_cents<=0 OR tb.component_gst_cents<0
+                                    OR tb.component_gst_cents>tb.component_gross_cents
+                                    OR tb.component_gross_source IS NULL OR tb.component_gst_source IS NULL))
+                        ))
+                    UNION ALL
+                    SELECT 3, 'unreconciled_totals' WHERE EXISTS (
+                        SELECT 1 FROM allocation_history_baseline_bindings b
+                        WHERE b.baseline_event_id=NEW.baseline_event_id AND (
+                            EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id) AND (
+                            b.allocated_gross_cents IS NOT COALESCE((SELECT SUM(tb.component_gross_cents)
+                                FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id),0)
+                            OR b.allocated_gst_cents IS NOT COALESCE((SELECT SUM(tb.component_gst_cents)
+                                FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id),0))))
+                    UNION ALL
+                    SELECT 4, 'unsupported_tax_evidence' WHERE EXISTS (
+                        SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                        JOIN allocation_history_baseline_bindings b
+                            ON b.id=tb.allocation_binding_id
+                        WHERE b.baseline_event_id=NEW.baseline_event_id
+                            AND (tb.tax_code IS NULL OR tb.tax_code NOT IN
+                                ('standard','gst_free','input_taxed','capital','none')))
+                    UNION ALL
+                    SELECT 5, 'insufficient_source_data' WHERE EXISTS (
+                        SELECT 1 FROM allocation_history_baseline_bindings b
+                        LEFT JOIN invoices i ON i.id=b.invoice_or_bill_id
+                        JOIN bank_transactions t ON t.id=b.bank_transaction_id
+                        WHERE b.baseline_event_id=NEW.baseline_event_id AND (
+                            b.invoice_or_bill_id IS NULL OR b.source_kind IS NULL OR i.id IS NULL
+                            OR (b.source_kind='invoice' AND (i.direction!='AR' OR t.direction!='in'))
+                            OR (b.source_kind='bill' AND (i.direction!='AP' OR t.direction!='out'))))
+                                        UNION ALL
+                                        SELECT 6, 'insufficient_source_data'
+                                                WHERE NEW.observed_payment_date IS NULL
+                                                    OR {_sqlite_invalid_iso_date('NEW.observed_payment_date')}
+                ) ORDER BY ordering
+            )
+        )"""
+        baseline_finalization_sql = f'''CREATE TRIGGER "trg_allocation_history_baseline_finalizations_domain"
+                BEFORE INSERT ON "allocation_history_baseline_finalizations"
+                WHEN typeof(NEW.observed_allocation_count)!='integer'
+                    OR NEW.observed_allocation_count<0
+                    OR typeof(NEW.observed_component_count)!='integer'
+                    OR NEW.observed_component_count<0
+                    OR typeof(NEW.gross_allocation_total_cents)!='integer'
+                    OR typeof(NEW.gst_total_cents)!='integer'
+                    OR {nonblank('NEW.observed_at')} OR julianday(NEW.observed_at) IS NULL
+                    OR length(NEW.integrity_hash)!=64
+                    OR lower(NEW.integrity_hash) GLOB '*[^0-9a-f]*'
+                    OR NEW.status NOT IN ('complete','incomplete')
+                    OR json_valid(NEW.incomplete_reason_codes)!=1
+                    OR json_type(NEW.incomplete_reason_codes)!='array'
+                    OR NOT EXISTS (SELECT 1 FROM allocation_history_events e
+                            WHERE e.id=NEW.baseline_event_id
+                                AND e.operation='legacy_history_unknown'
+                                AND e.bank_transaction_id=NEW.bank_transaction_id)
+                    OR NOT EXISTS (SELECT 1 FROM bank_transactions t
+                            WHERE t.id=NEW.bank_transaction_id
+                                AND t.occurred_at IS NEW.observed_payment_date)
+                    OR NEW.observed_allocation_count != (SELECT COUNT(*)
+                            FROM allocation_history_baseline_bindings b
+                            WHERE b.baseline_event_id=NEW.baseline_event_id)
+                    OR NEW.observed_component_count != (SELECT COUNT(*)
+                            FROM allocation_history_baseline_tax_bindings tb
+                            JOIN allocation_history_baseline_bindings b
+                                ON b.id=tb.allocation_binding_id
+                            WHERE b.baseline_event_id=NEW.baseline_event_id)
+                    OR NEW.gross_allocation_total_cents != COALESCE((SELECT SUM(b.allocated_gross_cents)
+                            FROM allocation_history_baseline_bindings b
+                            WHERE b.baseline_event_id=NEW.baseline_event_id),0)
+                    OR NEW.gst_total_cents != COALESCE((SELECT SUM(tb.component_gst_cents)
+                            FROM allocation_history_baseline_tax_bindings tb
+                            JOIN allocation_history_baseline_bindings b
+                                ON b.id=tb.allocation_binding_id
+                            WHERE b.baseline_event_id=NEW.baseline_event_id),0)
+                    OR (SELECT COUNT(*) FROM invoice_payment_allocations a
+                            WHERE a.bank_transaction_id=NEW.bank_transaction_id)
+                         != (SELECT COUNT(*) FROM allocation_history_baseline_bindings b
+                            WHERE b.baseline_event_id=NEW.baseline_event_id)
+                    OR {allocation_identity_mismatch}
+                    OR (SELECT COUNT(*) FROM invoice_payment_tax_components c
+                            JOIN invoice_payment_allocations a ON a.id=c.allocation_id
+                            WHERE a.bank_transaction_id=NEW.bank_transaction_id)
+                         != (SELECT COUNT(*) FROM allocation_history_baseline_tax_bindings tb
+                            JOIN allocation_history_baseline_bindings b
+                                ON b.id=tb.allocation_binding_id
+                            WHERE b.baseline_event_id=NEW.baseline_event_id)
+                    OR {component_identity_mismatch}
+                    OR NEW.integrity_hash != {baseline_hash_sql}
+                    OR NEW.incomplete_reason_codes != {reasons_sql}
+                    OR (NEW.status='complete' AND {reasons_sql}!='[]')
+                    OR (NEW.status='incomplete' AND {reasons_sql}='[]')
+                BEGIN SELECT RAISE(ABORT, 'Legacy allocation baseline does not match observed rows'); END'''
+        changed = _ensure_trigger(
+                conn,
+                "trg_allocation_history_baseline_finalizations_domain",
+                baseline_finalization_sql,
+        ) or changed
+
+        finalized_allocation = """EXISTS (
+                SELECT 1 FROM allocation_history_baseline_finalizations f
+                JOIN allocation_history_baseline_bindings b
+                    ON b.baseline_event_id=f.baseline_event_id
+                WHERE f.bank_transaction_id={transaction}
+                    OR b.allocation_row_id={allocation_id})"""
+        allocation_guards = (
+                ("insert", "INSERT", "NEW", f"{finalized_allocation.format(transaction='NEW.bank_transaction_id', allocation_id='NEW.id')}"),
+                ("update", "UPDATE", "OLD", f"{finalized_allocation.format(transaction='OLD.bank_transaction_id', allocation_id='OLD.id')} OR {finalized_allocation.format(transaction='NEW.bank_transaction_id', allocation_id='NEW.id')}"),
+                ("delete", "DELETE", "OLD", finalized_allocation.format(transaction="OLD.bank_transaction_id", allocation_id="OLD.id")),
+        )
+        for suffix, operation, _row, condition in allocation_guards:
+                trigger_name = f"trg_invoice_payment_allocations_baseline_no_{suffix}"
+                sql = (
+                    f'CREATE TRIGGER "{trigger_name}" BEFORE {operation} '
+                        f'ON "invoice_payment_allocations" WHEN {condition} '
+                        "BEGIN SELECT RAISE(ABORT, 'Finalized legacy allocation baseline is immutable'); END"
+                )
+                changed = _ensure_trigger(conn, trigger_name, sql) or changed
+        allocation_replace_sql = f'''CREATE TRIGGER "trg_invoice_payment_allocations_baseline_no_replace"
+                BEFORE INSERT ON "invoice_payment_allocations"
+                WHEN {finalized_allocation.format(transaction='NEW.bank_transaction_id', allocation_id='NEW.id')}
+                BEGIN SELECT RAISE(ABORT, 'Finalized legacy allocation baseline is immutable'); END'''
+        changed = _ensure_trigger(
+                conn, "trg_invoice_payment_allocations_baseline_no_replace", allocation_replace_sql
+        ) or changed
+
+        finalized_component = """EXISTS (
+                SELECT 1 FROM allocation_history_baseline_finalizations f
+                JOIN allocation_history_baseline_bindings b
+                    ON b.baseline_event_id=f.baseline_event_id
+                JOIN allocation_history_baseline_tax_bindings tb
+                    ON tb.allocation_binding_id=b.id
+                WHERE b.allocation_row_id={allocation_id}
+                    OR tb.source_component_row_id={component_id})"""
+        component_guards = (
+                ("insert", "INSERT", finalized_component.format(
+                        allocation_id="NEW.allocation_id", component_id="NEW.id")),
+                ("update", "UPDATE", f"{finalized_component.format(allocation_id='OLD.allocation_id', component_id='OLD.id')} OR {finalized_component.format(allocation_id='NEW.allocation_id', component_id='NEW.id')}"),
+                ("delete", "DELETE", finalized_component.format(
+                        allocation_id="OLD.allocation_id", component_id="OLD.id")),
+        )
+        for suffix, operation, condition in component_guards:
+                trigger_name = f"trg_invoice_payment_tax_components_baseline_no_{suffix}"
+                sql = (
+                    f'CREATE TRIGGER "{trigger_name}" BEFORE {operation} '
+                        f'ON "invoice_payment_tax_components" WHEN {condition} '
+                        "BEGIN SELECT RAISE(ABORT, 'Finalized legacy allocation baseline is immutable'); END"
+                )
+                changed = _ensure_trigger(conn, trigger_name, sql) or changed
+        component_replace_sql = f'''CREATE TRIGGER "trg_invoice_payment_tax_components_baseline_no_replace"
+                BEFORE INSERT ON "invoice_payment_tax_components"
+                WHEN {finalized_component.format(allocation_id='NEW.allocation_id', component_id='NEW.id')}
+                BEGIN SELECT RAISE(ABORT, 'Finalized legacy allocation baseline is immutable'); END'''
+        changed = _ensure_trigger(
+                conn,
+                "trg_invoice_payment_tax_components_baseline_no_replace",
+                component_replace_sql,
+        ) or changed
 
     period_start_invalid = _sqlite_invalid_iso_date("NEW.period_start")
     period_end_invalid = _sqlite_invalid_iso_date("NEW.period_end")
@@ -2272,7 +2663,9 @@ def _payment_reconciliation_counts(conn) -> dict[str, int]:
                 "LEFT JOIN journal_entries AS j ON j.source_id = i.id AND "
                 "((i.direction = 'AR' AND j.source_type = 'invoice_ar') OR "
                 " (i.direction = 'AP' AND j.source_type = 'invoice_ap')) "
-                "WHERE j.id IS NULL"
+                "WHERE j.id IS NULL AND NOT EXISTS (SELECT 1 "
+                "FROM allocation_history_events e WHERE e.bank_transaction_id=a.bank_transaction_id "
+                "AND e.operation='legacy_history_unknown')"
             )
         ).scalar_one()
     )
@@ -2284,7 +2677,10 @@ def _payment_reconciliation_counts(conn) -> dict[str, int]:
                 "WHERE ((a.code = '1100' AND t.direction = 'in') OR "
                 "       (a.code = '2000' AND t.direction = 'out')) "
                 "AND NOT EXISTS (SELECT 1 FROM invoice_payment_allocations AS p "
-                "                WHERE p.bank_transaction_id = t.id)"
+                "                WHERE p.bank_transaction_id = t.id) "
+                "AND NOT EXISTS (SELECT 1 FROM allocation_history_events e "
+                "                WHERE e.bank_transaction_id=t.id "
+                "                  AND e.operation='legacy_history_unknown')"
             )
         ).scalar_one()
     )
@@ -2298,7 +2694,10 @@ def _payment_reconciliation_counts(conn) -> dict[str, int]:
                 "OR (i.status NOT IN ('draft', 'void') AND NOT EXISTS ("
                 "    SELECT 1 FROM journal_entries AS j WHERE j.source_id = i.id "
                 "    AND ((i.direction = 'AR' AND j.source_type = 'invoice_ar') OR "
-                "         (i.direction = 'AP' AND j.source_type = 'invoice_ap'))))"
+                "         (i.direction = 'AP' AND j.source_type = 'invoice_ap')))) "
+                "AND NOT EXISTS (SELECT 1 FROM invoice_payment_allocations p "
+                "JOIN allocation_history_events e ON e.bank_transaction_id=p.bank_transaction_id "
+                "WHERE p.invoice_id=i.id AND e.operation='legacy_history_unknown')"
             )
         ).scalar_one()
     )
@@ -2354,7 +2753,9 @@ def _reconcile_legacy_payment_metadata(conn) -> dict[str, int]:
             "LEFT JOIN journal_entries AS j ON j.source_id = i.id AND "
             "((i.direction = 'AR' AND j.source_type = 'invoice_ar') OR "
             " (i.direction = 'AP' AND j.source_type = 'invoice_ap')) "
-            "WHERE j.id IS NULL"
+            "WHERE j.id IS NULL AND NOT EXISTS (SELECT 1 "
+            "FROM allocation_history_events e WHERE e.bank_transaction_id=t.id "
+            "AND e.operation='legacy_history_unknown')"
         )
     ).mappings().all()
     for row in invalid_txn_rows:
@@ -2401,7 +2802,10 @@ def _reconcile_legacy_payment_metadata(conn) -> dict[str, int]:
             "WHERE ((a.code = '1100' AND t.direction = 'in') OR "
             "       (a.code = '2000' AND t.direction = 'out')) "
             "AND NOT EXISTS (SELECT 1 FROM invoice_payment_allocations AS p "
-            "                WHERE p.bank_transaction_id = t.id)"
+                "                WHERE p.bank_transaction_id = t.id) "
+                "AND NOT EXISTS (SELECT 1 FROM allocation_history_events e "
+                "                WHERE e.bank_transaction_id=t.id "
+                "                  AND e.operation='legacy_history_unknown')"
         )
     ).mappings().all()
     for row in control_rows:
@@ -2434,7 +2838,10 @@ def _reconcile_legacy_payment_metadata(conn) -> dict[str, int]:
             "OR (i.status NOT IN ('draft', 'void') AND NOT EXISTS ("
             "    SELECT 1 FROM journal_entries AS j WHERE j.source_id = i.id "
             "    AND ((i.direction = 'AR' AND j.source_type = 'invoice_ar') OR "
-            "         (i.direction = 'AP' AND j.source_type = 'invoice_ap'))))"
+            "         (i.direction = 'AP' AND j.source_type = 'invoice_ap')))) "
+            "AND NOT EXISTS (SELECT 1 FROM invoice_payment_allocations p "
+            "JOIN allocation_history_events e ON e.bank_transaction_id=p.bank_transaction_id "
+            "WHERE p.invoice_id=i.id AND e.operation='legacy_history_unknown')"
         )
     ).mappings().all()
     for row in invoice_rows:
@@ -2625,6 +3032,7 @@ def run_company_migrations(
 
     Returns the list of step names that ran this call. Idempotent.
     """
+    _install_allocation_baseline_hash(engine)
     applied: list[str] = []
     backup_path, backup_reasons = _create_destructive_migration_backup(
         engine,
@@ -2719,6 +3127,7 @@ def run_company_migrations(
                 )
             for trigger in (
                 "trg_allocation_history_events_domain",
+                "trg_allocation_history_baseline_finalizations_domain",
                 "trg_bank_transactions_allocation_history_no_delete",
                 "trg_bank_transactions_allocation_history_identity",
                 "trg_bank_transactions_allocation_history_no_replace",

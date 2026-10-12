@@ -1142,6 +1142,102 @@ class AllocationHistoryFinalization(CompanyBase):
     finalized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class AllocationHistoryBaselineBinding(CompanyBase):
+    """Observed legacy allocation row bound to its unknown-history marker."""
+
+    __tablename__ = "allocation_history_baseline_bindings"
+    __table_args__ = (
+        Index(
+            "uq_allocation_history_baseline_allocation",
+            "baseline_event_id",
+            "allocation_row_id",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    baseline_event_id: Mapped[int] = mapped_column(
+        ForeignKey("allocation_history_events.id", ondelete="RESTRICT"), nullable=False
+    )
+    bank_transaction_id: Mapped[int] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="RESTRICT"), nullable=False
+    )
+    allocation_row_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_kind: Mapped[str | None] = mapped_column(String(10))
+    invoice_or_bill_id: Mapped[int | None] = mapped_column(Integer)
+    allocated_gross_cents: Mapped[int | None] = mapped_column(Integer)
+    allocated_gross_source: Mapped[str | None] = mapped_column(Text)
+    allocated_gst_cents: Mapped[int | None] = mapped_column(Integer)
+    allocated_gst_source: Mapped[str | None] = mapped_column(Text)
+    allocation_created_at: Mapped[str | None] = mapped_column(Text)
+
+
+class AllocationHistoryBaselineTaxBinding(CompanyBase):
+    """Observed legacy tax-component row bound to one allocation binding."""
+
+    __tablename__ = "allocation_history_baseline_tax_bindings"
+    __table_args__ = (
+        Index(
+            "uq_allocation_history_baseline_component",
+            "allocation_binding_id",
+            "source_component_row_id",
+            unique=True,
+        ),
+        Index(
+            "uq_allocation_history_baseline_component_row",
+            "source_component_row_id",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("allocation_history_baseline_bindings.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_component_row_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    tax_code: Mapped[str | None] = mapped_column(String(20))
+    component_gross_cents: Mapped[int | None] = mapped_column(Integer)
+    component_gross_source: Mapped[str | None] = mapped_column(Text)
+    component_gst_cents: Mapped[int | None] = mapped_column(Integer)
+    component_gst_source: Mapped[str | None] = mapped_column(Text)
+
+
+class AllocationHistoryBaselineFinalization(CompanyBase):
+    """Immutable completion state for a legacy allocation observation."""
+
+    __tablename__ = "allocation_history_baseline_finalizations"
+    __table_args__ = (
+        Index(
+            "uq_allocation_history_baseline_finalization_transaction",
+            "bank_transaction_id",
+            unique=True,
+        ),
+        CheckConstraint(
+            "status IN ('complete', 'incomplete')",
+            name="ck_allocation_history_baseline_finalization_status",
+        ),
+    )
+
+    baseline_event_id: Mapped[int] = mapped_column(
+        ForeignKey("allocation_history_events.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    bank_transaction_id: Mapped[int] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    observed_payment_date: Mapped[str | None] = mapped_column(String(10))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    observed_allocation_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    observed_component_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    gross_allocation_total_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    gst_total_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    integrity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(10), nullable=False)
+    incomplete_reason_codes: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class BASPeriodLodgmentMarker(CompanyBase):
     """Internal assertion only; this is not authenticated ATO lodgment evidence."""
 
