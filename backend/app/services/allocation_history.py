@@ -26,6 +26,49 @@ class AllocationHistoryCaptureError(ValueError):
     """A legacy allocation baseline cannot safely be captured."""
 
 
+class AllocationHistoryConflict(Exception):
+    """A bank transaction with allocation history cannot be mutated."""
+
+    http_status = 409
+
+
+_ALLOCATION_HISTORY_TRIGGER_MESSAGES = {
+    "Bank transaction has allocation history",
+    "Bank transaction identity is protected by allocation history",
+}
+
+
+def has_allocation_history(db: Session, bank_transaction_id: int) -> bool:
+    return db.execute(
+        text(
+            "SELECT 1 FROM allocation_history_events "
+            "WHERE bank_transaction_id=:id LIMIT 1"
+        ),
+        {"id": bank_transaction_id},
+    ).first() is not None
+
+
+def guard_allocation_history_mutation(
+    db: Session, bank_transaction_id: int
+) -> None:
+    begin_sqlite_immediate(db)
+    if has_allocation_history(db, bank_transaction_id):
+        db.rollback()
+        raise AllocationHistoryConflict(
+            "This bank transaction has allocation history and cannot be changed."
+        )
+
+
+def translate_allocation_history_db_error(db: Session, exc: Exception) -> None:
+    original = getattr(exc, "orig", exc)
+    if str(original) not in _ALLOCATION_HISTORY_TRIGGER_MESSAGES:
+        return
+    db.rollback()
+    raise AllocationHistoryConflict(
+        "This bank transaction has allocation history and cannot be changed."
+    ) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class LegacyAllocationBaselineResult:
     baseline_event_id: int

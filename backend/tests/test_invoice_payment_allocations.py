@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import shutil
 import sys
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import text
 from fastapi.testclient import TestClient
 
 
@@ -394,6 +395,121 @@ def test_deleting_allocated_transaction_reopens_invoice_then_allows_void(client,
     assert Decimal(reopened["paid_amount"]) == 0
     voided = client.post(f"/api/v1/invoices/{invoice['id']}/void", headers=HEAD)
     assert voided.status_code == 200, voided.text
+
+
+@pytest.mark.parametrize("history_kind", ["baseline", "event"])
+def test_history_blocks_recategorisation_and_deletion_without_state_change(
+    client, accounts, bank, history_kind
+):
+    invoice = _posted_invoice(client, accounts, number=f"ALLOC-HISTORY-{history_kind}")
+    payment = _manual_payment(client, bank, accounts, invoice, amount="40.00")
+    assert payment.status_code == 201, payment.text
+    transaction_id = payment.json()["id"]
+
+    from app.db.company import company_session
+    from app.services.allocation_history import capture_legacy_allocation_baseline
+
+    with company_session("alloc") as db:
+        if history_kind == "baseline":
+            capture_legacy_allocation_baseline(
+                db, transaction_id, datetime(2026, 10, 12)
+            )
+        else:
+            db.execute(
+                text(
+                    "INSERT INTO allocation_history_events "
+                    "(operation, bank_transaction_id) "
+                    "VALUES ('legacy_history_unknown', :transaction_id)"
+                ),
+                {"transaction_id": transaction_id},
+            )
+        db.commit()
+
+    def read_operational_state():
+        with company_session("alloc") as db:
+            return {
+                "transaction": tuple(db.execute(
+                    text("SELECT * FROM bank_transactions WHERE id=:id"),
+                    {"id": transaction_id},
+                ).one()),
+                "allocations": tuple(db.execute(
+                    text(
+                        "SELECT * FROM invoice_payment_allocations "
+                        "WHERE bank_transaction_id=:id ORDER BY id"
+                    ),
+                    {"id": transaction_id},
+                ).all()),
+                "tax_components": tuple(db.execute(
+                    text(
+                        "SELECT c.* FROM invoice_payment_tax_components c "
+                        "JOIN invoice_payment_allocations a ON a.id=c.allocation_id "
+                        "WHERE a.bank_transaction_id=:id ORDER BY c.id"
+                    ),
+                    {"id": transaction_id},
+                ).all()),
+                "invoice": tuple(db.execute(
+                    text("SELECT * FROM invoices WHERE id=:id"),
+                    {"id": invoice["id"]},
+                ).one()),
+            }
+
+    def read_transaction():
+        rows = client.get(
+            f"/api/v1/bank-accounts/{bank['id']}/transactions", headers=HEAD
+        ).json()
+        return next(row for row in rows if row["id"] == transaction_id)
+
+    transaction_before = read_transaction()
+    invoice_before = client.get(
+        f"/api/v1/invoices/{invoice['id']}", headers=HEAD
+    ).json()
+    cash_before = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0][
+        "current_balance"
+    ]
+    operational_before = read_operational_state()
+
+    account_only = client.patch(
+        f"/api/v1/bank-accounts/transactions/{transaction_id}/categorise",
+        headers=HEAD,
+        json={"account_id": accounts["4000"]["id"]},
+    )
+    assert account_only.status_code == 409, account_only.text
+    assert account_only.json()["detail"] == (
+        "This bank transaction has allocation history and cannot be changed."
+    )
+    assert read_operational_state() == operational_before
+
+    recategorised = client.patch(
+        f"/api/v1/bank-accounts/transactions/{transaction_id}/categorise",
+        headers=HEAD,
+        json={
+            "account_id": accounts["1100"]["id"],
+            "tax_code": "none",
+            "gst_amount": "0.00",
+        },
+    )
+    assert recategorised.status_code == 409, recategorised.text
+    assert recategorised.json()["detail"] == (
+        "This bank transaction has allocation history and cannot be changed."
+    )
+    assert "SQLite" not in recategorised.text
+    assert "trigger" not in recategorised.text.lower()
+
+    deleted = client.delete(
+        f"/api/v1/bank-accounts/transactions/{transaction_id}", headers=HEAD
+    )
+    assert deleted.status_code == 409, deleted.text
+    assert deleted.json()["detail"] == (
+        "This bank transaction has allocation history and cannot be changed."
+    )
+    assert "SQLite" not in deleted.text
+    assert "trigger" not in deleted.text.lower()
+
+    assert read_transaction() == transaction_before
+    assert client.get(f"/api/v1/invoices/{invoice['id']}", headers=HEAD).json() == invoice_before
+    assert client.get("/api/v1/bank-accounts", headers=HEAD).json()[0][
+        "current_balance"
+    ] == cash_before
 
 
 def test_ambiguous_open_invoice_cash_cannot_be_double_counted_as_income(client, accounts, bank):
