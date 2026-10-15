@@ -217,6 +217,191 @@ def _bank_sequence(conn) -> int:
     )
 
 
+def test_allocation_batch_schema_migration_is_idempotent_without_backfill():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+
+    first_run = migrations.run_company_migrations(engine)
+    second_run = migrations.run_company_migrations(engine)
+
+    with engine.connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ))
+        }
+        assert {
+            "allocation_batches",
+            "allocation_batch_lines",
+            "allocation_batch_tax_components",
+            "allocation_batch_finalizations",
+        } <= tables
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_batches"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_batch_finalizations"
+        )).scalar_one() == 0
+        trigger_sql = connection.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_allocation_batches_domain'"
+        )).scalar_one()
+        assert "CREATE TRIGGER \"trg_allocation_batches_domain\"" in trigger_sql
+        assert "allocation_reallocation" in trigger_sql
+    assert "guards:allocation_batches_append_only" in first_run
+    assert "guards:allocation_batches_append_only" not in second_run
+    engine.dispose()
+
+
+def test_allocation_batch_migration_repairs_code_only_residual_trigger():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_allocation_batches_domain"))
+        connection.execute(text(
+            "CREATE TRIGGER trg_allocation_batches_domain "
+            "BEFORE INSERT ON allocation_batches "
+            "WHEN NEW.residual_amount_cents>0 AND NOT EXISTS ("
+            "SELECT 1 FROM accounts a WHERE a.id=NEW.residual_account_id "
+            "AND a.code NOT IN ('1100','1200','2000','2100')) "
+            "BEGIN SELECT RAISE(ABORT, 'Old code-only residual policy'); END"
+        ))
+
+    repaired = migrations.run_company_migrations(engine)
+    with engine.connect() as connection:
+        trigger_sql = connection.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_allocation_batches_domain'"
+        )).scalar_one()
+        assert "a.active=1" in trigger_sql
+        assert "a.type='LIABILITY'" in trigger_sql
+        assert "a.type='ASSET'" in trigger_sql
+        assert "FROM bank_accounts ba" in trigger_sql
+        assert "Old code-only residual policy" not in trigger_sql
+    assert "guards:allocation_batches_append_only" in repaired
+    assert "guards:allocation_batches_append_only" not in migrations.run_company_migrations(engine)
+    engine.dispose()
+
+
+def test_allocation_batch_migration_repairs_partial_schema_without_bank_table():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    initial_run = migrations.run_company_migrations(engine)
+    independent_trigger_names = {
+        f"trg_{table}_no_{operation}"
+        for table in (
+            "allocation_batches",
+            "allocation_batch_lines",
+            "allocation_batch_tax_components",
+            "allocation_batch_finalizations",
+        )
+        for operation in ("update", "delete", "replace_insert")
+    }
+    with engine.connect() as connection:
+        initial_independent_triggers = {
+            name: sql
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ))
+            if name in independent_trigger_names
+        }
+    assert independent_trigger_names <= initial_independent_triggers.keys()
+
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE bank_transactions"))
+
+    first_run = migrations.run_company_migrations(engine)
+    second_run = migrations.run_company_migrations(engine)
+    with engine.connect() as connection:
+        assert not _table_exists(connection, "bank_transactions")
+        invalid_triggers = connection.execute(text(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND (lower(name) LIKE 'trg_allocation_batch%' "
+            "OR lower(name) LIKE 'trg_bank_transactions_allocation_batch%') "
+            "AND lower(COALESCE(sql, '')) LIKE '%bank_transactions%'"
+        )).scalars().all()
+        assert invalid_triggers == []
+        assert _table_exists(connection, "allocation_batches")
+        remaining_independent_triggers = {
+            name: sql
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ))
+            if name in independent_trigger_names
+        }
+        assert remaining_independent_triggers == initial_independent_triggers
+    assert "guards:allocation_batches_append_only" in initial_run
+    assert "drop_triggers:allocation_batches_missing_bank_table" in first_run
+    assert "guards:allocation_batches_append_only" not in first_run
+    assert second_run == []
+    engine.dispose()
+
+
+def test_allocation_batch_migration_repairs_empty_partial_tables_without_bank():
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE allocation_batches (id INTEGER PRIMARY KEY)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE allocation_batch_lines (id INTEGER PRIMARY KEY)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE allocation_batch_tax_components (id INTEGER PRIMARY KEY)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE allocation_batch_finalizations (batch_id INTEGER PRIMARY KEY)"
+        ))
+
+    applied = migrations.run_company_migrations(engine)
+    with engine.connect() as connection:
+        assert not _table_exists(connection, "bank_transactions")
+        assert {
+            "idempotency_key", "transaction_version", "expected_prior_version",
+            "bank_transaction_id", "baseline_finalization_id",
+        } <= {
+            row[1] for row in connection.execute(
+                text("PRAGMA table_info(allocation_batches)")
+            )
+        }
+        index_names = {
+            row[0] for row in connection.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ))
+        }
+        assert {
+            "uq_allocation_batch_idempotency",
+            "uq_allocation_batch_transaction_version",
+            "uq_allocation_batch_line_order",
+            "uq_allocation_batch_line_identity",
+            "uq_allocation_batch_component_tax_code",
+        } <= index_names
+        trigger_names = {
+            row[0] for row in connection.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            ))
+        }
+        assert "trg_allocation_batches_no_update" in trigger_names
+        assert "trg_allocation_batch_lines_no_update" in trigger_names
+        assert "trg_allocation_batch_tax_components_no_update" in trigger_names
+        assert "trg_allocation_batch_finalizations_no_update" in trigger_names
+        assert not any(
+            name.startswith("trg_allocation_batch")
+            and "domain" in name
+            and name in trigger_names
+            for name in (
+                "trg_allocation_batches_domain",
+                "trg_allocation_batch_lines_domain",
+                "trg_allocation_batch_finalizations_domain",
+            )
+        )
+    assert "schema:allocation_batches" in applied
+    assert "guards:allocation_batches_append_only" in applied
+    engine.dispose()
+
+
 def test_gst_adjustment_schema_survives_rebuild_without_legacy_backfill():
     engine = _engine()
     CompanyBase.metadata.create_all(engine)
@@ -682,6 +867,13 @@ def test_rebuild_leaves_fk_enforcement_on_for_pooled_connections(tmp_path):
 
     with engine.connect() as conn:
         fk = conn.execute(text("PRAGMA foreign_keys")).scalar()
+        assert not _table_exists(conn, "bank_transactions")
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+            "AND (lower(name) LIKE 'trg_allocation_batch%' "
+            "OR lower(name) LIKE 'trg_bank_transactions_allocation_batch%') "
+            "AND lower(COALESCE(sql, '')) LIKE '%bank_transactions%'"
+        )).scalar_one() == 0
     assert fk == 1, "FK enforcement must stay on after a rebuild migration"
 
 
@@ -965,6 +1157,219 @@ def test_bank_rebuild_recovers_stale_helper_and_preserves_high_water(tmp_path):
             )
         ).scalar_one()
         assert inserted_id == 81
+
+
+def test_bank_rebuild_batch_trigger_lifecycle_is_atomic_and_retryable(
+    tmp_path, monkeypatch
+):
+    engine = _file_engine_with_fk_hook(tmp_path / "batch-trigger-rebuild.db")
+    _populate_legacy_bank_graph(engine)
+    migrations.run_company_migrations(engine)
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO contacts (id, kind, name, active, created_at) "
+            "VALUES (1, 'customer', 'Synthetic batch customer', 1, CURRENT_TIMESTAMP)"
+        ))
+        connection.execute(text(
+            "INSERT INTO accounts (id, code, name, type, is_gst, active) "
+            "VALUES (2, '2200', 'Synthetic customer deposits', 'LIABILITY', 0, 1)"
+        ))
+        connection.execute(text(
+            "INSERT INTO invoices (id, direction, contact_id, invoice_number, issue_date, "
+            "currency, subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+            "source, created_at, updated_at) VALUES (1, 'AR', 1, 'SYN-BATCH', "
+            "'2026-05-01', 'AUD', 5, 0.5, 5.5, 1, 'authorised', 0, 'manual', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ))
+        connection.execute(text(
+            "DROP TRIGGER trg_allocation_history_baseline_finalizations_domain"
+        ))
+        event_id = connection.execute(text(
+            "INSERT INTO allocation_history_events (operation, bank_transaction_id) "
+            "VALUES ('legacy_history_unknown', 1) RETURNING id"
+        )).scalar_one()
+        connection.execute(text(
+            "INSERT INTO allocation_history_baseline_finalizations "
+            "(baseline_event_id, bank_transaction_id, observed_payment_date, observed_at, "
+            "observed_allocation_count, observed_component_count, "
+            "gross_allocation_total_cents, gst_total_cents, integrity_hash, status, "
+            "incomplete_reason_codes) VALUES (:event_id, 1, '2026-05-01', "
+            "'2026-05-01 00:00:00', 0, 0, 0, 0, :hash, 'complete', '[]')"
+        ), {"event_id": event_id, "hash": "0" * 64})
+        migrations._ensure_allocation_history_guards(connection)
+
+        batch_payload = {
+            "kind": "batch",
+            "bank_transaction_id": 1,
+            "operation": "allocation_correction",
+            "transaction_version": 1,
+            "expected_prior_version": 0,
+            "effective_date": "2026-05-01",
+            "recorded_at": "2026-05-02 00:00:00",
+            "idempotency_key": "synthetic-rebuild-batch",
+            "reason": "Synthetic rebuild preservation",
+            "evidence_reference": "synthetic://rebuild",
+            "evidence_sha256": None,
+            "actor_placeholder": "Synthetic operator",
+            "linked_prior_batch_id": None,
+            "internal_correction_approval_id": None,
+            "manual_review_status": "approved",
+            "residual_amount_cents": 500,
+            "residual_account_id": 2,
+            "baseline_finalization_id": event_id,
+        }
+        line_payload = {
+            "kind": "line",
+            "line_order": 0,
+            "source_kind": "invoice",
+            "invoice_or_bill_id": 1,
+            "gross_cents": 500,
+            "gst_cents": 50,
+        }
+        component_payload = {
+            "kind": "component",
+            "line_order": 0,
+            "tax_code": "standard",
+            "gross_cents": 500,
+            "gst_cents": 50,
+        }
+        batch_hash = migrations.allocation_baseline_integrity_hash(
+            [batch_payload, line_payload, component_payload]
+        )
+        batch_id = connection.execute(text(
+            "INSERT INTO allocation_batches (bank_transaction_id, operation, "
+            "transaction_version, expected_prior_version, effective_date, recorded_at, "
+            "idempotency_key, canonical_payload_hash, reason, evidence_reference, "
+            "actor_placeholder, manual_review_status, residual_amount_cents, "
+            "residual_account_id, baseline_finalization_id) VALUES "
+            "(1, 'allocation_correction', 1, 0, '2026-05-01', '2026-05-02 00:00:00', "
+            "'synthetic-rebuild-batch', :hash, 'Synthetic rebuild preservation', "
+            "'synthetic://rebuild', 'Synthetic operator', 'approved', 500, 2, "
+            ":event_id) RETURNING id"
+        ), {"hash": batch_hash, "event_id": event_id}).scalar_one()
+        line_id = connection.execute(text(
+            "INSERT INTO allocation_batch_lines "
+            "(batch_id, line_order, source_kind, invoice_or_bill_id, gross_cents, gst_cents) "
+            "VALUES (:batch_id, 0, 'invoice', 1, 500, 50) RETURNING id"
+        ), {"batch_id": batch_id}).scalar_one()
+        connection.execute(text(
+            "INSERT INTO allocation_batch_tax_components "
+            "(allocation_batch_line_id, tax_code, gross_cents, gst_cents) "
+            "VALUES (:line_id, 'standard', 500, 50)"
+        ), {"line_id": line_id})
+        connection.execute(text(
+            "INSERT INTO allocation_batch_finalizations "
+            "(batch_id, allocation_line_count, component_count, total_allocated_cents, "
+            "total_gst_cents, residual_cents, bank_cash_cents, "
+            "canonical_integrity_hash, finalized_at) "
+            "VALUES (:batch_id, 1, 1, 500, 50, 500, 1000, :hash, "
+            "'2026-05-02 00:01:00')"
+        ), {"batch_id": batch_id, "hash": batch_hash})
+
+    bank_dependent_names = {
+        "trg_allocation_batches_domain",
+        "trg_allocation_batch_lines_domain",
+        "trg_allocation_batch_finalizations_domain",
+        "trg_bank_transactions_allocation_batch_cash_immutable",
+        "trg_bank_transactions_allocation_batch_no_delete",
+        "trg_bank_transactions_allocation_batch_no_replace",
+    }
+    before_rows = None
+    with engine.connect() as connection:
+        before_rows = (
+            connection.execute(text("SELECT * FROM allocation_batches")).all(),
+            connection.execute(text("SELECT * FROM allocation_batch_lines")).all(),
+            connection.execute(text("SELECT * FROM allocation_batch_tax_components")).all(),
+            connection.execute(text("SELECT * FROM allocation_batch_finalizations")).all(),
+            connection.execute(text("SELECT * FROM bank_transactions")).all(),
+        )
+        before_triggers = {
+            name: sql
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ))
+            if name in bank_dependent_names
+        }
+    assert set(before_triggers) == bank_dependent_names
+
+    observed_during_rebuild = []
+    original_rebuild = migrations._rebuild_bank_transactions
+
+    def observe_dependencies(connection):
+        remaining = {
+            row[0]
+            for row in connection.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            ))
+            if row[0] in bank_dependent_names
+        }
+        observed_during_rebuild.append(remaining)
+        return original_rebuild(connection)
+
+    should_fail = True
+
+    def inject_rebuild_failure(_conn, _cursor, statement, _params, _context, _many):
+        nonlocal should_fail
+        if should_fail and " ".join(statement.upper().split()).startswith(
+            "DROP TABLE BANK_TRANSACTIONS"
+        ):
+            should_fail = False
+            raise RuntimeError("synthetic batch-trigger rebuild failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(migrations, "_bank_needs_rebuild", lambda _conn: True)
+        patch.setattr(migrations, "_rebuild_bank_transactions", observe_dependencies)
+        event.listen(engine, "before_cursor_execute", inject_rebuild_failure)
+        try:
+            with pytest.raises(RuntimeError, match="synthetic batch-trigger rebuild failure"):
+                migrations.run_company_migrations(engine)
+        finally:
+            event.remove(engine, "before_cursor_execute", inject_rebuild_failure)
+
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT * FROM allocation_batches")).all() == before_rows[0]
+            assert connection.execute(text("SELECT * FROM allocation_batch_lines")).all() == before_rows[1]
+            assert connection.execute(text("SELECT * FROM allocation_batch_tax_components")).all() == before_rows[2]
+            assert connection.execute(text("SELECT * FROM allocation_batch_finalizations")).all() == before_rows[3]
+            assert connection.execute(text("SELECT * FROM bank_transactions")).all() == before_rows[4]
+            restored_triggers = {
+                name: sql
+                for name, sql in connection.execute(text(
+                    "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+                ))
+                if name in bank_dependent_names
+            }
+            assert restored_triggers == before_triggers
+            assert not _table_exists(connection, "new_bank_transactions")
+            assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
+            assert connection.execute(text("PRAGMA foreign_key_check")).fetchall() == []
+
+        retry = migrations.run_company_migrations(engine)
+        assert "rebuild:bank_transactions" in retry
+
+    assert observed_during_rebuild == [set(), set()]
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT * FROM allocation_batches")).all() == before_rows[0]
+        assert connection.execute(text("SELECT * FROM allocation_batch_lines")).all() == before_rows[1]
+        assert connection.execute(text("SELECT * FROM allocation_batch_tax_components")).all() == before_rows[2]
+        assert connection.execute(text("SELECT * FROM allocation_batch_finalizations")).all() == before_rows[3]
+        assert connection.execute(text("SELECT * FROM bank_transactions")).all() == before_rows[4]
+        restored_triggers = {
+            name: sql
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ))
+            if name in bank_dependent_names
+        }
+        assert restored_triggers == before_triggers
+        assert not _table_exists(connection, "new_bank_transactions")
+        assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
+        assert connection.execute(text("PRAGMA foreign_key_check")).fetchall() == []
+    assert "rebuild:bank_transactions" not in migrations.run_company_migrations(engine)
+    engine.dispose()
 
 
 @pytest.mark.parametrize(

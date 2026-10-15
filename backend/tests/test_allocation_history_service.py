@@ -85,6 +85,282 @@ def _database(path):
     return engine
 
 
+def _allocation_batch_database(
+    path, *, baseline_tax_code="standard", baseline_gst_amount="1"
+):
+    engine = _database(path)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE bank_transactions SET amount=12 WHERE id=2"))
+        connection.execute(text(
+            "UPDATE invoice_payment_allocations SET gst_amount=:gst WHERE id=22"
+        ), {"gst": baseline_gst_amount})
+        connection.execute(text(
+            "UPDATE invoice_payment_tax_components SET tax_code=:tax_code, "
+            "gross_amount=10, gst_amount=:gst WHERE id=222"
+        ), {"tax_code": baseline_tax_code, "gst": baseline_gst_amount})
+        connection.execute(text(
+            "INSERT INTO accounts (id, code, name, type, is_gst, active) "
+            "VALUES (2, '5000', 'Synthetic expense', 'EXPENSE', 0, 1), "
+            "(3, '2200', 'Synthetic customer deposits', 'LIABILITY', 0, 1), "
+            "(4, '2210', 'Synthetic inactive liability', 'LIABILITY', 0, 0), "
+            "(5, '1200', 'Synthetic GST paid', 'ASSET', 1, 1), "
+            "(6, '2100', 'Synthetic GST collected', 'LIABILITY', 1, 1), "
+            "(7, '1100', 'Synthetic receivables control', 'ASSET', 0, 1), "
+            "(8, '2000', 'Synthetic payables control', 'LIABILITY', 0, 1), "
+            "(9, '2300', 'Synthetic bank ledger', 'LIABILITY', 0, 1), "
+            "(10, '5100', 'Synthetic eligible asset', 'ASSET', 0, 1)"
+        ))
+    with Session(engine) as session:
+        baseline = capture_legacy_allocation_baseline(
+            session, 2, datetime(2026, 10, 12, 10, 0, 0)
+        )
+        assert baseline.status == "complete"
+        session.commit()
+    return engine, baseline.baseline_event_id
+
+
+def _batch_payload_rows(
+    *, baseline_id, bank_transaction_id, operation, version, expected_version, effective_date,
+    recorded_at, idempotency_key, manual_review_status, residual_cents,
+    residual_account_id, linked_prior_batch_id, internal_approval_id, line,
+):
+    rows = [{
+        "kind": "batch",
+        "bank_transaction_id": bank_transaction_id,
+        "operation": operation,
+        "transaction_version": version,
+        "expected_prior_version": expected_version,
+        "effective_date": effective_date,
+        "recorded_at": recorded_at,
+        "idempotency_key": idempotency_key,
+        "reason": "Synthetic transaction-wide allocation change",
+        "evidence_reference": "synthetic://allocation-batch",
+        "evidence_sha256": None,
+        "actor_placeholder": "Synthetic operator",
+        "linked_prior_batch_id": linked_prior_batch_id,
+        "internal_correction_approval_id": internal_approval_id,
+        "manual_review_status": manual_review_status,
+        "residual_amount_cents": residual_cents,
+        "residual_account_id": residual_account_id,
+        "baseline_finalization_id": baseline_id,
+    }]
+    if line is not None:
+        rows.append({
+            "kind": "line",
+            "line_order": 0,
+            "source_kind": line["source_kind"],
+            "invoice_or_bill_id": line["invoice_or_bill_id"],
+            "gross_cents": line["gross_cents"],
+            "gst_cents": line["gst_cents"],
+        })
+        for component in line["components"]:
+            rows.append({
+                "kind": "component",
+                "line_order": 0,
+                "tax_code": component["tax_code"],
+                "gross_cents": component["gross_cents"],
+                "gst_cents": component["gst_cents"],
+            })
+    return rows
+
+
+def _insert_allocation_batch(
+    connection, baseline_id, *, bank_transaction_id=2,
+    operation="allocation_correction", version=1,
+    expected_version=0, effective_date="2026-10-01",
+    recorded_at="2026-10-12 11:00:00", idempotency_key="synthetic-batch-1",
+    manual_review_status="not_required", residual_cents=200,
+    residual_account_id=3, linked_prior_batch_id=None, internal_approval_id=None,
+    line=None,
+):
+    rows = _batch_payload_rows(
+        baseline_id=baseline_id,
+        bank_transaction_id=bank_transaction_id,
+        operation=operation,
+        version=version,
+        expected_version=expected_version,
+        effective_date=effective_date,
+        recorded_at=recorded_at,
+        idempotency_key=idempotency_key,
+        manual_review_status=manual_review_status,
+        residual_cents=residual_cents,
+        residual_account_id=residual_account_id,
+        linked_prior_batch_id=linked_prior_batch_id,
+        internal_approval_id=internal_approval_id,
+        line=line,
+    )
+    values = {
+        "bank_transaction_id": bank_transaction_id,
+        "operation": operation,
+        "transaction_version": version,
+        "expected_prior_version": expected_version,
+        "effective_date": effective_date,
+        "recorded_at": recorded_at,
+        "idempotency_key": idempotency_key,
+        "canonical_payload_hash": allocation_baseline_integrity_hash(rows),
+        "reason": "Synthetic transaction-wide allocation change",
+        "evidence_reference": "synthetic://allocation-batch",
+        "evidence_sha256": None,
+        "actor_placeholder": "Synthetic operator",
+        "linked_prior_batch_id": linked_prior_batch_id,
+        "internal_correction_approval_id": internal_approval_id,
+        "manual_review_status": manual_review_status,
+        "residual_amount_cents": residual_cents,
+        "residual_account_id": residual_account_id,
+        "baseline_finalization_id": baseline_id,
+    }
+    return connection.execute(text(
+        "INSERT INTO allocation_batches (bank_transaction_id, operation, "
+        "transaction_version, expected_prior_version, effective_date, recorded_at, "
+        "idempotency_key, canonical_payload_hash, reason, evidence_reference, "
+        "evidence_sha256, actor_placeholder, linked_prior_batch_id, "
+        "internal_correction_approval_id, manual_review_status, "
+        "residual_amount_cents, residual_account_id, baseline_finalization_id) "
+        "VALUES (:bank_transaction_id, :operation, :transaction_version, "
+        ":expected_prior_version, :effective_date, :recorded_at, :idempotency_key, "
+        ":canonical_payload_hash, :reason, :evidence_reference, :evidence_sha256, "
+        ":actor_placeholder, :linked_prior_batch_id, :internal_correction_approval_id, "
+        ":manual_review_status, :residual_amount_cents, :residual_account_id, "
+        ":baseline_finalization_id) RETURNING id"
+    ), values).scalar_one()
+
+
+def _insert_allocation_batch_line(connection, batch_id, line):
+    line_id = connection.execute(text(
+        "INSERT INTO allocation_batch_lines "
+        "(batch_id, line_order, source_kind, invoice_or_bill_id, gross_cents, gst_cents) "
+        "VALUES (:batch_id, 0, :source_kind, :invoice_id, :gross_cents, :gst_cents) "
+        "RETURNING id"
+    ), {
+        "batch_id": batch_id,
+        "source_kind": line["source_kind"],
+        "invoice_id": line["invoice_or_bill_id"],
+        "gross_cents": line["gross_cents"],
+        "gst_cents": line["gst_cents"],
+    }).scalar_one()
+    for component in line["components"]:
+        connection.execute(text(
+            "INSERT INTO allocation_batch_tax_components "
+            "(allocation_batch_line_id, tax_code, gross_cents, gst_cents) "
+            "VALUES (:line_id, :tax_code, :gross_cents, :gst_cents)"
+        ), {"line_id": line_id, **component})
+    return line_id
+
+
+def _standard_batch_line(
+    *, source_kind="invoice", invoice_id=2, gross_cents=1000,
+    gst_cents=100, tax_code="standard",
+):
+    return {
+        "source_kind": source_kind,
+        "invoice_or_bill_id": invoice_id,
+        "gross_cents": gross_cents,
+        "gst_cents": gst_cents,
+        "components": [{
+            "tax_code": tax_code,
+            "gross_cents": gross_cents,
+            "gst_cents": gst_cents,
+        }],
+    }
+
+
+def _finalize_allocation_batch(connection, batch_id, line, *, total=1000, gst=100,
+                               residual=200, cash=1200):
+    rows = connection.execute(text(
+        "SELECT kind, payload FROM ("
+        "SELECT 0 sort_key, json_object('kind','batch',"
+        "'bank_transaction_id',b.bank_transaction_id,'operation',b.operation,"
+        "'transaction_version',b.transaction_version,'expected_prior_version',b.expected_prior_version,"
+        "'effective_date',b.effective_date,'recorded_at',b.recorded_at,"
+        "'idempotency_key',b.idempotency_key,'reason',b.reason,"
+        "'evidence_reference',b.evidence_reference,'evidence_sha256',b.evidence_sha256,"
+        "'actor_placeholder',b.actor_placeholder,'linked_prior_batch_id',b.linked_prior_batch_id,"
+        "'internal_correction_approval_id',b.internal_correction_approval_id,"
+        "'manual_review_status',b.manual_review_status,"
+        "'residual_amount_cents',b.residual_amount_cents,'residual_account_id',b.residual_account_id,"
+        "'baseline_finalization_id',b.baseline_finalization_id) payload, 'batch' kind "
+        "FROM allocation_batches b WHERE b.id=:batch_id "
+        "UNION ALL SELECT 1, json_object('kind','line','line_order',l.line_order,"
+        "'source_kind',l.source_kind,'invoice_or_bill_id',l.invoice_or_bill_id,"
+        "'gross_cents',l.gross_cents,'gst_cents',l.gst_cents), 'line' "
+        "FROM allocation_batch_lines l WHERE l.batch_id=:batch_id "
+        "UNION ALL SELECT 2, json_object('kind','component','line_order',l.line_order,"
+        "'tax_code',c.tax_code,'gross_cents',c.gross_cents,'gst_cents',c.gst_cents), 'component' "
+        "FROM allocation_batch_lines l JOIN allocation_batch_tax_components c "
+        "ON c.allocation_batch_line_id=l.id WHERE l.batch_id=:batch_id) "
+        "ORDER BY sort_key"
+    ), {"batch_id": batch_id}).all()
+    canonical_hash = allocation_baseline_integrity_hash(
+        [json.loads(row.payload) for row in rows]
+    )
+    connection.execute(text(
+        "INSERT INTO allocation_batch_finalizations "
+        "(batch_id, allocation_line_count, component_count, total_allocated_cents, "
+        "total_gst_cents, residual_cents, bank_cash_cents, canonical_integrity_hash, finalized_at) "
+        "VALUES (:batch_id, :line_count, :component_count, :total, :gst, :residual, :cash, "
+        ":integrity_hash, '2026-10-12 11:01:00')"
+    ), {
+        "batch_id": batch_id,
+        "line_count": 1 if line is not None else 0,
+        "component_count": len(line["components"]) if line else 0,
+        "total": total,
+        "gst": gst,
+        "residual": residual,
+        "cash": cash,
+        "integrity_hash": canonical_hash,
+    })
+
+
+def _insert_finalized_allocation_batch(
+    connection,
+    baseline_id,
+    *,
+    bank_transaction_id=2,
+    operation="allocation_correction",
+    version=1,
+    expected_version=0,
+    effective_date="2026-10-01",
+    recorded_at="2026-10-12 11:00:00",
+    idempotency_key="synthetic-finalized-batch",
+    manual_review_status="not_required",
+    residual_cents=200,
+    residual_account_id=3,
+    linked_prior_batch_id=None,
+    line=None,
+    total=1000,
+    gst=100,
+    cash=1200,
+):
+    batch_id = _insert_allocation_batch(
+        connection,
+        baseline_id,
+        bank_transaction_id=bank_transaction_id,
+        operation=operation,
+        version=version,
+        expected_version=expected_version,
+        effective_date=effective_date,
+        recorded_at=recorded_at,
+        idempotency_key=idempotency_key,
+        manual_review_status=manual_review_status,
+        residual_cents=residual_cents,
+        residual_account_id=residual_account_id,
+        linked_prior_batch_id=linked_prior_batch_id,
+        line=line,
+    )
+    if line is not None:
+        _insert_allocation_batch_line(connection, batch_id, line)
+    _finalize_allocation_batch(
+        connection,
+        batch_id,
+        line,
+        total=total,
+        gst=gst,
+        residual=residual_cents,
+        cash=cash,
+    )
+    return batch_id
+
+
 def _insert_correction_history(connection, *, transaction_id, allocation_id, invoice_id):
     source_kind = "bill" if invoice_id == 1 else "invoice"
     snapshot_id = connection.execute(
@@ -407,6 +683,949 @@ def test_exact_cent_service_and_trigger_agreement(tmp_path, raw_amount, expected
         assert json.loads(finalization.incomplete_reason_codes) == []
         assert finalization.integrity_hash == result.integrity_hash
         session.rollback()
+    engine.dispose()
+
+
+def test_allocation_batch_finalization_reconciles_complete_state_and_is_append_only(tmp_path):
+    engine, baseline_id = _allocation_batch_database(tmp_path / "batch-valid.db")
+    line = {
+        "source_kind": "invoice",
+        "invoice_or_bill_id": 2,
+        "gross_cents": 1000,
+        "gst_cents": 100,
+        "components": [{
+            "tax_code": "standard", "gross_cents": 1000, "gst_cents": 100,
+        }],
+    }
+    with engine.begin() as connection:
+        batch_id = _insert_allocation_batch(connection, baseline_id, line=line)
+        _insert_allocation_batch_line(connection, batch_id, line)
+        _finalize_allocation_batch(connection, batch_id, line)
+
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT allocation_line_count, component_count, total_allocated_cents, "
+            "total_gst_cents, residual_cents, bank_cash_cents "
+            "FROM allocation_batch_finalizations WHERE batch_id=:id"
+        ), {"id": batch_id}).one() == (1, 1, 1000, 100, 200, 1200)
+        assert connection.execute(text(
+            "SELECT amount FROM bank_transactions WHERE id=2"
+        )).scalar_one() == 12
+        assert connection.execute(text(
+            "SELECT paid_amount FROM invoices WHERE id=2"
+        )).scalar_one() == 10
+
+    immutable_statements = (
+        "UPDATE allocation_batches SET reason='changed' WHERE id=:id",
+        "DELETE FROM allocation_batches WHERE id=:id",
+        "INSERT OR REPLACE INTO allocation_batches SELECT * FROM allocation_batches WHERE id=:id",
+        "UPDATE allocation_batch_lines SET gross_cents=999 WHERE batch_id=:id",
+        "DELETE FROM allocation_batch_lines WHERE batch_id=:id",
+        "INSERT OR REPLACE INTO allocation_batch_lines SELECT * FROM allocation_batch_lines WHERE batch_id=:id",
+        "UPDATE allocation_batch_tax_components SET gross_cents=999 "
+        "WHERE allocation_batch_line_id=(SELECT id FROM allocation_batch_lines WHERE batch_id=:id)",
+        "DELETE FROM allocation_batch_tax_components WHERE allocation_batch_line_id="
+        "(SELECT id FROM allocation_batch_lines WHERE batch_id=:id)",
+        "INSERT OR REPLACE INTO allocation_batch_tax_components "
+        "SELECT * FROM allocation_batch_tax_components WHERE allocation_batch_line_id="
+        "(SELECT id FROM allocation_batch_lines WHERE batch_id=:id)",
+        "UPDATE allocation_batch_finalizations SET total_allocated_cents=999 WHERE batch_id=:id",
+        "DELETE FROM allocation_batch_finalizations WHERE batch_id=:id",
+        "INSERT OR REPLACE INTO allocation_batch_finalizations "
+        "SELECT * FROM allocation_batch_finalizations WHERE batch_id=:id",
+    )
+    for statement in immutable_statements:
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(text(statement), {"id": batch_id})
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("review_status", "should_finalize"),
+    [
+        ("not_required", False),
+        ("required", False),
+        ("rejected", False),
+        ("approved", True),
+    ],
+)
+def test_allocation_batch_changed_bas_vector_requires_approved_review(
+    tmp_path, review_status, should_finalize
+):
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / f"batch-review-{review_status}.db"
+    )
+    line = {
+        "source_kind": "invoice",
+        "invoice_or_bill_id": 2,
+        "gross_cents": 900,
+        "gst_cents": 90,
+        "components": [{
+            "tax_code": "standard", "gross_cents": 900, "gst_cents": 90,
+        }],
+    }
+    with engine.begin() as connection:
+        batch_id = _insert_allocation_batch(
+            connection,
+            baseline_id,
+            manual_review_status=review_status,
+            residual_cents=300,
+            line=line,
+        )
+        _insert_allocation_batch_line(connection, batch_id, line)
+    if should_finalize:
+        with engine.begin() as connection:
+            _finalize_allocation_batch(
+                connection, batch_id, line, total=900, gst=90, residual=300
+            )
+    else:
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                _finalize_allocation_batch(
+                    connection, batch_id, line, total=900, gst=90, residual=300
+                )
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    (
+        "baseline_tax_code", "after_tax_code", "after_gross", "review_status",
+        "accepted",
+    ),
+    [
+        ("none", "none", 1000, "not_required", True),
+        ("gst_free", "gst_free", 900, "not_required", False),
+        ("none", "gst_free", 1000, "not_required", False),
+        ("none", "gst_free", 1000, "approved", True),
+        ("gst_free", "none", 1000, "not_required", False),
+    ],
+)
+def test_allocation_batch_bas_vector_tracks_zero_gst_and_none_components(
+    tmp_path, baseline_tax_code, after_tax_code, after_gross, review_status, accepted
+):
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / f"batch-vector-{baseline_tax_code}-{after_tax_code}-{review_status}.db",
+        baseline_tax_code=baseline_tax_code,
+        baseline_gst_amount="0",
+    )
+    line = _standard_batch_line(
+        gross_cents=after_gross,
+        gst_cents=0,
+        tax_code=after_tax_code,
+    )
+    residual = 1200 - after_gross
+    with engine.begin() as connection:
+        batch_id = _insert_allocation_batch(
+            connection,
+            baseline_id,
+            idempotency_key=f"vector-{review_status}",
+            manual_review_status=review_status,
+            residual_cents=residual,
+            line=line,
+        )
+        _insert_allocation_batch_line(connection, batch_id, line)
+    if accepted:
+        with engine.begin() as connection:
+            _finalize_allocation_batch(
+                connection,
+                batch_id,
+                line,
+                total=after_gross,
+                gst=0,
+                residual=residual,
+            )
+    else:
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                _finalize_allocation_batch(
+                    connection,
+                    batch_id,
+                    line,
+                    total=after_gross,
+                    gst=0,
+                    residual=residual,
+                )
+    engine.dispose()
+
+
+def test_allocation_batch_rejects_component_cash_version_and_residual_errors(tmp_path):
+    engine, baseline_id = _allocation_batch_database(tmp_path / "batch-invalid.db")
+    with engine.begin() as connection:
+        invalid_headers = (
+            {"version": 2, "expected_version": 0},
+            {"residual_cents": 200, "residual_account_id": None},
+            {"residual_cents": 200, "residual_account_id": 7},
+            {"residual_cents": 0, "residual_account_id": 2},
+        )
+        for index, overrides in enumerate(invalid_headers):
+            with pytest.raises(IntegrityError):
+                _insert_allocation_batch(
+                    connection,
+                    baseline_id,
+                    idempotency_key=f"invalid-batch-{index}",
+                    **overrides,
+                )
+
+    line = {
+        "source_kind": "invoice",
+        "invoice_or_bill_id": 2,
+        "gross_cents": 1000,
+        "gst_cents": 100,
+        "components": [{
+            "tax_code": "standard", "gross_cents": 900, "gst_cents": 90,
+        }],
+    }
+    with engine.begin() as connection:
+        batch_id = _insert_allocation_batch(connection, baseline_id, line=line)
+        _insert_allocation_batch_line(connection, batch_id, line)
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _finalize_allocation_batch(connection, batch_id, line)
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("case", "direction", "residual_cents", "account_id", "bank_ledger", "accepted"),
+    [
+        ("zero-null", "in", 0, None, False, True),
+        ("zero-account", "in", 0, 3, False, False),
+        ("positive-null", "in", 200, None, False, False),
+        ("missing-account", "in", 200, 999, False, False),
+        ("inactive-account", "in", 200, 4, False, False),
+        ("gst-paid-control", "in", 200, 5, False, False),
+        ("gst-collected-control", "in", 200, 6, False, False),
+        ("ar-control", "in", 200, 7, False, False),
+        ("ap-control", "in", 200, 8, False, False),
+        ("bank-ledger-control", "in", 200, 9, True, False),
+        ("money-in-asset", "in", 200, 2, False, False),
+        ("money-in-liability", "in", 200, 3, False, True),
+        ("money-out-liability", "out", 200, 3, False, False),
+        ("money-out-asset", "out", 200, 10, False, True),
+        ("unsupported-direction", "odd", 200, 3, False, False),
+    ],
+)
+def test_allocation_batch_residual_account_database_policy(
+    tmp_path, case, direction, residual_cents, account_id, bank_ledger, accepted
+):
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / f"batch-residual-{case}.db"
+    )
+    with engine.begin() as connection:
+        if direction != "in":
+            connection.execute(text(
+                "UPDATE bank_transactions SET direction=:direction WHERE id=2"
+            ), {"direction": direction})
+        if bank_ledger:
+            connection.execute(text(
+                "UPDATE bank_accounts SET ledger_account_id=9 WHERE id=1"
+            ))
+
+    def insert_batch(connection):
+        return _insert_allocation_batch(
+            connection,
+            baseline_id,
+            idempotency_key=f"residual-{case}",
+            residual_cents=residual_cents,
+            residual_account_id=account_id,
+        )
+
+    if accepted:
+        with engine.begin() as connection:
+            batch_id = insert_batch(connection)
+        with engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT residual_amount_cents, residual_account_id "
+                "FROM allocation_batches WHERE id=:id"
+            ), {"id": batch_id}).one() == (residual_cents, account_id)
+    else:
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                insert_batch(connection)
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("residual_cents", "account_id", "accepted"),
+    [(0, None, True), (0, 3, False), (200, None, False), (200, 2, False), (200, 3, True)],
+)
+def test_allocation_batch_residual_account_orm_policy(
+    tmp_path, residual_cents, account_id, accepted
+):
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / f"batch-residual-orm-{residual_cents}-{account_id}.db"
+    )
+    batch = _company_models.AllocationBatch(
+        bank_transaction_id=2,
+        operation="allocation_correction",
+        transaction_version=1,
+        expected_prior_version=0,
+        effective_date=date(2026, 10, 1),
+        recorded_at=datetime(2026, 10, 12, 11),
+        idempotency_key=f"orm-residual-{residual_cents}-{account_id}",
+        canonical_payload_hash="a" * 64,
+        reason="Synthetic ORM residual test",
+        evidence_reference="synthetic://orm-residual",
+        evidence_sha256=None,
+        actor_placeholder="Synthetic operator",
+        linked_prior_batch_id=None,
+        internal_correction_approval_id=None,
+        manual_review_status="not_required",
+        residual_amount_cents=residual_cents,
+        residual_account_id=account_id,
+        baseline_finalization_id=baseline_id,
+    )
+    with Session(engine) as session:
+        session.add(batch)
+        if accepted:
+            session.commit()
+        else:
+            with pytest.raises(IntegrityError):
+                session.flush()
+            session.rollback()
+    engine.dispose()
+
+
+def test_allocation_batch_versions_idempotency_and_prior_links_fail_closed(tmp_path):
+    engine, baseline_id = _allocation_batch_database(tmp_path / "batch-versions.db")
+    line = _standard_batch_line()
+    with engine.begin() as connection:
+        first_id = _insert_finalized_allocation_batch(
+            connection,
+            baseline_id,
+            idempotency_key="version-one",
+            line=line,
+        )
+
+    with Session(engine) as session:
+        other_baseline = capture_legacy_allocation_baseline(
+            session, 1, datetime(2026, 10, 12, 10)
+        )
+        assert other_baseline.status == "complete"
+        other_baseline_id = other_baseline.baseline_event_id
+        session.commit()
+    other_line = _standard_batch_line(source_kind="bill", invoice_id=1)
+    with engine.begin() as connection:
+        other_transaction_batch_id = _insert_finalized_allocation_batch(
+            connection,
+            other_baseline_id,
+            bank_transaction_id=1,
+            idempotency_key="other-transaction-version-one",
+            residual_cents=0,
+            residual_account_id=None,
+            line=other_line,
+            cash=1000,
+        )
+
+    invalid_versions = (
+        {
+            "version": 3,
+            "expected_version": 1,
+            "linked_prior_batch_id": first_id,
+            "idempotency_key": "wrong-version-step",
+        },
+        {
+            "version": 3,
+            "expected_version": 2,
+            "linked_prior_batch_id": first_id,
+            "idempotency_key": "skipped-version",
+        },
+        {
+            "version": 2,
+            "expected_version": 0,
+            "idempotency_key": "stale-version",
+        },
+        {
+            "version": 1,
+            "expected_version": 0,
+            "idempotency_key": "duplicate-transaction-version",
+        },
+        {
+            "version": 2,
+            "expected_version": 1,
+            "linked_prior_batch_id": other_transaction_batch_id,
+            "idempotency_key": "cross-transaction-prior",
+        },
+    )
+    for values in invalid_versions:
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                _insert_allocation_batch(
+                    connection,
+                    baseline_id,
+                    **values,
+                )
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                version=2,
+                expected_version=1,
+                linked_prior_batch_id=first_id,
+                idempotency_key="version-one",
+                line=line,
+            )
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                version=2,
+                expected_version=1,
+                linked_prior_batch_id=first_id,
+                idempotency_key="version-one",
+                line=_standard_batch_line(gross_cents=900, gst_cents=90),
+            )
+
+    with engine.begin() as connection:
+        second_id = _insert_finalized_allocation_batch(
+            connection,
+            baseline_id,
+            version=2,
+            expected_version=1,
+            linked_prior_batch_id=first_id,
+            idempotency_key="version-two",
+            line=line,
+        )
+        third_id = _insert_allocation_batch(
+            connection,
+            baseline_id,
+            version=3,
+            expected_version=2,
+            linked_prior_batch_id=second_id,
+            idempotency_key="version-three",
+            line=line,
+        )
+        assert third_id > second_id
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT transaction_version, expected_prior_version "
+            "FROM allocation_batches WHERE bank_transaction_id=2 "
+            "ORDER BY transaction_version"
+        )).all() == [(1, 0), (2, 1), (3, 2)]
+        assert connection.execute(text(
+            "SELECT bank_transaction_id, transaction_version, expected_prior_version "
+            "FROM allocation_batches WHERE id=:id"
+        ), {"id": other_transaction_batch_id}).one() == (1, 1, 0)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("boundary", ["effective_date", "recorded_at"])
+def test_allocation_batch_requires_complete_baseline_observation_boundary(
+    tmp_path, boundary
+):
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / f"batch-boundary-{boundary}.db"
+    )
+    overrides = (
+        {"effective_date": "2026-09-30"}
+        if boundary == "effective_date"
+        else {"recorded_at": "2026-10-12 09:59:59"}
+    )
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                idempotency_key=f"before-{boundary}-boundary",
+                **overrides,
+            )
+    engine.dispose()
+
+
+def test_allocation_batch_rejects_missing_incomplete_and_cross_transaction_baselines(
+    tmp_path
+):
+    engine, baseline_id = _allocation_batch_database(tmp_path / "batch-baselines.db")
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                999,
+                idempotency_key="missing-baseline",
+            )
+
+    with Session(engine) as session:
+        other_baseline = capture_legacy_allocation_baseline(
+            session, 1, datetime(2026, 10, 12, 10)
+        )
+        session.commit()
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                other_baseline.baseline_event_id,
+                idempotency_key="cross-transaction-baseline",
+            )
+    engine.dispose()
+
+    incomplete_engine = _database(tmp_path / "batch-incomplete-baseline.db")
+    with incomplete_engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO accounts (id, code, name, type, is_gst, active) "
+            "VALUES (3, '2200', 'Synthetic customer deposits', 'LIABILITY', 0, 1)"
+        ))
+        connection.execute(text(
+            "DELETE FROM invoice_payment_tax_components WHERE id=222"
+        ))
+    with Session(incomplete_engine) as session:
+        incomplete = capture_legacy_allocation_baseline(
+            session, 2, datetime(2026, 10, 12, 10)
+        )
+        assert incomplete.status == "incomplete"
+        session.commit()
+    with pytest.raises(IntegrityError):
+        with incomplete_engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                incomplete.baseline_event_id,
+                idempotency_key="incomplete-baseline",
+            )
+    incomplete_engine.dispose()
+
+
+def test_allocation_batch_correction_reversal_and_reallocation_sequence(tmp_path):
+    engine, baseline_id = _allocation_batch_database(tmp_path / "batch-operations.db")
+    line = _standard_batch_line()
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                operation="allocation_reallocation",
+                effective_date="2026-10-02",
+                idempotency_key="reallocation-from-baseline",
+                manual_review_status="approved",
+                line=line,
+            )
+    with engine.begin() as connection:
+        correction_id = _insert_finalized_allocation_batch(
+            connection,
+            baseline_id,
+            idempotency_key="operation-correction-one",
+            line=line,
+        )
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                version=2,
+                expected_version=1,
+                linked_prior_batch_id=correction_id,
+                effective_date="2026-10-02",
+                idempotency_key="correction-wrong-date",
+                line=line,
+            )
+
+    with engine.begin() as connection:
+        assert connection.execute(text(
+            "SELECT transaction_version, expected_prior_version "
+            "FROM allocation_batches WHERE id=:id"
+        ), {"id": correction_id}).one() == (1, 0)
+        second_correction_id = _insert_finalized_allocation_batch(
+            connection,
+            baseline_id,
+            version=2,
+            expected_version=1,
+            linked_prior_batch_id=correction_id,
+            idempotency_key="operation-correction-two",
+            line=line,
+        )
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                operation="allocation_reallocation",
+                version=3,
+                expected_version=2,
+                linked_prior_batch_id=second_correction_id,
+                effective_date="2026-10-03",
+                idempotency_key="reallocation-after-correction",
+                manual_review_status="approved",
+                line=line,
+            )
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                operation="allocation_reversal",
+                version=3,
+                expected_version=2,
+                linked_prior_batch_id=second_correction_id,
+                effective_date="2026-10-01",
+                idempotency_key="reversal-not-later",
+                manual_review_status="approved",
+                residual_cents=1200,
+                line=None,
+            )
+
+    excessive_line = _standard_batch_line(gross_cents=1100, gst_cents=110)
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            reversal_id = _insert_allocation_batch(
+                connection,
+                baseline_id,
+                operation="allocation_reversal",
+                version=3,
+                expected_version=2,
+                linked_prior_batch_id=second_correction_id,
+                effective_date="2026-10-02",
+                idempotency_key="reversal-exceeds-prior",
+                manual_review_status="approved",
+                residual_cents=100,
+                line=excessive_line,
+            )
+            _insert_allocation_batch_line(connection, reversal_id, excessive_line)
+            _finalize_allocation_batch(
+                connection,
+                reversal_id,
+                excessive_line,
+                total=1100,
+                gst=110,
+                residual=100,
+            )
+
+    with engine.begin() as connection:
+        reversal_id = _insert_finalized_allocation_batch(
+            connection,
+            baseline_id,
+            operation="allocation_reversal",
+            version=3,
+            expected_version=2,
+            linked_prior_batch_id=second_correction_id,
+            effective_date="2026-10-02",
+            idempotency_key="operation-reversal-three",
+            manual_review_status="approved",
+            residual_cents=1200,
+            residual_account_id=3,
+            line=None,
+            total=0,
+            gst=0,
+            cash=1200,
+        )
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                operation="allocation_correction",
+                version=4,
+                expected_version=3,
+                linked_prior_batch_id=reversal_id,
+                idempotency_key="correction-after-reversal",
+                line=line,
+            )
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                operation="allocation_reallocation",
+                version=4,
+                expected_version=3,
+                linked_prior_batch_id=reversal_id,
+                effective_date="2026-10-02",
+                idempotency_key="reallocation-not-later",
+                manual_review_status="approved",
+                line=line,
+            )
+
+    with engine.begin() as connection:
+        reallocation_id = _insert_finalized_allocation_batch(
+            connection,
+            baseline_id,
+            operation="allocation_reallocation",
+            version=4,
+            expected_version=3,
+            linked_prior_batch_id=reversal_id,
+            effective_date="2026-10-03",
+            idempotency_key="operation-reallocation-four",
+            manual_review_status="approved",
+            line=line,
+        )
+
+    for operation, linked_id, key in (
+        ("allocation_correction", reallocation_id, "correction-after-reallocation"),
+        ("allocation_reallocation", reallocation_id, "reallocation-after-reallocation"),
+    ):
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                _insert_allocation_batch(
+                    connection,
+                    baseline_id,
+                    operation=operation,
+                    version=5,
+                    expected_version=4,
+                    linked_prior_batch_id=linked_id,
+                    effective_date="2026-10-04" if operation == "allocation_reallocation" else "2026-10-01",
+                    idempotency_key=key,
+                    manual_review_status="approved",
+                    line=line,
+                )
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("link_reversal", "finalized", "effective_date"),
+    [(False, True, "2026-10-03"), (True, False, "2026-10-03"), (True, True, "2026-10-02")],
+)
+def test_allocation_batch_reallocation_requires_later_finalized_reversal(
+    tmp_path, link_reversal, finalized, effective_date
+):
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / f"batch-reallocation-gate-{link_reversal}-{finalized}-{effective_date}.db"
+    )
+    with engine.begin() as connection:
+        reversal_id = _insert_allocation_batch(
+            connection,
+            baseline_id,
+            operation="allocation_reversal",
+            effective_date="2026-10-02",
+            idempotency_key="reallocation-gate-reversal",
+            manual_review_status="approved",
+            residual_cents=1200,
+            line=None,
+        )
+        if finalized:
+            _finalize_allocation_batch(
+                connection,
+                reversal_id,
+                None,
+                total=0,
+                gst=0,
+                residual=1200,
+                cash=1200,
+            )
+
+    should_accept = link_reversal and finalized and effective_date > "2026-10-02"
+    line = _standard_batch_line()
+    if should_accept:
+        with engine.begin() as connection:
+            batch_id = _insert_allocation_batch(
+                connection,
+                baseline_id,
+                operation="allocation_reallocation",
+                version=2,
+                expected_version=1,
+                linked_prior_batch_id=reversal_id,
+                effective_date=effective_date,
+                idempotency_key="eligible-reallocation",
+                manual_review_status="approved",
+                line=line,
+            )
+            _insert_allocation_batch_line(connection, batch_id, line)
+    else:
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                _insert_allocation_batch(
+                    connection,
+                    baseline_id,
+                    operation="allocation_reallocation",
+                    version=2,
+                    expected_version=1,
+                    linked_prior_batch_id=reversal_id if link_reversal else None,
+                    effective_date=effective_date,
+                    idempotency_key="ineligible-reallocation",
+                    manual_review_status="approved",
+                    line=line,
+                )
+    engine.dispose()
+
+
+def test_allocation_batch_migrations_do_not_backfill_baselines_or_financial_rows(
+    tmp_path
+):
+    engine = _database(tmp_path / "batch-no-backfill.db")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE invoices SET contact_name_snapshot='Synthetic contact'"
+        ))
+        connection.execute(text(
+            "INSERT INTO journal_entries (entry_date, memo, source_type, source_id) "
+            "VALUES ('2026-09-01', 'Synthetic AP invoice provenance', 'invoice_ap', 1), "
+            "('2026-09-01', 'Synthetic AR invoice provenance', 'invoice_ar', 2)"
+        ))
+    before = _snapshot(engine)
+    with engine.connect() as connection:
+        bank_state = connection.execute(text(
+            "SELECT id, bank_account_id, amount, direction, occurred_at, gst_amount, tax_code "
+            "FROM bank_transactions ORDER BY id"
+        )).all()
+        invoice_state = connection.execute(text(
+            "SELECT id, paid_amount, status FROM invoices ORDER BY id"
+        )).all()
+        allocation_state = connection.execute(text(
+            "SELECT * FROM invoice_payment_allocations ORDER BY id"
+        )).all()
+        component_state = connection.execute(text(
+            "SELECT * FROM invoice_payment_tax_components ORDER BY id"
+        )).all()
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_history_events"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT id FROM invoice_payment_allocations ORDER BY id"
+        )).scalars().all() == [11, 22]
+        assert connection.execute(text(
+            "SELECT id FROM invoice_payment_tax_components ORDER BY id"
+        )).scalars().all() == [111, 222]
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_batches"
+        )).scalar_one() == 0
+
+    first_run = run_company_migrations(engine)
+    assert _snapshot(engine) == before
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT id, bank_account_id, amount, direction, occurred_at, gst_amount, tax_code "
+            "FROM bank_transactions ORDER BY id"
+        )).all() == bank_state
+        assert connection.execute(text(
+            "SELECT id, paid_amount, status FROM invoices ORDER BY id"
+        )).all() == invoice_state
+        assert connection.execute(text(
+            "SELECT * FROM invoice_payment_allocations ORDER BY id"
+        )).all() == allocation_state
+        assert connection.execute(text(
+            "SELECT * FROM invoice_payment_tax_components ORDER BY id"
+        )).all() == component_state
+        assert connection.execute(text(
+            "SELECT id FROM invoice_payment_allocations ORDER BY id"
+        )).scalars().all() == [11, 22]
+        assert connection.execute(text(
+            "SELECT id FROM invoice_payment_tax_components ORDER BY id"
+        )).scalars().all() == [111, 222]
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_history_events"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_history_baseline_finalizations"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_batches"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_batch_lines"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_batch_tax_components"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_batch_finalizations"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM payment_reconciliation_events"
+        )).scalar_one() == 0
+
+    second_run = run_company_migrations(engine)
+    assert _snapshot(engine) == before
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT id, bank_account_id, amount, direction, occurred_at, gst_amount, tax_code "
+            "FROM bank_transactions ORDER BY id"
+        )).all() == bank_state
+        assert connection.execute(text(
+            "SELECT id, paid_amount, status FROM invoices ORDER BY id"
+        )).all() == invoice_state
+        assert connection.execute(text(
+            "SELECT * FROM invoice_payment_allocations ORDER BY id"
+        )).all() == allocation_state
+        assert connection.execute(text(
+            "SELECT * FROM invoice_payment_tax_components ORDER BY id"
+        )).all() == component_state
+    assert not any(step.startswith("reconcile:payments:") for step in first_run + second_run)
+    assert not any(step.startswith("backfill:") for step in first_run + second_run)
+    engine.dispose()
+
+
+def _insert_batch_lodgment_marker(connection):
+    return connection.execute(text(
+        "INSERT INTO bas_period_lodgment_markers "
+        "(period_id, period_start, period_end, lodged_status, internally_asserted_at, "
+        "actor_placeholder, evidence_reference, evidence_scope) "
+        "VALUES ('synthetic-period', '2026-10-01', '2026-10-31', 1, "
+        "'2026-10-12 10:00:00', 'Synthetic operator', 'synthetic://lodgment', "
+        "'internal_assertion_not_ato_lodgment_evidence') RETURNING id"
+    )).scalar_one()
+
+
+def _insert_batch_correction_approval(connection, marker_id, idempotency_key):
+    return connection.execute(text(
+        "INSERT INTO allocation_period_correction_approvals "
+        "(period_marker_id, allocation_id, approved_idempotency_key, actor_placeholder, "
+        "reason, evidence_reference, recorded_at) VALUES (:marker_id, 22, :key, "
+        "'Synthetic reviewer', 'Synthetic correction approval', "
+        "'synthetic://correction-approval', '2026-10-12 10:30:00') RETURNING id"
+    ), {"marker_id": marker_id, "key": idempotency_key}).scalar_one()
+
+
+def test_allocation_batch_lodged_correction_requires_transaction_approval(tmp_path):
+    engine, baseline_id = _allocation_batch_database(tmp_path / "batch-correction-marker.db")
+    with engine.begin() as connection:
+        marker_id = _insert_batch_lodgment_marker(connection)
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                idempotency_key="approved-correction",
+                line=None,
+            )
+
+    line = {
+        "source_kind": "invoice",
+        "invoice_or_bill_id": 2,
+        "gross_cents": 1000,
+        "gst_cents": 100,
+        "components": [{
+            "tax_code": "standard", "gross_cents": 1000, "gst_cents": 100,
+        }],
+    }
+    with engine.begin() as connection:
+        approval_id = _insert_batch_correction_approval(
+            connection, marker_id, "approved-correction"
+        )
+        batch_id = _insert_allocation_batch(
+            connection,
+            baseline_id,
+            idempotency_key="approved-correction",
+            internal_approval_id=approval_id,
+            line=line,
+        )
+        _insert_allocation_batch_line(connection, batch_id, line)
+    engine.dispose()
+
+
+def test_allocation_batch_reversal_inside_marker_ignores_correction_approval(tmp_path):
+    engine, baseline_id = _allocation_batch_database(tmp_path / "batch-reversal-marker.db")
+    with engine.begin() as connection:
+        marker_id = _insert_batch_lodgment_marker(connection)
+        approval_id = _insert_batch_correction_approval(
+            connection, marker_id, "reversal-is-not-authorized"
+        )
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_allocation_batch(
+                connection,
+                baseline_id,
+                operation="allocation_reversal",
+                effective_date="2026-10-02",
+                idempotency_key="reversal-is-not-authorized",
+                manual_review_status="approved",
+                residual_cents=1200,
+                internal_approval_id=approval_id,
+            )
     engine.dispose()
 
 

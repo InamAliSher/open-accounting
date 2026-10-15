@@ -48,6 +48,27 @@ def _engine(path):
     return engine
 
 
+def test_allocation_batch_migration_leaves_schema_drift_clean(tmp_path):
+    engine = _engine(tmp_path / "allocation-batch-drift.db")
+    run_company_migrations(engine)
+
+    report = detect_drift(engine, CompanyBase, "allocation-batch-schema")
+    assert report.is_clean
+    with engine.connect() as connection:
+        batch_indexes = connection.execute(text(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name LIKE 'uq_allocation_batch_%'"
+        )).scalars().all()
+        assert {
+            "uq_allocation_batch_idempotency",
+            "uq_allocation_batch_transaction_version",
+            "uq_allocation_batch_line_order",
+            "uq_allocation_batch_line_identity",
+            "uq_allocation_batch_component_tax_code",
+        } <= set(batch_indexes)
+    engine.dispose()
+
+
 def _valid_gst_event(**overrides):
     values = {
         "event_type": "agreement",

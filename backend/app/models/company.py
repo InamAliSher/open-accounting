@@ -1391,6 +1391,148 @@ class AllocationHistoryEvent(CompanyBase):
     )
 
 
+class AllocationBatch(CompanyBase):
+    """Immutable transaction-wide after-state for allocation changes."""
+
+    __tablename__ = "allocation_batches"
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('allocation_correction', 'allocation_reversal', 'allocation_reallocation')",
+            name="ck_allocation_batch_operation",
+        ),
+        CheckConstraint(
+            "transaction_version > 0 AND expected_prior_version >= 0 "
+            "AND transaction_version = expected_prior_version + 1",
+            name="ck_allocation_batch_version_step",
+        ),
+        CheckConstraint(
+            "manual_review_status IN ('not_required', 'required', 'approved', 'rejected')",
+            name="ck_allocation_batch_manual_review_status",
+        ),
+        CheckConstraint(
+            "residual_amount_cents >= 0 AND "
+            "((residual_amount_cents = 0 AND residual_account_id IS NULL) OR "
+            "(residual_amount_cents > 0 AND residual_account_id IS NOT NULL))",
+            name="ck_allocation_batch_residual_account",
+        ),
+        UniqueConstraint(
+            "bank_transaction_id", "transaction_version",
+            name="uq_allocation_batch_transaction_version",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_allocation_batch_idempotency"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bank_transaction_id: Mapped[int] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="RESTRICT"), nullable=False
+    )
+    operation: Mapped[str] = mapped_column(String(40), nullable=False)
+    transaction_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_prior_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    effective_date: Mapped[date] = mapped_column(Date, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    canonical_payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str] = mapped_column(String(1000), nullable=False)
+    evidence_reference: Mapped[str] = mapped_column(String(500), nullable=False)
+    evidence_sha256: Mapped[str | None] = mapped_column(String(64))
+    actor_placeholder: Mapped[str] = mapped_column(String(200), nullable=False)
+    linked_prior_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("allocation_batches.id", ondelete="RESTRICT")
+    )
+    internal_correction_approval_id: Mapped[int | None] = mapped_column(
+        ForeignKey("allocation_period_correction_approvals.id", ondelete="RESTRICT")
+    )
+    manual_review_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    residual_amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    residual_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT")
+    )
+    baseline_finalization_id: Mapped[int] = mapped_column(
+        ForeignKey("allocation_history_baseline_finalizations.baseline_event_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+
+class AllocationBatchLine(CompanyBase):
+    """One allocation in a complete transaction-wide batch after-state."""
+
+    __tablename__ = "allocation_batch_lines"
+    __table_args__ = (
+        CheckConstraint("source_kind IN ('invoice', 'bill')", name="ck_allocation_batch_line_source_kind"),
+        CheckConstraint("line_order >= 0", name="ck_allocation_batch_line_order"),
+        CheckConstraint("gross_cents > 0", name="ck_allocation_batch_line_gross_positive"),
+        CheckConstraint(
+            "gst_cents >= 0 AND gst_cents <= gross_cents",
+            name="ck_allocation_batch_line_gst_within",
+        ),
+        UniqueConstraint("batch_id", "line_order", name="uq_allocation_batch_line_order"),
+        UniqueConstraint(
+            "batch_id", "source_kind", "invoice_or_bill_id",
+            name="uq_allocation_batch_line_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("allocation_batches.id", ondelete="RESTRICT"), nullable=False
+    )
+    line_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    invoice_or_bill_id: Mapped[int] = mapped_column(
+        ForeignKey("invoices.id", ondelete="RESTRICT"), nullable=False
+    )
+    gross_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    gst_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class AllocationBatchTaxComponent(CompanyBase):
+    """Complete immutable tax composition for one batch allocation line."""
+
+    __tablename__ = "allocation_batch_tax_components"
+    __table_args__ = (
+        CheckConstraint(
+            "tax_code IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none')",
+            name="ck_allocation_batch_component_tax_code",
+        ),
+        CheckConstraint("gross_cents > 0", name="ck_allocation_batch_component_gross_positive"),
+        CheckConstraint(
+            "gst_cents >= 0 AND gst_cents <= gross_cents",
+            name="ck_allocation_batch_component_gst_within",
+        ),
+        UniqueConstraint(
+            "allocation_batch_line_id", "tax_code",
+            name="uq_allocation_batch_component_tax_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_batch_line_id: Mapped[int] = mapped_column(
+        ForeignKey("allocation_batch_lines.id", ondelete="RESTRICT"), nullable=False
+    )
+    tax_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    gross_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    gst_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class AllocationBatchFinalization(CompanyBase):
+    """Immutable reconciliation proof that makes one allocation batch usable."""
+
+    __tablename__ = "allocation_batch_finalizations"
+
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("allocation_batches.id", ondelete="RESTRICT"), primary_key=True
+    )
+    allocation_line_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    component_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_allocated_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_gst_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    residual_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    bank_cash_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    canonical_integrity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    finalized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class PaymentReconciliationEvent(CompanyBase):
     """Immutable record of a fail-safe legacy payment repair at upgrade."""
 
