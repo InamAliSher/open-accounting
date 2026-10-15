@@ -10,9 +10,11 @@ from __future__ import annotations
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any, Iterable
 
-from sqlalchemy import func
+from sqlalchemy import func, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from ..db.company import begin_sqlite_immediate, rollback_session_on_error
 from ..models.company import (
     Account,
     AccountType,
@@ -28,6 +30,11 @@ from ..models.company import (
     TaxCode,
 )
 from ..schemas._dates import current_date
+from .allocation_history import (
+    guard_allocation_history_mutation,
+    has_allocation_history,
+    translate_allocation_history_db_error,
+)
 
 
 class PaymentAllocationError(ValueError):
@@ -39,6 +46,14 @@ _UNSET = object()
 
 def _money(value: Decimal | str | int) -> Decimal:
     return Decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _flush_allocation_mutation(db: Session) -> None:
+    try:
+        db.flush()
+    except DBAPIError as exc:
+        translate_allocation_history_db_error(db, exc)
+        raise
 
 
 _TAX_CODES = ("standard", "gst_free", "input_taxed", "capital", "none")
@@ -370,6 +385,7 @@ def _apply_unapplied_residual(
     transaction.unapplied_amount = residual
 
 
+@rollback_session_on_error
 def replace_transaction_allocations(
     db: Session,
     transaction: BankTransaction,
@@ -384,6 +400,15 @@ def replace_transaction_allocations(
     empty list clears it, which is allowed only after moving the transaction
     away from AR/AP control accounts.
     """
+
+    begin_sqlite_immediate(db)
+    if has_allocation_history(db, transaction.id):
+        if specs is None and (
+            unapplied_account_id is _UNSET
+            or unapplied_account_id == transaction.unapplied_account_id
+        ):
+            return
+        guard_allocation_history_mutation(db, transaction.id)
 
     account = db.get(Account, transaction.account_id) if transaction.account_id else None
     invoice_direction = control_invoice_direction(account, transaction.direction)
@@ -403,7 +428,7 @@ def replace_transaction_allocations(
             if existing:
                 touched = [row.invoice_id for row in existing]
                 transaction.invoice_allocations.clear()
-                db.flush()
+                _flush_allocation_mutation(db)
                 recompute_invoice_payment_state(db, touched)
             transaction.unapplied_account_id = None
             transaction.unapplied_amount = Decimal("0.00")
@@ -444,7 +469,7 @@ def replace_transaction_allocations(
         transaction.invoice_allocations.clear()
         transaction.unapplied_account_id = None
         transaction.unapplied_amount = Decimal("0.00")
-        db.flush()
+        _flush_allocation_mutation(db)
         recompute_invoice_payment_state(db, touched)
         return
 
@@ -584,7 +609,7 @@ def replace_transaction_allocations(
     transaction.tax_code = (
         TaxCode.STANDARD if transaction.gst_amount > 0 else TaxCode.GST_FREE
     )
-    db.flush()
+    _flush_allocation_mutation(db)
     recompute_invoice_payment_state(db, touched)
 
 
@@ -606,8 +631,22 @@ def allocations_for_transaction(db: Session, transaction_id: int) -> list[dict[s
     ]
 
 
+@rollback_session_on_error
 def backfill_missing_tax_components(db: Session) -> int:
     """Upgrade allocation rows created before tax components were introduced."""
+
+    begin_sqlite_immediate(db)
+    historical_allocation = db.execute(
+        text(
+            "SELECT 1 FROM allocation_history_events e "
+            "JOIN invoice_payment_allocations a "
+            "ON a.bank_transaction_id=e.bank_transaction_id LIMIT 1"
+        )
+    ).first()
+    if historical_allocation is not None:
+        raise PaymentAllocationError(
+            "Legacy tax-component backfill is blocked because allocation history exists."
+        )
 
     allocations = (
         db.query(InvoicePaymentAllocation)
@@ -627,7 +666,6 @@ def backfill_missing_tax_components(db: Session) -> int:
             break
     if not needs_rebuild:
         recompute_invoice_payment_state(db, invoice_ids)
-        db.commit()
         return 0
 
     for row in allocations:
@@ -702,5 +740,4 @@ def backfill_missing_tax_components(db: Session) -> int:
             else TaxCode.GST_FREE
         )
     recompute_invoice_payment_state(db, invoice_ids)
-    db.commit()
     return rebuilt
