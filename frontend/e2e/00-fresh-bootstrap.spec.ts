@@ -119,6 +119,44 @@ test("04 — Customer Invoices link, route, and AR-only list behavior", async ({
   expect(new URL(req.url()).searchParams.get("direction")).toBe("AR");
 });
 
+test("Supplier Bills navigation opens the AP-only invoice page", async ({ page }) => {
+  await ensureCompany(page.context().request);
+
+  await page.goto("/");
+  const apListRequest = page.waitForRequest(
+    (request) =>
+      request.method() === "GET" &&
+      request.url().includes("/api/v1/invoices") &&
+      new URL(request.url()).searchParams.get("direction") === "AP",
+  );
+  await page.locator("main").getByRole("link", {
+    name: /^Supplier Bills/,
+  }).click();
+  await expect(page).toHaveURL(/\/supplier-bills$/);
+  await expect(page.getByRole("heading", { name: "Supplier Bills", exact: true })).toBeVisible();
+  const req = await apListRequest;
+  expect(new URL(req.url()).searchParams.get("direction")).toBe("AP");
+  await expect(page.getByRole("button", {
+    name: /^(AP \(bills\)|AR \(sales\)|AP · Bill from supplier|AR · Invoice to customer)$/,
+  })).toHaveCount(0);
+
+  await page.goto("/");
+  await page.locator("aside").getByRole("link", {
+    name: "Supplier Bills",
+    exact: true,
+  }).click();
+  await expect(page).toHaveURL(/\/supplier-bills$/);
+  await expect(page.getByRole("heading", { name: "Supplier Bills", exact: true })).toBeVisible();
+
+  await page.goto("/dashboard");
+  const supplierCard = page.getByRole("heading", {
+    name: "Unpaid supplier invoices",
+  }).locator("..");
+  await supplierCard.getByRole("link", { name: "View all →" }).click();
+  await expect(page).toHaveURL(/\/supplier-bills$/);
+  await expect(page.getByRole("heading", { name: "Supplier Bills", exact: true })).toBeVisible();
+});
+
 test("05 — Customer Invoices manual create posts direction=AR", async ({ page }) => {
   const requestContext = page.context().request;
   await ensureCompany(requestContext);

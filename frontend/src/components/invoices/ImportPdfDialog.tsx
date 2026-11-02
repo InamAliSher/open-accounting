@@ -49,7 +49,7 @@ export default function ImportPdfDialog({
     mutationFn: uploadPdf,
     onSuccess: (res) => {
       setPreview(res);
-      setForm(EMPTY_FORM);
+      setForm({ ...EMPTY_FORM, direction: defaultDirection });
     },
   });
 
@@ -75,7 +75,10 @@ export default function ImportPdfDialog({
   const submit = () => {
     if (!preview) return;
     createMut.mutate(
-      toCreatePayload(form, {
+      toCreatePayload({
+        ...form,
+        direction: showDirection ? form.direction : defaultDirection,
+      }, {
         source: "pdf",
         attachment_id: preview.attachment_id,
         gst_registered: companyQ.data!.gst_registered,

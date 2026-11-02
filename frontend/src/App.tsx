@@ -40,6 +40,18 @@ function CompanyWorkspace({ privacyOn }: { privacyOn: boolean }) {
           <Route path="/contacts" element={<ProvidersPage />} />
           <Route path="/invoices" element={<InvoicesPage />} />
           <Route
+            path="/supplier-bills"
+            element={
+              <InvoicesPage
+                title="Supplier Bills"
+                fixedDirection="AP"
+                defaultDirection="AP"
+                showDirectionFilter={false}
+                showDirection={false}
+              />
+            }
+          />
+          <Route
             path="/customer-invoices"
             element={
               <InvoicesPage
