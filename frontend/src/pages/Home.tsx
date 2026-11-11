@@ -9,7 +9,12 @@ const modules = [
   {
     to: "/documents",
     label: "Documents",
-    meta: "Customer invoices / Receipts",
+    meta: "Receipts",
+  },
+  {
+    to: "/supplier-bills",
+    label: "Supplier Bills",
+    meta: "Accounts payable",
   },
   {
     to: "/contacts-hub",
